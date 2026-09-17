@@ -2,8 +2,6 @@
   <img src="assets/jev-code-logo.png" alt="Jev Code" width="220">
 </p>
 
-# Jev Code
-
 [Install](https://raw.githubusercontent.com/rhighs/jev-code/main/install.sh) · macOS / Linux
 
 ```bash
