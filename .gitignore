@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.jev/
+.env
+__pycache__/
+.venv/
+*.tsbuildinfo

@@ -1,0 +1,113 @@
+import { choice, noul, type EntryType, type Questions, type SystemOneResult } from '@typesafe-ai/sdk';
+import { DecisionError, LimitError, type DecisionProvider, type DecisionEventData } from './types.js';
+
+export type State = Record<string, unknown>;
+
+export class Decisions {
+  get requests(): number { return this.counters.requests; }
+  get usage(): { inputTokens: number; outputTokens: number } { return this.counters.usage; }
+
+  constructor(
+    private readonly provider: DecisionProvider,
+    private readonly maxRequests: number,
+    readonly signal: AbortSignal,
+    private readonly onDecision: (data: DecisionEventData) => Promise<void> = async () => {},
+    private readonly counters = { requests: 0, usage: { inputTokens: 0, outputTokens: 0 } },
+  ) {}
+
+  fork(signal: AbortSignal): Decisions {
+    return new Decisions(this.provider, this.maxRequests, AbortSignal.any([this.signal, signal]), this.onDecision, this.counters);
+  }
+
+  assertRequestBudget(count: number): void {
+    if (this.requests + count > this.maxRequests) throw new LimitError(`Request budget exhausted (${this.maxRequests}).`);
+  }
+
+  private async ask<Q extends Questions>(state: State, questions: Q): Promise<SystemOneResult<Q>> {
+    this.signal.throwIfAborted();
+    if (this.requests >= this.maxRequests) throw new LimitError(`Request budget exhausted (${this.maxRequests}).`);
+    this.counters.requests++;
+    // Make the transport boundary explicit: state must contain JSON values only.
+    let response: SystemOneResult<Q>;
+    try {
+      response = await this.provider.decide(JSON.parse(JSON.stringify(state)) as EntryType, questions, this.signal);
+    } catch (error) {
+      this.signal.throwIfAborted();
+      throw new DecisionError(error instanceof Error ? error.message : String(error), { cause: error });
+    }
+    this.signal.throwIfAborted();
+    if (!response.usage || !Number.isFinite(response.usage.input_tokens) || response.usage.input_tokens < 0 ||
+      !Number.isFinite(response.usage.output_tokens) || response.usage.output_tokens < 0) throw new DecisionError('Jev returned invalid usage metadata.');
+    this.usage.inputTokens += response.usage.input_tokens;
+    this.usage.outputTokens += response.usage.output_tokens;
+    return response;
+  }
+
+  async choose(state: State, instructions: string, criteria: Record<string, string>): Promise<string> {
+    const keys = Object.keys(criteria);
+    if (keys.length < 2 || keys.length > 255) throw new Error('Choice requires 2–255 candidates.');
+    const response = await this.ask(state, { selection: choice(instructions, criteria) });
+    const answer = response.answers.selection;
+    if (!answer || answer.type !== 'choice' || !answer.probabilities) throw new DecisionError('Jev returned an invalid choice answer.');
+    if (!Object.hasOwn(criteria, answer.choice)) throw new DecisionError(`Jev returned an unavailable choice: ${answer.choice}`);
+    for (const [key, probability] of Object.entries(answer.probabilities)) {
+      if (!Object.hasOwn(criteria, key) || !Number.isFinite(probability) || probability < 0 || probability > 1) {
+        throw new DecisionError('Jev returned an invalid choice distribution.');
+      }
+    }
+    if (!Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1) {
+      throw new DecisionError('Jev returned invalid confidence.');
+    }
+    await this.onDecision({ choice: answer.choice, confidence: answer.confidence, model: response.model });
+    return answer.choice;
+  }
+
+  async probability(state: State, instructions: string): Promise<number> {
+    const response = await this.ask(state, { verdict: noul(instructions) });
+    const answer = response.answers.verdict;
+    if (!answer || answer.type !== 'noul') throw new DecisionError('Jev returned an invalid noul answer.');
+    const value = answer.noul;
+    if (!Number.isFinite(value) || value < 0 || value > 1) throw new DecisionError('Jev returned an invalid noul.');
+    await this.onDecision({ probability: value, model: response.model });
+    return value;
+  }
+
+  /** Parallel positions, each with a scored categorical distribution over characters. */
+  async chooseMany(state: State, instructions: Record<string, string>, criteria: Record<string, string>): Promise<Record<string, { choice: string; score: number; probabilities: Record<string, number> }>> {
+    const questions = Object.fromEntries(Object.entries(instructions).map(([key, text]) => [key, choice(text, criteria)]));
+    let response: SystemOneResult<typeof questions>;
+    try { response = await this.ask(state, questions); }
+    catch (error) {
+      const entries = Object.entries(instructions);
+      if (!(error instanceof DecisionError) || !/max_tokens_exceeded/.test(error.message) || entries.length < 2) throw error;
+      this.signal.throwIfAborted();
+      const middle = Math.ceil(entries.length / 2);
+      const parts = await Promise.allSettled([
+        this.chooseMany(state, Object.fromEntries(entries.slice(0, middle)), criteria),
+        this.chooseMany(state, Object.fromEntries(entries.slice(middle)), criteria),
+      ]);
+      for (const part of parts) if (part.status === 'rejected') throw part.reason;
+      return Object.assign({}, ...parts.flatMap(part => part.status === 'fulfilled' ? [part.value] : []));
+    }
+    const results: Record<string, { choice: string; score: number; probabilities: Record<string, number> }> = {};
+    for (const key of Object.keys(instructions)) {
+      const answer = response.answers[key];
+      if (!answer || answer.type !== 'choice' || !Object.hasOwn(criteria, answer.choice) || !answer.probabilities ||
+        !Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1) {
+        throw new DecisionError(`Jev returned an invalid or missing cell choice: ${key}`);
+      }
+      let best = answer.choice;
+      for (const label of Object.keys(criteria)) {
+        const probability = answer.probabilities[label];
+        if (!Number.isFinite(probability) || probability! < 0 || probability! > 1) throw new DecisionError(`Jev returned an invalid or missing character probability: ${key}.${label}`);
+        if (probability! > answer.probabilities[best]!) best = label;
+      }
+      if (Object.keys(answer.probabilities).some(label => !Object.hasOwn(criteria, label)) || answer.probabilities[best]! <= 0) {
+        throw new DecisionError(`Jev returned an invalid character distribution: ${key}`);
+      }
+      results[key] = { choice: best, score: answer.probabilities[best]!, probabilities: { ...answer.probabilities } };
+    }
+    await this.onDecision({ questions: Object.keys(results).length, model: response.model });
+    return results;
+  }
+}

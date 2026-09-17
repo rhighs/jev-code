@@ -1,0 +1,20 @@
+{
+  "name": "jev-code",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A turn-based coding harness built from Jev decisions.",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "bin": { "jev-code": "dist/cli.js" },
+  "exports": { ".": "./dist/index.js" },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "test": "tsx --test test/*.test.ts",
+    "demo": "tsx src/cli.ts --demo"
+  },
+  "dependencies": { "@typesafe-ai/sdk": "^0.6.0", "typescript": "^5.9.0" },
+  "devDependencies": { "@types/node": "^24.0.0", "tsx": "^4.20.0" }
+}
