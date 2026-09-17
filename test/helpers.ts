@@ -7,6 +7,7 @@ export interface TestState {
   task: { turn: number; prompt: string; updates: string[] };
   generation?: { field: string; phase: string; syntax?: unknown[]; draft?: string; tokens?: Array<{ key: string; value: string }>; grid?: { columns: number; capacity: number; alphabet: Array<{ key: string; value: string }> } };
   field?: string;
+  completionCheck?: boolean;
   recent: Array<{ tool: string; result: { ok: boolean; output: string } }>;
 }
 
@@ -29,6 +30,7 @@ export class ScriptedProvider implements DecisionProvider {
       assert.equal(question.type, 'choice');
       if (question.type !== 'choice') throw new Error('Only Choice and Noul are used.');
       let selected = step.action;
+      if (state.completionCheck) selected = (step.verdict ?? 1) >= 0.5 ? 'complete' : 'continue';
       if (state.generation?.phase.startsWith('plan')) selected = 'free';
       if (state.generation?.phase === 'bash_ast') {
         const target = step.args?.[state.generation.field];

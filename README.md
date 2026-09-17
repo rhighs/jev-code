@@ -1,15 +1,17 @@
+<p align="center">
+  <img src="assets/jev-code-logo.png" alt="Jev Code" width="220">
+</p>
+
 # Jev Code
 
-[Install](https://raw.githubusercontent.com/rhighs/jev-code/main/install.sh) · macOS / Linux · no sudo
+[Install](https://raw.githubusercontent.com/rhighs/jev-code/main/install.sh) · macOS / Linux
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rhighs/jev-code/main/install.sh | bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-<img src="assets/jev-code-logo.png" alt="Jev Code" width="220">
-
-An interactive coding CLI powered by [Jev](https://typesafe.ai). Watch source take shape, run tools, send updates, and see elapsed time after every turn. No automatic character-grid fallback.
+An interactive coding CLI powered by [Jev](https://typesafe.ai). Watch source take shape, run tools, send updates, and see elapsed time after every turn.
 
 ```bash
 export TYPESAFE_API_KEY="your-typesafe-key"

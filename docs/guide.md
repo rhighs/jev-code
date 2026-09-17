@@ -59,7 +59,7 @@ Direct file tools resolve symlinks and reject paths outside the selected workspa
 | `edit_file` | Replace one unambiguous exact match; fail without mutation otherwise. |
 | `bash` | Execute an arbitrary Bash command with bounded output and an explicit exit status. |
 | `set_plan` | Record/revise the active plan and progress. |
-| `finish` | Summarize completion, gated by a separate Jev satisfaction decision. |
+| `finish` | End the run, gated by a separate task-scoped Jev completion choice. |
 | `blocked` | Explain a missing prerequisite or user decision. |
 
 An action turn contains multiple Jev requests. Python source follows this pipeline:
@@ -92,7 +92,7 @@ Run statuses are `completed`, `blocked`, `limited`, `cancelled`, or `error`. Onl
 
 Every run writes `.jev/runs/<run-id>.jsonl` with decisions, model identities, progress, full tool arguments, outcomes, usage, and final status. Journals are created with owner-only file permissions. They can contain project source and command output. `--no-journal` disables persistence; `--json` emits machine-readable events to stdout, with any confirmation prompts on stderr. Generation events report AST productions and tree previews, exact-plan selections, or grid cell patches with their candidate probabilities. The terminal shows the active draft while generation runs. The completed source is shown before execution; Bash stdout and stderr stream separately. `bytes` counts UTF-8 bytes.
 
-The CLI prints real tool outcomes and an observed completion summary derived from successful tool records. A finish turn only selects the action and checks completion; it generates no prose. Rejected completion requires another action before a new finish attempt, and rejected finish records are excluded from the verification evidence. Generated blocker explanations are retained as `modelSummary`. For experimental evaluation, use the journal and independently inspect generated files and verification results. This version does not automatically resume interrupted runs or replay tool effects; start a new task against the existing workspace to continue work.
+The CLI prints real tool outcomes and an observed completion summary derived from successful tool records. A finish turn only selects the action and checks completion; it generates no prose. The default check is a categorical `complete` / `continue` choice over the current task and observed results; it excludes prior conversations and avoids a fixed probability cutoff. Library hosts can explicitly opt into a strict Noul gate with `completionThreshold`. Rejected completion requires another action before a new finish attempt, and rejected finish records are excluded from verification evidence. Three rejected completion checks without an implementation write stop with `limited`; repeated Bash runs, reads, or plan updates do not reset that guard. Generated blocker explanations are retained as `modelSummary`. For experimental evaluation, inspect generated files and verification results. This version does not automatically resume interrupted runs or replay tool effects; start a new task against the existing workspace to continue work.
 
 ## Timing
 
@@ -184,7 +184,5 @@ The offline demo uses a clearly labeled scripted provider and real tools in a te
 Live validation on September 17, 2026 used Jev through the official SDK with the objective “Create a simple Python hello world. Run it with python3 to verify it.” Jev chose AST productions for `print('Hello, world!')`, wrote `main.py`, ran `python3 'main.py'`, observed `Hello, world!`, and completed in 3 turns and 16 requests. The live interactive session repeated this successfully in 3 turns and 16 requests (20,426 input tokens), streamed AST progress and command output, remained open, and accepted `/status`. These are narrow smoke tests, not a general coding benchmark.
 
 After removing default grids and generated finish prose, a live “write a for loop in Python and run it” task generated `for i in range(5): print(i)`, printed 0 through 4, and completed in 3 turns, 22 requests, and 9.6 seconds. Generic one-argument range bounds exclude zero; explicitly requested empty or negative ranges remain valid. A more complex number-guessing-game trial exhausted 256 requests without producing a complete AST or writing a file. Complex generation still needs better model guidance and broader grammar coverage; passing syntax checks alone does not establish correctness.
-
-The original Python generation experiments are preserved under `legacy/python/` for comparison and are not used by this harness.
 
 API integration follows the [official TypeScript SDK](https://github.com/typesafe-ai/typesafe-sdk-js) and its [typed question builders](https://github.com/typesafe-ai/typesafe-sdk-js/blob/main/src/questions.ts).

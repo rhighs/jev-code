@@ -18,7 +18,7 @@ test('default text generation avoids grids, retries retain the objective, and fi
   const events: import('../src/types.js').HarnessEvent[] = [];
   const provider = new ScriptedProvider([
     { action: 'write_file', args: { path: 'hello.txt', content: 'hello' } },
-    { action: 'finish' },
+    { action: 'finish', verdict: 0.79 },
   ]);
   const harness = new Harness({ workspace: root, provider, journalDirectory: false, onEvent: event => { events.push(event); } });
   const first = await harness.run('Write "hello" into hello.txt.');
@@ -34,6 +34,59 @@ test('default text generation avoids grids, retries retain the objective, and fi
   assert.equal(first.turnTimings.at(-1)?.requests, 2, 'finish only selects the action and checks completion');
 });
 
+test('completion checks are scoped to the current task, excluding previous blocked conversations', async t => {
+  const root = await workspace(t);
+  const base = new ScriptedProvider([{ action: 'finish', verdict: 0.79 }]);
+  let seen = false;
+  const provider: DecisionProvider = { decide: async (input, questions, signal) => {
+    const state = input as unknown as Record<string, unknown>;
+    if (state.completionCheck) {
+      seen = true;
+      assert.equal(state.conversation, undefined);
+      assert.equal(state.rules, undefined);
+      assert.equal(questions.selection?.type, 'choice');
+      assert.equal(questions.verdict, undefined);
+    }
+    return base.decide(input, questions, signal);
+  } };
+  const harness = new Harness({ workspace: root, provider, journalDirectory: false });
+  assert.equal((await harness.run('No file changes required.')).status, 'completed');
+  assert.equal((await harness.run('Only report completion.')).status, 'completed');
+  assert.ok(seen);
+});
+
+test('unchanged bash, read and plan cycles stop after three rejected completion checks', async t => {
+  const root = await workspace(t);
+  const provider = new ScriptedProvider([
+    { action: 'write_file', args: { path: 'hello.txt', content: 'hello' } },
+    { action: 'finish', verdict: 0.1 },
+    { action: 'bash', args: { command: 'printf hello', cwd: '.', timeout_ms: '' } },
+    { action: 'finish', verdict: 0.1 },
+    { action: 'set_plan', args: { plan: 'Verify hello.txt.' } },
+    { action: 'finish', verdict: 0.1 },
+  ]);
+  const result = await new Harness({ workspace: root, provider, experimentalGrid: true, journalDirectory: false }).run('Write hello.txt with hello.');
+  assert.equal(result.status, 'limited', result.summary);
+  assert.equal(result.turns, 6);
+  assert.match(result.summary, /Stopped after 3 rejected completion checks/);
+  assert.equal(result.records.filter(record => record.tool === 'bash').length, 1);
+});
+
+test('explicit strict completion thresholds still reject intermediate probabilities and terminate', async t => {
+  const root = await workspace(t);
+  const provider = new ScriptedProvider([
+    { action: 'finish', verdict: 0.79 },
+    { action: 'set_plan', args: { plan: 'Verify the result.' } },
+    { action: 'finish', verdict: 0.72 },
+    { action: 'set_plan', args: { plan: 'Verify the result.' } },
+    { action: 'finish', verdict: 0.78 },
+  ]);
+  const result = await new Harness({ workspace: root, provider, completionThreshold: 0.85, journalDirectory: false }).run('Verify the result.');
+  assert.equal(result.status, 'limited', result.summary);
+  assert.equal(result.turns, 5);
+  assert.equal(provider.states.filter(state => state.completionCheck).length, 3);
+});
+
 test('rejected completion cannot immediately repeat and does not contaminate later verification evidence', async t => {
   const root = await workspace(t);
   const base = new ScriptedProvider([
@@ -46,7 +99,7 @@ test('rejected completion cannot immediately repeat and does not contaminate lat
   const provider: DecisionProvider = { decide: async (input, questions, signal) => {
     const state = input as unknown as import('./helpers.js').TestState;
     if (state.task.turn === 3 && !state.generation && !state.field && questions.selection?.type === 'choice') assert.ok(!Object.hasOwn(questions.selection.criteria, 'finish'));
-    if (questions.verdict) { checks++; assert.ok(state.recent.every(record => record.tool !== 'finish')); }
+    if (state.completionCheck) { checks++; assert.ok(state.recent.every(record => record.tool !== 'finish')); }
     return base.decide(input, questions, signal);
   } };
   const result = await new Harness({ workspace: root, provider, journalDirectory: false }).run('Write hello.txt with "hello" and verify it.');
@@ -194,7 +247,7 @@ test('instructions arriving during the completion check prevent stale completion
   ]);
   let harness: Harness;
   const provider: DecisionProvider = { decide: async (state, questions) => {
-    if (questions.verdict && !(state as unknown as { generation?: unknown }).generation) harness.enqueue('Also generate documentation.');
+    if ((state as unknown as { completionCheck?: boolean }).completionCheck) harness.enqueue('Also generate documentation.');
     return base.decide(state, questions);
   } };
   harness = new Harness({ experimentalGrid: true, workspace: root, provider, journalDirectory: false });

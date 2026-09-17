@@ -24,6 +24,7 @@ export interface HarnessOptions {
   gridBatchSize?: number;
   gridConcurrency?: number;
   maxRunMs?: number;
+  /** Opt into a strict Noul gate; by default completion uses a categorical choice. */
   completionThreshold?: number;
   allowOutsideWorkspace?: boolean;
   /** false disables persistence; otherwise defaults to <workspace>/.jev/runs. */
@@ -119,7 +120,7 @@ export class Harness {
     const records: ToolRecord[] = [];
     const turnTimings: RunResult['turnTimings'] = [];
     const messages = [/^(?:retry|try again)[.!]?$/i.test(prompt.trim()) ? this.conversation.at(-1)?.prompt ?? prompt : prompt];
-    let turn = 0, plan = '';
+    let turn = 0, plan = '', completionRejections = 0;
     let journal: string | undefined;
     let journalHandle: FileHandle | undefined;
     let eventQueue = Promise.resolve();
@@ -154,6 +155,7 @@ export class Harness {
         signal.throwIfAborted();
         for (const instruction of this.pendingInputs.splice(0)) {
           messages.push(instruction);
+          completionRejections = 0;
           await emit('input', { instruction });
         }
         const inventory = await listWorkspace(workspace);
@@ -208,10 +210,30 @@ export class Harness {
             { ...generationOptions, maxBytes: 8000, allowEmpty: false });
           if (action === 'finish') {
             const evidence = records.filter(record => record.tool !== 'finish');
-            const verdict = await decisions.probability({ ...state, recent: evidence.slice(-8).map(record => ({ ...record, args: boundedArgs(record.args), result: { ...record.result, output: trim(record.result.output) } })), history: evidence.slice(0, -8).map(record => ({ turn: record.turn, tool: record.tool, result: { ok: record.result.ok, output: trim(record.result.output, 200) } })), proposedSummary: message },
-              'Does the observed workspace and actual tool history establish that ALL current user requirements are satisfied, with applicable checks passed? Answer no if work is incomplete, results are invented, or verification failures remain unresolved.');
-            if (verdict < (this.options.completionThreshold ?? 0.85)) {
-              records.push({ turn, tool: 'finish', args: {}, result: { ok: false, output: `Completion rejected: satisfaction probability ${verdict}. Continue implementing or verifying.` } });
+            const checkState: State = { task: state.task, completionCheck: true,
+              recent: evidence.slice(-8).map(record => ({ ...record, args: boundedArgs(record.args), result: { ...record.result, output: trim(record.result.output, 2000) } })),
+              history: evidence.slice(0, -8).map(record => ({ turn: record.turn, tool: record.tool, result: { ok: record.result.ok, output: trim(record.result.output, 200) } })), proposedSummary: message };
+            const instruction = 'Judge ONLY the current task and its latest updates, using the actual tool results below. Do not add requirements the user did not ask for. Complete when the requested work is present and applicable verification succeeded. Continue when specific requested work is missing or a verification failure is unresolved. Prior tasks and rejected finish attempts are not requirements.';
+            const verdict = this.options.completionThreshold === undefined
+              ? await decisions.choose(checkState, instruction, { complete: 'The current requested work is complete. End the run.', continue: 'Specific requested work or verification remains unfinished. Continue working.' })
+              : await decisions.probability(checkState, instruction);
+            const accepted = typeof verdict === 'string' ? verdict === 'complete' : verdict >= this.options.completionThreshold!;
+            if (this.pendingInputs.length) {
+              const record: ToolRecord = { turn, tool: action, args: {}, result: { ok: false, output: 'New user instructions arrived. Apply them before ending the run.' } };
+              records.push(record);
+              await emit('tool_end', record);
+              continue;
+            }
+            if (!accepted) {
+              completionRejections++;
+              const record: ToolRecord = { turn, tool: 'finish', args: {}, result: { ok: false, output: `Completion rejected (${completionRejections}/3): ${typeof verdict === 'number' ? `satisfaction probability ${verdict}` : 'the completion check selected continue'}. Make a concrete implementation change or resolve a verification failure; repeating a successful command or revising the plan does not establish progress.` } };
+              records.push(record);
+              await emit('tool_end', record);
+              if (completionRejections >= 3) {
+                status = 'limited';
+                summary = `${completionSummary(records)}\nStopped after 3 rejected completion checks without an implementation change. Jev could not establish completion; successful tools were not treated as proof of the entire task.`;
+                break;
+              }
               continue;
             }
           }
@@ -250,6 +272,7 @@ export class Harness {
           if (typeof result.ok !== 'boolean' || typeof result.output !== 'string') throw new Error(`Tool ${action} returned an invalid result.`);
           const record: ToolRecord = { turn, tool: action, args, result };
           records.push(record);
+          if (result.ok && tool.effect === 'write' && action !== 'set_plan') completionRejections = 0;
           if (result.ok && typeof result.data?.plan === 'string') plan = result.data.plan;
           await emit('tool_end', record);
         } catch (error) {

@@ -8,7 +8,7 @@ import type { DecisionProvider, HarnessEvent, RunResult } from './types.js';
 /** A scripted driver for the offline demo only. Live runs always use JevProvider. */
 class DemoProvider implements DecisionProvider {
   async decide<Q extends Questions>(input: EntryType, questions: Q): Promise<SystemOneResult<Q>> {
-    const state = input as { task: { turn: number }; action?: string; field?: string; generation?: { field: string; phase: string; grid?: {
+    const state = input as { task: { turn: number }; completionCheck?: boolean; action?: string; field?: string; generation?: { field: string; phase: string; grid?: {
       columns: number; alphabet: Array<{ key: string; value: string }>;
     } } };
     const targets: Record<string, string> = {
@@ -23,7 +23,8 @@ class DemoProvider implements DecisionProvider {
       }
       if (question.type !== 'choice') throw new Error('Unexpected demo question.');
       let selected: string;
-      if (!state.generation && state.field === 'timeout_ms') selected = 'default';
+      if (state.completionCheck) selected = 'complete';
+      else if (!state.generation && state.field === 'timeout_ms') selected = 'default';
       else if (!state.generation) selected = ['write_file', 'bash', 'finish'][state.task.turn - 1]!;
       else if (state.generation.phase.startsWith('plan')) selected = 'free';
       else if (state.generation.phase === 'cells') {
