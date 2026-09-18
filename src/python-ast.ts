@@ -231,7 +231,8 @@ export function vocabulary(objective: string): Vocab {
   const words = objective.match(/[A-Za-z_][A-Za-z_0-9]*/g) ?? [];
   const identifiers = [...new Set([...words.filter(word => /^[a-z_][a-z_0-9]*$/.test(word) && !keywords.has(word)), 'message', 'result', 'value', 'i', 'main', 'add', 'a', 'b', 'guess', 'target', 'attempts', 'randint', 'append', 'read', 'write', 'strip', 'lower'])].slice(0, 180);
   const quoted = [...objective.matchAll(/`([^`\n]+)`|"([^"\n]+)"|'([^'\n]+)'/g)].map(match => match[1] ?? match[2] ?? match[3]!);
-  const literals: string[] = [...quoted];
+  const files = objective.match(/\b[A-Za-z_][A-Za-z_0-9-]*\.[a-z]{1,5}\b/g) ?? [];
+  const literals: string[] = [...quoted, ...files];
   const purposes: string[] = [];
   // Candidates are terminal values derived from the objective, never source templates.
   for (let start = 0; start < words.length; start++) for (let count = 1; count <= 4 && start + count <= words.length; count++) {
@@ -314,7 +315,8 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
     const namesForValue = visible(scope).filter(id => !['builtin', 'function'].includes(table[id]!.kind));
     const criteria: Record<string, string> = { string: 'A literal string.', number: 'A numeric literal.', boolean: 'True, False or None.' };
     if (namesForValue.length) criteria.name = 'Reference an already defined variable, parameter or module.';
-    if (depth < maxDepth) Object.assign(criteria, { call: 'Call a function, such as print, with arguments.', binary: 'Combine two expressions with arithmetic.', compare: 'Compare two expressions.', list: 'A list of expressions.', attribute: 'Read an attribute from a defined object.', subscript: 'Index a defined object.' });
+    if (depth < maxDepth) Object.assign(criteria, { call: 'Call a function, such as print, with arguments.', binary: 'Combine two expressions with arithmetic.', compare: 'Compare two expressions.', attribute: 'Read an attribute from a defined object.', subscript: 'Index a defined object.' });
+    if (depth < maxDepth && !slot.startsWith('element_') && !slot.startsWith('argument_')) criteria.list = 'A list of expressions.';
     const production = await pick(slot, scope, criteria, depth);
     if (production === 'string') { Object.assign(target, node('Constant', { value: String(await terminal('string', scope, strings)), kind: null })); }
     else if (production === 'number') {

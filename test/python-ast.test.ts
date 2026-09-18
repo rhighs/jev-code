@@ -236,3 +236,15 @@ test('an else branch renders its pending slot as a statement so the preview neve
   const elseBody = provider.states.find(s => s.generation.slot === 'else_body');
   assert.match(elseBody?.generation.partialSource ?? '', /else:\n\s+__jev_pending__/);
 });
+
+test('lists are not offered inside list elements or call arguments, and file names in the task become string candidates', async () => {
+  const provider = new AstProvider(['0', 'expr', 'call', { value: 'print' }, '1', 'string', { value: JSON.stringify('numbers.txt') }, 'finish']);
+  assert.equal(await generatePythonAst(decisions(provider), { task: { prompt: 'Write the numbers 1 to 5 to a file named numbers.txt.', turn: 1, updates: [] } }, 'content', options), "print('numbers.txt')\n");
+  const argument = provider.criteria[provider.states.findIndex(s => s.generation.slot === 'argument_0')]!;
+  assert.ok(!Object.hasOwn(argument, 'list'));
+  const nested = new AstProvider(['0', 'expr', 'list', '1', 'number', { value: '1' }, 'finish']);
+  assert.equal(await generatePythonAst(decisions(nested), state, 'content', options), '[1]\n');
+  const element = nested.criteria[nested.states.findIndex(s => s.generation.slot === 'element_0')]!;
+  assert.ok(!Object.hasOwn(element, 'list'));
+  assert.ok(Object.hasOwn(nested.criteria[nested.states.findIndex(s => s.generation.slot === 'expression')]!, 'list'));
+});
