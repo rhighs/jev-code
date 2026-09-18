@@ -206,6 +206,16 @@ npm run dev -- eval compare .jev/eval/<before>.json .jev/eval/<after>.json
 
 ### Eval results
 
-<!-- eval-results -->
+Live results on 2026-09-18 (one run per task, default task limits; `pass` means the checker accepted the workspace):
+
+| build | guessing-game | file-io-script | multi-file-package |
+| --- | --- | --- | --- |
+| before rendered context (`ec792ca`) | fail, 2 turns, 1394 requests, 9 min 15 s, request-size overflow | not run | not run |
+| rendered context (`1398293`) | fail, 1 turn, 102 requests, 33 s, token budget | fail, 78 requests, 27 s | fail, 125 requests, 44 s |
+| decompose-and-fill (`2c9a341`) | fail, 23 turns, 2000 requests, 11 min 15 s | fail, 1 turn, 1500 productions, 9 min 47 s | fail, 60 turns, 2839 requests, 15 min 47 s |
+| loop guards (`87849a1`) | fail, 33 turns, 2000 requests, 11 min 24 s | fail, 39 turns, 3000 requests, 12 min 44 s | fail, 60 turns, 1941 requests, 11 min 25 s |
+| review fixes (`3925414`) | fail, 25 turns, 2000 requests, 11 min 20 s | fail, 44 turns, 3000 requests, 13 min 23 s | fail, 60 turns, 2783 requests, 15 min 9 s |
+
+No task passes yet. The failure mode moved from crashes (request-size overflow, token loops, a serializer error on every `else` branch) to decision quality: every run now spends its whole budget in a write, write, read cycle, the rewrite guard forces the read, and the program is almost never executed. The generated programs have the right shape (a `randint` call, an input loop, `open` and a running total, a package module imported by `main.py`) but wrong details, such as nested lists as `randint` arguments, `int()` without an argument, or a literal `'Hello, <name>!'`. Search width above 1 has not been measured live.
 
 API integration follows the [official TypeScript SDK](https://github.com/typesafe-ai/typesafe-sdk-js) and its [typed question builders](https://github.com/typesafe-ai/typesafe-sdk-js/blob/main/src/questions.ts).
