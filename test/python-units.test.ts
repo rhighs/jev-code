@@ -115,7 +115,7 @@ test('at most four unit requests are in flight with six units', async () => {
   const names = ['a', 'b', 'c', 'd', 'e', 'f'];
   names.forEach((n, i) => units.push({ slot: `unit_${i}_name`, answer: { value: n } }, { slot: `unit_${i}_arity`, answer: '0' }, { slot: `unit_${i}_purpose`, answer: { value: 'helper' } }));
   const provider = new GateProvider([...units, ...names.map(() => ({ slot: 'function_body', answer: 'pass', once: true })), { slot: 'function_body', answer: 'finish' },
-    { slot: 'module_body', answer: 'pass', once: true }, { slot: 'module_body', answer: 'finish' }], async s => { if (s.generation.unit) await new Promise(resolve => setTimeout(resolve, 15)); });
+    { slot: 'module_body', answer: 'finish' }], async s => { if (s.generation.unit) await new Promise(resolve => setTimeout(resolve, 15)); });
   const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Python helper functions a b c d e f.' } }, 'content', options);
   assert.equal((source.match(/^def /gm) ?? []).length, 6);
   assert.ok(provider.maxPending <= 4, `max in flight ${provider.maxPending}`);

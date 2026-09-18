@@ -17,6 +17,8 @@ export const node = (_type: string, fields: Record<string, unknown> = {}): Pytho
 export const name = (id: string, store = false): PythonNode => node('Name', { id, ctx: node(store ? 'Store' : 'Load') });
 const keywords = new Set('False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case'.split(' '));
 const builtins = ['print', 'range', 'len', 'str', 'int', 'float', 'list', 'dict', 'set', 'sum', 'min', 'max', 'abs', 'sorted', 'enumerate', 'zip', 'input', 'open'];
+const builtinArity: Record<string, number[]> = { print: [0, 1, 2, 3], range: [1, 2, 3], len: [1], str: [0, 1], int: [0, 1], float: [0, 1], list: [0, 1], dict: [0], set: [0, 1], sum: [1, 2], min: [1, 2, 3], max: [1, 2, 3], abs: [1], sorted: [1], enumerate: [1, 2], zip: [1, 2, 3], input: [0, 1], open: [1, 2, 3] };
+const maxBlockStatements = 16;
 export interface Symbol { kind: 'builtin' | 'variable' | 'parameter' | 'function' | 'module'; arity?: number }
 export interface Scope { names: Map<string, Symbol>; parent?: Scope; function: boolean; loop: boolean }
 const symbolTable = (scope: Scope): Record<string, Symbol> => ({ ...(scope.parent ? symbolTable(scope.parent) : Object.fromEntries(builtins.map(id => [id, { kind: 'builtin' }]))), ...Object.fromEntries(scope.names) });
@@ -276,11 +278,10 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
   async function terminal(slot: string, scope: Scope, values: Array<string | number>): Promise<string | number> {
     const criteria: Record<string, string> = Object.fromEntries(values.map((value, index) => [`value_${index}`, JSON.stringify(value)]));
     const numeric = slot === 'number';
-    if (!numeric) criteria.custom = 'Compose a different terminal value from valid token choices, staying in AST generation.';
+    if (slot === 'string') criteria.custom = 'Compose a different terminal value from valid token choices, staying in AST generation.';
     const selected = await pick(slot, scope, criteria);
     if (selected !== 'custom') return values[Number(selected.slice(6))]!;
-    const identifierSlot = slot !== 'string' && !slot.endsWith('_purpose');
-    const pieces = [...new Set([...words, ...identifiers, ...'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'.split(''), ...(identifierSlot ? [] : [' ', ', ', ': ', '!', '?', '.', '\n'])])].slice(0, 240);
+    const pieces = [...new Set([...words, ...identifiers, ...'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'.split(''), ' ', ', ', ': ', '!', '?', '.', '\n'])].slice(0, 240);
     let result = '', last = '', repeats = 0;
     for (let count = 0; count < 32; count++) {
       const candidates: Record<string, string> = Object.fromEntries(pieces.map((piece, index) => [`piece_${index}`, JSON.stringify(piece)]));
@@ -331,7 +332,7 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
       const callees: Record<string, string> = Object.fromEntries(names.map((value, index) => [`name_${index}`, value]));
       callees.member = 'Call an attribute or method of an already defined object or module.';
       const selected = await pick('callee', scope, callees);
-      let arity: number | undefined;
+      let arity: number | undefined, counts = [0, 1, 2, 3];
       if (selected === 'member') {
         const receiver = await pick('receiver', scope, Object.fromEntries(names.map((value, index) => [`name_${index}`, value])));
         Object.assign(func, node('Attribute', { value: name(names[Number(receiver.slice(5))]!), attr: await identifier('method_name', scope), ctx: node('Load') }));
@@ -339,8 +340,9 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
         const id = names[Number(selected.slice(5))]!;
         Object.assign(func, name(id));
         arity = symbolTable(scope)[id]?.arity;
+        if (arity !== undefined) counts = [arity];
+        else if (symbolTable(scope)[id]?.kind === 'builtin' && builtinArity[id]) counts = builtinArity[id]!;
       }
-      const counts = arity === undefined ? [0, 1, 2, 3] : [arity];
       const count = Number(await pick('argument_count', scope, Object.fromEntries(counts.map(value => [String(value), `${value} positional arguments.`]))));
       for (let i = 0; i < count; i++) {
         const arg = node('Hole'); args.push(arg);
@@ -369,9 +371,9 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
   }
 
   async function block(body: PythonNode[], scope: Scope, depth: number, slot: string): Promise<void> {
-    while (true) {
+    while (body.length < maxBlockStatements) {
       const criteria: Record<string, string> = { expr: 'Evaluate an expression, usually a function call such as print.', assign: 'Assign a value to a variable.' };
-      criteria.pass = 'An explicit empty statement (pass), for a required empty block.';
+      if (!body.length) criteria.pass = 'An explicit empty statement (pass), for a required empty block.';
       if (body.length || (slot === 'module_body' && options.allowEmpty)) criteria.finish = 'This block satisfies its required behavior; finish it now.';
       if (scope.function) criteria.return = 'Return a value from this function.';
       if (scope.loop) { criteria.break = 'Break from the enclosing loop.'; criteria.continue = 'Continue the enclosing loop.'; }

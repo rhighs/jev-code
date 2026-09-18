@@ -187,6 +187,28 @@ test('numeric terminals offer constants only and string spelling stops after thr
   assert.ok(!spelled.states.some(state => String(state.generation.slot).startsWith('string_token:"aaa"')));
 });
 
+test('blocks cannot repeat pass, are capped in length, identifiers never spell, and range needs an argument', async () => {
+  const loop = new AstProvider(['0', 'while', 'boolean', 'true', 'pass', 'finish', 'finish']);
+  assert.equal(await generatePythonAst(decisions(loop), state, 'content', options), 'while True:\n    pass\n');
+  const after = loop.states.findIndex((s, i) => s.generation.slot === 'loop_body' && i > loop.states.findIndex(x => x.generation.slot === 'loop_body'));
+  assert.ok(after > 0);
+  assert.ok(!Object.keys(loop.criteria[after]!).includes('pass'));
+  const script: Array<string | { value: string }> = ['0'];
+  for (let i = 0; i < 16; i++) script.push('expr', 'call', { value: 'print' }, '0');
+  const capped = new AstProvider(script);
+  const source = await generatePythonAst(decisions(capped), state, 'content', options);
+  assert.equal(source.split('\n').filter(Boolean).length, 16);
+  assert.ok(!capped.states.some(s => s.generation.slot === 'module_body' && Object.keys(capped.criteria[capped.states.indexOf(s)]!).includes('finish') && capped.states.indexOf(s) === capped.states.length - 1));
+  const named = new AstProvider(['0', 'assign', { value: JSON.stringify('result') }, 'number', { value: '1' }, 'finish']);
+  await generatePythonAst(decisions(named), state, 'content', options);
+  const nameSlot = named.states.findIndex(s => s.generation.slot === 'assignment_name');
+  assert.ok(!Object.keys(named.criteria[nameSlot]!).includes('custom'));
+  const ranged = new AstProvider(['0', 'for', { value: JSON.stringify('i') }, 'call', { value: 'range' }, '1', 'number', { value: '5' }, 'pass', 'finish', 'finish']);
+  await generatePythonAst(decisions(ranged), { task: { prompt: 'Write a for loop in Python.' } }, 'content', options);
+  const count = ranged.states.findIndex(s => s.generation.slot === 'argument_count');
+  assert.deepEqual(Object.keys(ranged.criteria[count]!), ['1', '2', '3']);
+});
+
 test('ordinary for-loop range bounds exclude zero and builtins are not variable references', async () => {
   const provider = new AstProvider(['0', 'for', { value: JSON.stringify('i') }, 'call', { value: 'range' }, '1', 'number', { value: '5' },
     'expr', 'call', { value: 'print' }, '1', 'name', 'finish', 'finish']);
