@@ -14,6 +14,7 @@ import { formatDuration } from './timing.js';
 import { AstRegistry, loadInstalledAsts, loadAstModule, installAstModule, removeAstAdapter } from './ast-adapters.js';
 import { compareRecords, formatComparison, runEval, type EvalRecord } from './eval.js';
 import { runDecide } from './decide.js';
+import { checkSchema, findJournal, readJournal, replayPlain } from './replay.js';
 import type { HarnessOptions } from './harness.js';
 import type { Tool } from './types.js';
 
@@ -49,6 +50,9 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
   decide --spec <file.json>   Run [{ question, choices } | { true, threshold? } | { score }] over stdin; one JSON line each
     --lines                   With --true or --score: one request per stdin line, ranked best first
     --json                    Print each decide answer as a decision event; failures exit 125
+  replay <run-id>         Render a saved .jev/runs or .jev/eval journal through the transcript
+    --speed <x>               Pace events at x times real time (default: instant; gaps capped at 2 s)
+    --plain                   Print cards as text instead of the Ink view
   --eval-out <dir>        Directory for .jev/eval records (default: current directory)
   --json                  Emit JSONL events on stdout
   --no-journal            Disable .jev/runs JSONL persistence
@@ -69,6 +73,30 @@ async function stdinText(): Promise<string> {
   return value;
 }
 
+async function replay(args: string[]): Promise<void> {
+  const { values, positionals } = parseArgs({ args, allowPositionals: true, options: { speed: { type: 'string' }, plain: { type: 'boolean' } } });
+  const [id, ...extra] = positionals;
+  if (!id || extra.length) throw new Error('Use replay <run-id> [--speed <x>] [--plain].');
+  const speed = values.speed === undefined ? 0 : Number(values.speed);
+  if (values.speed !== undefined && (!Number.isFinite(speed) || speed < 0)) throw new Error('--speed must be a number >= 0.');
+  const path = await findJournal(process.cwd(), id);
+  if (!path) throw new Error(`No journal found for run ${id}.`);
+  const events = await readJournal(path);
+  const warning = checkSchema(events);
+  if (warning) process.stderr.write(`replay: ${warning}\n`);
+  if (!values.plain && isInteractiveTTY(process.stdin, process.stderr)) {
+    const { runReplay } = await import('./ui/replay-session.js');
+    process.exitCode = await runReplay({ events, runId: id, speed });
+    return;
+  }
+  const controller = new AbortController();
+  const stop = (): void => controller.abort();
+  process.on('SIGINT', stop);
+  try { await replayPlain(events, { stdout: process.stdout, stderr: process.stderr }, speed, controller.signal); }
+  finally { process.removeListener('SIGINT', stop); }
+  if (controller.signal.aborted) process.exitCode = 130;
+}
+
 async function main(): Promise<void> {
   try { loadEnvFile(); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
@@ -82,6 +110,7 @@ async function main(): Promise<void> {
     process.exitCode = res.code;
     return;
   }
+  if (process.argv[2] === 'replay') return replay(process.argv.slice(3));
   const { values, positionals } = parseArgs({ allowPositionals: true, options: {
     workspace: { type: 'string' }, 'prompt-file': { type: 'string' }, interactive: { type: 'boolean' },
     print: { type: 'boolean', short: 'p' },
