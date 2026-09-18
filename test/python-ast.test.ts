@@ -10,7 +10,7 @@ import { Harness } from '../src/harness.js';
 import type { DecisionProvider, HarnessEvent } from '../src/types.js';
 import { ScriptedProvider } from './helpers.js';
 
-interface AstState { generation: { phase: string; slot: string; partialAst: unknown; symbols: string[]; constraints: { inFunction: boolean; inLoop: boolean } } }
+interface AstState { generation: { phase: string; slot: string; partialSource: string; partialAst?: unknown; symbols: string[]; constraints: { inFunction: boolean; inLoop: boolean } } }
 class AstProvider implements DecisionProvider {
   states: AstState[] = [];
   criteria: Array<Record<string, EntryType>> = [];
@@ -50,7 +50,12 @@ test('Python AST builds a complete tree, streams productions and unparses execut
   assert.equal(progress.length, 7);
   assert.deepEqual(progress.slice(0, 5), ['expr', 'call', 'name_0', '1', 'string']);
   assert.equal(progress.at(-1), 'finish');
-  assert.ok(provider.states.some(state => JSON.stringify(state.generation.partialAst).includes('Call')));
+  assert.ok(provider.states.every(state => !Object.hasOwn(state.generation, 'partialAst')));
+  const argument = provider.states.find(state => state.generation.slot === 'argument_0')!;
+  assert.match(argument.generation.partialSource, /print\(__jev_pending__\)/);
+  const statement = provider.states.find(state => state.generation.slot === 'module_body')!;
+  assert.equal(statement.generation.partialSource, '__jev_pending__\n');
+  assert.equal(provider.states.at(-1)!.generation.partialSource, "print('Hello, world!')\n__jev_pending__\n");
 });
 
 test('function parameters enter the symbol table and return is allowed only in function scope', async () => {

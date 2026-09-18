@@ -3,6 +3,7 @@ import type { Decisions, State } from './decisions.js';
 import type { GenerateOptions } from './generation.js';
 import { gridCursor } from './grid.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
+import { buildDecisionContext, PENDING, windowSource } from './decision-context.js';
 import { LimitError } from './types.js';
 import { choice } from '@typesafe-ai/sdk';
 
@@ -20,7 +21,7 @@ function previewTree(value: unknown, field = ''): unknown {
   if (Array.isArray(value)) return value.length ? value.map(item => previewTree(item, field)) : field === 'body' ? [node('Pass')] : [];
   if (!value || typeof value !== 'object') return value;
   const ast = value as PythonNode;
-  if (ast._type === 'Hole') return field === 'body' ? node('Pass') : name('__jev_pending__');
+  if (ast._type === 'Hole') return field === 'body' ? node('Expr', { value: name(PENDING) }) : name(PENDING);
   return Object.fromEntries(Object.entries(ast).map(([key, child]) => [key, ast._type === 'Module' && key === 'body' && Array.isArray(child) && !child.length ? [] : previewTree(child, key)]));
 }
 
@@ -111,24 +112,28 @@ export async function generatePythonAst(decisions: Decisions, state: State, fiel
   async function pick(slot: string, scope: Scope, criteria: Record<string, string>, depth = 0): Promise<string> {
     decisions.signal.throwIfAborted();
     if (++step > options.maxSteps) throw new LimitError(`Python AST production budget exhausted (${options.maxSteps}).`);
-    if (Buffer.byteLength(JSON.stringify(tree)) > 16_000) throw new LimitError('Python partial AST exceeds the decision context budget.');
     const keys = Object.keys(criteria);
     if (!keys.length) throw new Error(`No valid Python AST production for ${slot}.`);
-    const input = {
-      task: { prompt: objective }, recent: context.recent ?? [],
-      generation: { field, phase: 'ast', slot, partialAst: tree, symbols: visible(scope), symbolTable: symbolTable(scope),
-        constraints: { depth, maxDepth, inFunction: scope.function, inLoop: scope.loop, remainingSteps: options.maxSteps - step },
-      },
-    };
-    const instruction = `Choose the next valid Python AST production for ${slot}. Satisfy the objective with the smallest sufficient program. Complete the current slot only; do not add unrequested behavior.`;
-    if (Buffer.byteLength(JSON.stringify({ state: input, questions: { selection: choice(instruction, criteria) } })) > MAX_GRID_REQUEST_BYTES) throw new LimitError('Python AST decision exceeds the safe request size.');
+    const preview = await unparsePython(previewTree(tree) as PythonNode, decisions.signal, options.maxBytes);
+    const instruction = `Choose the next valid Python AST production for ${slot}. The rendered source marks the slot being filled with ${PENDING}. Satisfy the objective with the smallest sufficient program. Complete the current slot only; do not add unrequested behavior.`;
+    const core = { field, phase: 'ast', slot, symbols: visible(scope), symbolTable: symbolTable(scope),
+      constraints: { depth, maxDepth, inFunction: scope.function, inLoop: scope.loop, remainingSteps: options.maxSteps - step } };
+    const assemble = (values: Record<string, unknown>): State => ({
+      task: values.task, ...(values.recent === undefined ? {} : { recent: values.recent }), ...(values.plan === undefined ? {} : { plan: values.plan }),
+      generation: { ...core, partialSource: values.source, ...(values.trimmed === undefined ? {} : { trimmed: values.trimmed }) },
+    });
+    const { values, trimmed } = buildDecisionContext([
+      { key: 'task', value: { prompt: objective }, required: true },
+      { key: 'core', value: core, required: true },
+      { key: 'source', value: preview, shrink: windowSource },
+      { key: 'recent', value: context.recent ?? [] },
+      ...(typeof context.plan === 'string' && context.plan ? [{ key: 'plan', value: context.plan }] : []),
+    ], parts => Buffer.byteLength(JSON.stringify({ state: assemble(parts), questions: { selection: choice(instruction, criteria) } })), MAX_GRID_REQUEST_BYTES);
+    const input = assemble(trimmed.length ? { ...values, trimmed } : values);
     const selected = keys.length === 1 ? keys[0]! : await decisions.choose(input, instruction, criteria);
-    if (options.onText) {
-      const preview = await unparsePython(previewTree(tree) as PythonNode, decisions.signal, options.maxBytes);
-      await options.onText(field, preview, false, { replace: preview }, {
-        decoder: 'ast', step, cursor: gridCursor(preview), bytes: Buffer.byteLength(preview), ast: { slot, production: selected, symbols: visible(scope) },
-      });
-    }
+    await options.onText?.(field, preview, false, { replace: preview }, {
+      decoder: 'ast', step, cursor: gridCursor(preview), bytes: Buffer.byteLength(preview), ast: { slot, production: selected, symbols: visible(scope) },
+    });
     return selected;
   }
 
@@ -231,9 +236,9 @@ export async function generatePythonAst(decisions: Decisions, state: State, fiel
       if (scope.function) criteria.return = 'Return a value from this function.';
       if (scope.loop) { criteria.break = 'Break from the enclosing loop.'; criteria.continue = 'Continue the enclosing loop.'; }
       if (depth < maxDepth) Object.assign(criteria, { function: 'Define a named function.', if: 'Conditional statement.', for: 'For loop over an iterable.', while: 'While loop.', import: 'Import a Python standard library module.' });
-      const production = await pick(slot, scope, criteria, depth);
-      if (production === 'finish') return;
       const statement = node('Hole'); body.push(statement);
+      const production = await pick(slot, scope, criteria, depth);
+      if (production === 'finish') { body.pop(); return; }
       if (production === 'expr' || production === 'assign' || production === 'return') {
         const value = node('Hole');
         if (production === 'expr') Object.assign(statement, node('Expr', { value }));
