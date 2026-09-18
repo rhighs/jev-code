@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { chmod, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -103,6 +103,7 @@ test('validation is static: unresolved imports and syntax errors write nothing, 
   await assert.rejects(tool.execute({ files: JSON.stringify({ 'main.py': 'from greeter.missing import greet\n', 'greeter/__init__.py': '' }) }, context(root)), /greeter\.missing/);
   await assert.rejects(tool.execute({ files: JSON.stringify({ 'main.py': 'from greeter.helper import nothing\n', 'greeter/__init__.py': '', 'greeter/helper.py': 'def greet(name):\n    return name\n' }) }, context(root)), /nothing/);
   await assert.rejects(tool.execute({ files: JSON.stringify({ 'main.py': 'print(\n', 'ok.py': 'x = 1\n' }) }, context(root)), /main\.py/);
+  await assert.rejects(tool.execute({ files: JSON.stringify({ 'main.py': 'from random.core import x\n', 'random/__init__.py': '', 'random/core.py': 'x = 1\n' }) }, context(root)), /random shadows an installed module/);
   assert.deepEqual(await listAll(root), []);
   await validatePythonProject({ 'main.py': "open('side-effect.txt', 'w').write('ran')\nimport os\nfrom os import path\n" }, signal, dir);
   assert.deepEqual(await listAll(dir), ['main.py']);
@@ -149,4 +150,22 @@ test('harness end to end: write_files is selected, the manifest is generated, fi
   assert.deepEqual(await listAll(root), ['greeter', 'greeter/__init__.py', 'greeter/helper.py', 'main.py']);
   assert.match(result.summary, /Wrote main\.py\./);
   assert.equal((await run('python3', ['main.py'], { cwd: root })).stdout, 'greet\n');
+});
+
+test('write_files leaves existing files untouched when a target is not a regular file or two entries alias one file', async t => {
+  const root = await workspace(t);
+  const tool = writeFiles();
+  const manifest = { 'main.py': "from pkg.mod import f\nprint(f())\n", 'pkg/__init__.py': '', 'pkg/mod.py': 'def f():\n    return 1\n' };
+  await writeFile(join(root, 'main.py'), 'original\n');
+  await mkdir(join(root, 'pkg', 'mod.py'), { recursive: true });
+  await assert.rejects(tool.execute({ files: JSON.stringify(manifest) }, context(root)), /not a regular file/);
+  assert.equal(await readFile(join(root, 'main.py'), 'utf8'), 'original\n');
+  assert.deepEqual(await listAll(root), ['main.py', 'pkg', 'pkg/mod.py']);
+  await rm(join(root, 'pkg', 'mod.py'), { recursive: true });
+  await writeFile(join(root, 'pkg', 'mod.py'), 'def f():\n    return 0\n');
+  await symlink('mod.py', join(root, 'pkg', 'alias.py'));
+  await assert.rejects(tool.execute({ files: JSON.stringify({ ...manifest, 'pkg/alias.py': 'def f():\n    return 2\n' }) }, context(root)), /pkg\/mod\.py and pkg\/alias\.py resolve to the same file/);
+  assert.equal(await readFile(join(root, 'main.py'), 'utf8'), 'original\n');
+  assert.equal(await readFile(join(root, 'pkg', 'mod.py'), 'utf8'), 'def f():\n    return 0\n');
+  assert.deepEqual(await listAll(root), ['main.py', 'pkg', 'pkg/alias.py', 'pkg/mod.py']);
 });

@@ -72,6 +72,8 @@ test('static checks report compile, undefined, arity and return in that order', 
   assert.equal(await checkCandidate('def f(x):\n    g(x, x)\n', spec, signal), 'return');
   assert.equal(await checkCandidate('def f(x):\n    return g(x, x)\n', spec, signal), undefined);
   assert.equal(await checkCandidate('def f(x):\n    print(x)\n', { ...spec, wantsReturn: false }, signal), undefined);
+  assert.equal(wantsReturn('print what is left'), false);
+  assert.equal(wantsReturn('check whether the file has lines'), true);
   assert.equal(wantsReturn('returns the greeting'), true);
   assert.equal(wantsReturn('print the board'), false);
 });

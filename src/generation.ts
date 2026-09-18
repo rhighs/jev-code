@@ -42,7 +42,7 @@ export function syntaxFeedback(state: State, field: string, text: string): Array
 
 export async function generateText(decisions: Decisions, state: State, field: string, description: string, options: GenerateOptions): Promise<string> {
   if (field === 'command' && !options.experimentalGrid) return generateBashAst(decisions, state, field, options);
-  if (field === 'files') {
+  if (field === 'files' && state.action === 'write_files') {
     const registry = options.astRegistry ?? defaultAsts;
     const adapter = [registry.resolve(state), ...registry.list()].find(candidate => candidate?.generateProject && candidate.validateProject);
     if (!adapter) throw new Error('No AST adapter can generate a multi-file project.');

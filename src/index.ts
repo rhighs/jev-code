@@ -7,6 +7,7 @@ export { characterAlphabet, gridCursor } from './grid.js';
 export { generatePythonAst, unparsePython, type PythonNode } from './python-ast.js';
 export { AstRegistry, pythonAstAdapter, loadAstModule, loadInstalledAsts, installAstModule, removeAstAdapter, type AstAdapter } from './ast-adapters.js';
 export { formatDuration } from './timing.js';
+export { runEval, loadTasks, compareRecords, formatComparison, type EvalRecord, type EvalTask, type CheckResult } from './eval.js';
 export { typescriptAstAdapter } from './typescript-ast.js';
 export { generateBashAst, renderBashAst, validateBashSource, type BashAst } from './bash-ast.js';
 export type { CharacterSymbol, GridCursor, GridProgress, ScoredCell, TextChange, TextProgress } from './grid.js';

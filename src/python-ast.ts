@@ -98,6 +98,8 @@ const projectBridge = String.raw`
 import ast, json, os, sys, importlib.util
 root = os.getcwd()
 paths = json.load(sys.stdin)
+for top in sorted({p.split('/')[0].removesuffix('.py') for p in paths}):
+    if importlib.util.find_spec(top) is not None: raise ValueError(f'{top} shadows an installed module')
 sys.path.insert(0, root)
 def local(parts):
     base = os.path.join(root, *parts)

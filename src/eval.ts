@@ -53,9 +53,14 @@ export async function loadTasks(tasksDir: string, only?: string): Promise<EvalTa
 
 export function runPython(workspace: string, args: string[], opts: RunPythonOptions): Promise<RunPythonResult> {
   return new Promise(res => {
-    const child = spawn('python3', ['-u', ...args], { cwd: workspace, env: sanitizedEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
+    const detached = process.platform !== 'win32';
+    const child = spawn('python3', ['-u', ...args], { cwd: workspace, env: sanitizedEnv(), detached, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '', stderr = '', timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, opts.timeoutMs);
+    const kill = (): void => {
+      if (detached && child.pid) { try { process.kill(-child.pid, 'SIGKILL'); return; } catch {} }
+      child.kill('SIGKILL');
+    };
+    const timer = setTimeout(() => { timedOut = true; kill(); }, opts.timeoutMs);
     const write = (text: string): void => { if (!child.stdin.destroyed) child.stdin.write(text); };
     child.stdin.on('error', () => {});
     child.stdout.on('data', (c: Buffer) => { stdout += c.toString(); });
@@ -86,6 +91,9 @@ export async function runEval(opts: RunEvalOptions): Promise<EvalRecord[]> {
   const tasks = await loadTasks(opts.tasksDir ?? defaultTasksDir, opts.only);
   const sha = await commit();
   const records: EvalRecord[] = [];
+  const dir = join(resolve(opts.out), '.jev', 'eval');
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const file = join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
   for (const task of tasks) {
     const ws = await mkdtemp(join(tmpdir(), `jev-eval-${task.name}-`));
     try {
@@ -96,21 +104,21 @@ export async function runEval(opts: RunEvalOptions): Promise<EvalRecord[]> {
         authorize: () => true, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}),
       });
       const result = await harness.run(task.prompt);
-      const check = result.status === 'completed' ? await task.check(ws) : { ok: false, reason: `run ${result.status}: ${result.summary}` };
+      const check = result.status === 'completed'
+        ? await task.check(ws).catch((err: unknown) => ({ ok: false, reason: `checker threw: ${err instanceof Error ? err.message : String(err)}` }))
+        : { ok: false, reason: `run ${result.status}: ${result.summary}` };
       const record: EvalRecord = {
         task: task.name, stage: task.stage, status: result.status, summary: result.summary, check,
         turns: result.turns, requests: result.requests, inputTokens: result.usage.inputTokens, durationMs: result.durationMs,
         runId: result.id, commit: sha, startedAt: result.startedAt,
       };
       records.push(record);
+      await writeFile(file, JSON.stringify(records, null, 2) + '\n', { mode: 0o600 });
       opts.onRecord?.(record);
     } finally {
       await rm(ws, { recursive: true, force: true });
     }
   }
-  const dir = join(resolve(opts.out), '.jev', 'eval');
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  await writeFile(join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}.json`), JSON.stringify(records, null, 2) + '\n', { mode: 0o600 });
   return records;
 }
 

@@ -53,6 +53,14 @@ test('guessing-game checker fails a program that exits before the correct guess'
   assert.match(res.reason, /exited/i);
 });
 
+test('guessing-game checker fails a program that prints Correct without any feedback', async t => {
+  const ws = await workspace(t);
+  await writeFile(join(ws, 'main.py'), "input()\nprint('Correct')\n");
+  const res = await check_guessing(ws);
+  assert.equal(res.ok, false);
+  assert.match(res.reason, /never produced too high\/too low feedback/);
+});
+
 test('guessing-game checker fails when no program exists', async t => {
   const ws = await workspace(t);
   const res = await check_guessing(ws);
@@ -91,6 +99,11 @@ test('multi-file checker requires two python files and a runnable main.py', asyn
   const single = await check_multi(ws);
   assert.equal(single.ok, false);
   assert.match(single.reason, /two/);
+  await writeFile(join(ws, 'unused.py'), 'x = 1\n');
+  const unrelated = await check_multi(ws);
+  assert.equal(unrelated.ok, false);
+  assert.match(unrelated.reason, /does not import a local module/);
+  await rm(join(ws, 'unused.py'));
   await mkdir(join(ws, 'greet'));
   await writeFile(join(ws, 'greet', '__init__.py'), '');
   await writeFile(join(ws, 'greet', 'text.py'), "def greeting(name):\n    return 'Hello, ' + name + '!'\n");
@@ -182,4 +195,13 @@ test('compare marks a task missing from one record as absent instead of throwing
   assert.equal(rows[1]!.deltas, undefined);
   const text = formatComparison(rows);
   assert.match(text, /\| c \| absent → pass \| absent → 10 \| absent → 1\.0 s \| absent → completed \|/);
+});
+
+test('cli eval compare prints the comparison table for two record files', async t => {
+  const dir = await workspace(t);
+  await writeFile(join(dir, 'a.json'), JSON.stringify([record('a', false, 100, 30_000)]));
+  await writeFile(join(dir, 'b.json'), JSON.stringify([record('a', true, 80, 20_000)]));
+  const run = promisify(execFile);
+  const { stdout } = await run('npx', ['tsx', resolve('src/cli.ts'), 'eval', 'compare', join(dir, 'a.json'), join(dir, 'b.json')], { cwd: resolve('.') });
+  assert.match(stdout, /\| a \| fail → pass \| 100 → 80 \(-20\) \|/);
 });

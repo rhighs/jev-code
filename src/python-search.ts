@@ -13,7 +13,7 @@ export interface SearchHooks {
   report(candidate: Candidate): Promise<void>;
 }
 
-export const wantsReturn = (purpose: string): boolean => /\b(?:returns?|compute|calculate|get|read|sum|count|total|check|is|has|parse|build|make|create|convert)\b/i.test(purpose);
+export const wantsReturn = (purpose: string): boolean => /\b(?:returns?|compute|calculate|get|read|sum|count|total|check|parse|build|make|create|convert)\b/i.test(purpose);
 
 /** K candidates from independent forks; static pruning first, Jev score second; ties keep the first. */
 export async function searchUnit(unit: Unit, decisions: Decisions, hooks: SearchHooks): Promise<void> {

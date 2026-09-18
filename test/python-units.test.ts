@@ -131,3 +131,13 @@ test('text events during unit generation carry the unit and the assembled module
   for (const e of during) { assert.match(e.text, /def greet\(name\):/); assert.match(e.text, /def shout\(name\):/); }
   assert.ok(during.some(e => e.unit === 'greet') && during.some(e => e.unit === 'shout'));
 });
+
+test('a prompt without ASCII words skips decomposition instead of failing on an empty purpose vocabulary', async () => {
+  const provider = new GateProvider([
+    { slot: 'module_body', answer: 'expr', once: true }, { slot: 'expression', answer: 'call' }, { slot: 'callee', answer: { value: 'print' } },
+    { slot: 'argument_count', answer: '1' }, { slot: 'argument_0', answer: 'number' }, { slot: 'number', answer: { value: '1' } }, { slot: 'module_body', answer: 'finish' },
+  ]);
+  const source = await generatePythonAst(decisions(provider), { task: { prompt: '打印 1 到 10 的数字' } }, 'content', options);
+  assert.equal(source, 'print(1)\n');
+  assert.ok(!provider.seen.some(s => s.generation.slot === 'unit_count'));
+});

@@ -21,6 +21,7 @@ export async function decomposeLayout(root: Builder, scope: Scope): Promise<Layo
 }
 
 export async function decompose(root: Builder, scope: Scope, vocab: Vocab, peers: Peer[], layout?: Layout): Promise<Unit[]> {
+  if (!vocab.purposes.length) return [];
   const count = Number(await root.pick('unit_count', scope, counts(6, i => i === 0 ? 'No helper functions; write the program as one main block.' : `${i} helper function${i > 1 ? 's' : ''}, each generated on its own, then a main block that uses them.`)));
   const units: Unit[] = [];
   for (let i = 0; i < count; i++) {

@@ -19,17 +19,22 @@ const number = (args: Args, key: string, fallback: number): number => {
   return value;
 };
 
-interface Staged { commit(): Promise<void>; discard(): Promise<void> }
+interface Staged { commit(): Promise<void>; undo(): Promise<void>; done(): Promise<void> }
 
-async function stage(path: string, contents: string, signal: AbortSignal): Promise<Staged> {
+const unlinkQuiet = (path: string): Promise<void> => unlink(path).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; });
+
+async function stage(path: string, contents: string, signal: AbortSignal, backup: boolean): Promise<Staged> {
   signal.throwIfAborted();
   await mkdir(dirname(path), { recursive: true });
-  const temp = `${path}.jev-${randomUUID()}.tmp`;
+  const id = randomUUID();
+  const temp = `${path}.jev-${id}.tmp`, saved = `${path}.jev-${id}.bak`;
   let mode = 0o644;
   let existing = false;
-  try { mode = (await stat(path)).mode & 0o777; existing = true; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-  const discard = (): Promise<void> => unlink(temp).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; });
+  try {
+    const info = await stat(path);
+    if (!info.isFile()) throw new Error(`Cannot write ${path}: not a regular file.`);
+    mode = info.mode & 0o777; existing = true;
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   try {
     const file = await open(temp, 'wx', mode);
     try {
@@ -37,23 +42,39 @@ async function stage(path: string, contents: string, signal: AbortSignal): Promi
       await file.writeFile(contents, 'utf8');
       await file.sync();
     } finally { await file.close(); }
-  } catch (error) { await discard(); throw error; }
-  return { commit: async () => { signal.throwIfAborted(); await rename(temp, path); }, discard };
+  } catch (error) { await unlinkQuiet(temp); throw error; }
+  const keep = existing && backup;
+  let phase: 'staged' | 'moved' | 'committed' = 'staged';
+  return {
+    commit: async () => {
+      if (keep) { await rename(path, saved); phase = 'moved'; }
+      await rename(temp, path); phase = 'committed';
+    },
+    undo: async () => {
+      if (phase !== 'committed') await unlinkQuiet(temp);
+      if (keep && phase !== 'staged') await rename(saved, path);
+      else if (!existing && phase === 'committed') await unlinkQuiet(path);
+    },
+    done: async () => { if (keep) await unlinkQuiet(saved); },
+  };
 }
 
 export async function atomicWrite(path: string, contents: string, signal: AbortSignal): Promise<void> {
   await atomicWriteAll([[path, contents]], signal);
 }
 
-/** Every file is staged before any is renamed into place, so a failure leaves the tree untouched. */
+/** Every file is staged, then renamed into place; if a rename fails, earlier renames are undone from backups, so a failure leaves the files as they were. */
 export async function atomicWriteAll(entries: Array<[string, string]>, signal: AbortSignal): Promise<void> {
-  const pending: Staged[] = [];
+  const staged: Staged[] = [];
   try {
-    for (const [path, contents] of entries) pending.push(await stage(path, contents, signal));
-    while (pending.length) { await pending[0]!.commit(); pending.shift(); }
-  } finally {
-    for (const item of pending) await item.discard();
+    for (const [path, contents] of entries) staged.push(await stage(path, contents, signal, entries.length > 1));
+    signal.throwIfAborted();
+    for (const item of staged) await item.commit();
+  } catch (error) {
+    for (const item of staged) await item.undo().catch(() => {});
+    throw error;
   }
+  for (const item of staged) await item.done();
 }
 
 export async function runBash(command: string, cwd: string, timeoutMs: number, signal: AbortSignal, maxOutputBytes = 32_000,
@@ -187,7 +208,14 @@ export function builtInTools(): Tool[] {
       async execute(args, context) {
         const files = parseManifest(text(args, 'files'));
         const targets: Array<[string, string]> = [];
-        for (const [path, content] of Object.entries(files)) targets.push([await context.resolvePath(path), content]);
+        const canonical = new Map<string, string>();
+        for (const [path, content] of Object.entries(files)) {
+          const target = await context.resolvePath(path);
+          const prior = canonical.get(target);
+          if (prior !== undefined) throw new Error(`Manifest entries ${prior} and ${path} resolve to the same file.`);
+          canonical.set(target, path);
+          targets.push([target, content]);
+        }
         await validatePythonProject(files, context.signal);
         await atomicWriteAll(targets, context.signal);
         const paths = Object.keys(files);

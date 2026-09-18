@@ -187,8 +187,12 @@ export class Harness {
           delete criteria[previous.tool];
           state.progressFeedback = 'The last two reads returned the same unchanged result. Choose another action that advances the task; the repeated read tool is unavailable for this turn.';
         }
-        const writtenPath = (record: ToolRecord | undefined): string | undefined => record && record.result.ok && record.tool !== 'set_plan' &&
-          this.registry.get(record.tool)?.effect === 'write' && typeof record.args.path === 'string' ? record.args.path : undefined;
+        const writtenPath = (record: ToolRecord | undefined): string | undefined => {
+          if (!record?.result.ok) return undefined;
+          if (record.tool === 'write_file' && typeof record.args.path === 'string') return record.args.path;
+          if (record.tool === 'write_files' && Array.isArray(record.result.data?.paths)) return [...record.result.data.paths as string[]].sort().join(', ');
+          return undefined;
+        };
         const rewritten = writtenPath(previous);
         if (rewritten !== undefined && rewritten === writtenPath(earlier)) {
           for (const tool of this.registry.values()) if (tool.effect === 'write' && tool.name !== 'set_plan') delete criteria[tool.name];

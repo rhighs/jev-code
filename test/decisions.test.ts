@@ -21,3 +21,15 @@ test('score rejects answers without probabilities or with levels outside the rub
   await assert.rejects(decisions(provider({ type: 'score', score: 7, confidence: 1, legend: {}, probabilities: { '0': 0, '1': 0, '2': 0, '3': 1 } })).score({}, 'rate', levels), DecisionError);
   await assert.rejects(decisions(provider({ type: 'choice', choice: '3', confidence: 1, probabilities: { '3': 1 } })).score({}, 'rate', levels), DecisionError);
 });
+
+test('a request queued behind the in-flight cap rejects when the shared signal aborts', async () => {
+  const ctrl = new AbortController();
+  const hanging: DecisionProvider = { decide: (_state, _questions, signal) => new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })) };
+  const d = new Decisions(hanging, 10, ctrl.signal, undefined, 1);
+  const first = d.choose({}, 'pick', { a: 'A', b: 'B' });
+  const second = d.choose({}, 'pick', { a: 'A', b: 'B' });
+  await new Promise(r => setTimeout(r, 20));
+  ctrl.abort(new Error('stop'));
+  await assert.rejects(first, /stop/);
+  await assert.rejects(second, /stop/);
+});

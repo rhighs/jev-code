@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { Harness } from '../src/harness.js';
-import type { DecisionProvider } from '../src/types.js';
+import { builtInTools } from '../src/tools.js';
+import type { DecisionProvider, Tool } from '../src/types.js';
 import { ScriptedProvider, type Step } from './helpers.js';
 
 async function workspace(t: test.TestContext): Promise<string> {
@@ -335,4 +336,22 @@ test('unchanged repeated reads require a different next action', async t => {
   assert.equal(await readFile(join(root, 'main.txt'), 'utf8'), 'new');
   assert.equal(result.turnTimings.length, 4);
   assert.equal(result.turnTimings.reduce((sum, timing) => sum + timing.requests, 0), result.requests);
+});
+
+test('two consecutive write_files over the same paths trigger the rewrite guard', async t => {
+  const root = await workspace(t);
+  const provider = new ScriptedProvider([
+    { action: 'write_files', args: { set: 'a' } },
+    { action: 'write_files', args: { set: 'b' } },
+    { action: 'bash', args: { command: 'true', cwd: '.', timeout_ms: '' } },
+    { action: 'finish', verdict: 1 },
+  ]);
+  const tools: Tool[] = [...builtInTools().filter(tool => tool.name !== 'write_files'), {
+    name: 'write_files', effect: 'write', description: 'Fake multi-file writer.', fields: { set: { type: 'string', description: 'Set.' } },
+    async execute() { return { ok: true, output: 'Wrote 2 files.', data: { paths: ['pkg/mod.py', 'main.py'] } }; },
+  }];
+  const result = await new Harness({ workspace: root, provider, tools, experimentalGrid: true, journalDirectory: false }).run('Write a package.');
+  assert.equal(result.status, 'completed', result.summary);
+  const third = provider.states.find(state => state.task.turn === 3) as { progressFeedback?: string } | undefined;
+  assert.match(third?.progressFeedback ?? '', /rewrote main\.py, pkg\/mod\.py/);
 });
