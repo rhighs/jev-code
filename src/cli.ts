@@ -14,6 +14,7 @@ import { GenerationDisplay } from './draft.js';
 import { formatDuration } from './timing.js';
 import { AstRegistry, loadInstalledAsts, loadAstModule, installAstModule, removeAstAdapter } from './ast-adapters.js';
 import { compareRecords, formatComparison, runEval, type EvalRecord } from './eval.js';
+import { runDecide } from './decide.js';
 import type { HarnessOptions } from './harness.js';
 import type { HarnessEvent, Tool } from './types.js';
 
@@ -43,6 +44,12 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
   ast remove <id>         Remove an installed adapter
   eval [task]             Run the live eval ladder (dev-only, implies --yes; honors --search-width)
   eval compare <a> <b>    Compare two .jev/eval record files
+  decide "<q>" --choices a,b  Ask one choice over stdin; prints "label confidence", exits with the label index
+  decide --true "<statement>" Print the probability the statement holds for stdin; exits 0 at or above --threshold (0.5)
+  decide --score "<criteria>" Print the expected level over a four-level rubric for stdin
+  decide --spec <file.json>   Run [{ question, choices } | { true, threshold? } | { score }] over stdin; one JSON line each
+    --lines                   With --true or --score: one request per stdin line, ranked best first
+    --json                    Print each decide answer as a decision event; failures exit 125
   --eval-out <dir>        Directory for .jev/eval records (default: current directory)
   --json                  Emit JSONL events on stdout
   --no-journal            Disable .jev/runs JSONL persistence
@@ -66,6 +73,16 @@ async function stdinText(): Promise<string> {
 async function main(): Promise<void> {
   try { loadEnvFile(); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  if (process.argv[2] === 'decide') {
+    if (!process.env.TYPESAFE_API_KEY) { process.stderr.write('decide: TYPESAFE_API_KEY is required.\n'); process.exitCode = 125; return; }
+    let input = '';
+    for await (const chunk of process.stdin) input += String(chunk);
+    const res = await runDecide(process.argv.slice(3), input, new JevProvider());
+    process.stdout.write(res.stdout);
+    process.stderr.write(res.stderr);
+    process.exitCode = res.code;
+    return;
+  }
   const { values, positionals } = parseArgs({ allowPositionals: true, options: {
     workspace: { type: 'string' }, 'prompt-file': { type: 'string' }, interactive: { type: 'boolean' },
     print: { type: 'boolean', short: 'p' },

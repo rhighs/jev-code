@@ -39,6 +39,10 @@ export class Decisions {
     return new Decisions(this.provider, this.maxRequests, AbortSignal.any([this.signal, signal]), this.onDecision, this.concurrency, this.counters);
   }
 
+  observe(onDecision: (data: DecisionEventData) => Promise<void>): Decisions {
+    return new Decisions(this.provider, this.maxRequests, this.signal, onDecision, this.concurrency, this.counters);
+  }
+
   private acquire(): Promise<void> {
     if (this.counters.inflight < this.concurrency) { this.counters.inflight++; return Promise.resolve(); }
     return new Promise((resolve, reject) => {
