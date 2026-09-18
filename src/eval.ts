@@ -6,6 +6,7 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { DEFAULT_LIMITS, Harness } from './harness.js';
+import { formatDuration } from './timing.js';
 import { builtInTools } from './tools.js';
 import type { DecisionProvider, HarnessEvent } from './types.js';
 
@@ -112,4 +113,27 @@ export async function runEval(opts: RunEvalOptions): Promise<EvalRecord[]> {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   await writeFile(join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}.json`), JSON.stringify(records, null, 2) + '\n', { mode: 0o600 });
   return records;
+}
+
+export interface CompareRow { task: string; a?: EvalRecord; b?: EvalRecord; deltas?: { requests: number; durationMs: number } }
+
+export function compareRecords(a: EvalRecord[], b: EvalRecord[]): CompareRow[] {
+  const byTask = (records: EvalRecord[]): Map<string, EvalRecord> => new Map(records.map(r => [r.task, r]));
+  const left = byTask(a), right = byTask(b);
+  return [...new Set([...left.keys(), ...right.keys()])].sort().map(task => {
+    const x = left.get(task), y = right.get(task);
+    return { task, ...(x ? { a: x } : {}), ...(y ? { b: y } : {}),
+      ...(x && y ? { deltas: { requests: y.requests - x.requests, durationMs: y.durationMs - x.durationMs } } : {}) };
+  });
+}
+
+export function formatComparison(rows: CompareRow[]): string {
+  const sign = (n: number, fmt: (v: number) => string): string => `${n < 0 ? '-' : '+'}${fmt(Math.abs(n))}`;
+  const cell = (row: CompareRow, f: (r: EvalRecord) => string): string => `${row.a ? f(row.a) : 'absent'} → ${row.b ? f(row.b) : 'absent'}`;
+  const lines = ['| task | pass | requests | duration | status |', '| --- | --- | --- | --- | --- |'];
+  for (const row of rows) {
+    const d = row.deltas;
+    lines.push(`| ${row.task} | ${cell(row, r => r.check.ok ? 'pass' : 'fail')} | ${cell(row, r => String(r.requests))}${d ? ` (${sign(d.requests, String)})` : ''} | ${cell(row, r => formatDuration(r.durationMs))}${d ? ` (${sign(d.durationMs, formatDuration)})` : ''} | ${cell(row, r => r.status)} |`);
+  }
+  return lines.join('\n') + '\n';
 }

@@ -13,7 +13,7 @@ import { TerminalSession } from './terminal.js';
 import { GenerationDisplay } from './draft.js';
 import { formatDuration } from './timing.js';
 import { AstRegistry, loadInstalledAsts, loadAstModule, installAstModule, removeAstAdapter } from './ast-adapters.js';
-import { runEval } from './eval.js';
+import { compareRecords, formatComparison, runEval, type EvalRecord } from './eval.js';
 import type { HarnessOptions } from './harness.js';
 import type { HarnessEvent, Tool } from './types.js';
 
@@ -42,6 +42,7 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
   ast list               List available AST adapters
   ast remove <id>         Remove an installed adapter
   eval [task]             Run the live eval ladder (dev-only, implies --yes)
+  eval compare <a> <b>    Compare two .jev/eval record files
   --eval-out <dir>        Directory for .jev/eval records (default: current directory)
   --json                  Emit JSONL events on stdout
   --no-journal            Disable .jev/runs JSONL persistence
@@ -84,9 +85,16 @@ async function main(): Promise<void> {
     else for (const adapter of new AstRegistry(await loadInstalledAsts(workspace)).list()) process.stdout.write(`${adapter.id}\t${adapter.extensions.join(', ')}\t${adapter.id === 'python' ? 'built-in' : 'installed'}\n`);
     return;
   }
+  if (positionals[0] === 'eval' && positionals[1] === 'compare') {
+    const [, , a, b, ...extra] = positionals;
+    if (!a || !b || extra.length) throw new Error('Use eval compare <a.json> <b.json>.');
+    const load = async (path: string): Promise<EvalRecord[]> => JSON.parse(await readFile(resolve(path), 'utf8')) as EvalRecord[];
+    process.stdout.write(formatComparison(compareRecords(await load(a), await load(b))));
+    return;
+  }
   if (positionals[0] === 'eval') {
     const [, only, ...extra] = positionals;
-    if (extra.length) throw new Error('Use eval [task].');
+    if (extra.length) throw new Error('Use eval [task] or eval compare <a.json> <b.json>.');
     if (!process.env.TYPESAFE_API_KEY) throw new Error('eval needs TYPESAFE_API_KEY for live Jev runs.');
     process.stderr.write('eval runs unattended: agent Bash executes on this host without confirmation.\n');
     const records = await runEval({ provider: new JevProvider(), out: resolve(values['eval-out'] ?? '.'), ...(only === undefined ? {} : { only }),

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
-import { loadTask, runEval, runPython } from '../src/eval.js';
+import { compareRecords, formatComparison, loadTask, runEval, runPython, type EvalRecord } from '../src/eval.js';
 import check_guessing from '../eval/guessing-game/check.js';
 import check_fileio from '../eval/file-io-script/check.js';
 import check_multi from '../eval/multi-file-package/check.js';
@@ -158,4 +158,28 @@ test('cli eval with an unknown task exits nonzero with a one-line error', async 
   const run = promisify(execFile);
   await assert.rejects(run('npx', ['tsx', resolve('src/cli.ts'), 'eval', 'no-such-task'], { cwd: resolve('.'), env: { ...process.env, TYPESAFE_API_KEY: 'x' } }),
     (err: Error & { code?: unknown; stderr?: string }) => err.code === 1 && /no-such-task/.test(err.stderr ?? ''));
+});
+
+const record = (task: string, ok: boolean, requests: number, durationMs: number, status = 'completed'): EvalRecord => ({
+  task, stage: 'x', status, summary: '', check: { ok, reason: '' }, turns: 1, requests, inputTokens: 1, durationMs, runId: 'r', commit: null, startedAt: 's',
+});
+
+test('compare prints one row per task with deltas', () => {
+  const rows = compareRecords([record('a', false, 100, 30_000), record('b', true, 20, 5_000)], [record('a', true, 80, 20_000), record('b', true, 25, 6_000)]);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows[0]!.deltas, { requests: -20, durationMs: -10_000 });
+  const text = formatComparison(rows);
+  const lines = text.trim().split('\n');
+  assert.equal(lines.length, 4);
+  assert.match(lines[2]!, /^\| a \| fail → pass \| 100 → 80 \(-20\) \| 30\.0 s → 20\.0 s \(-10\.0 s\) \| completed → completed \|$/);
+  assert.match(lines[3]!, /\| b \| pass → pass \| 20 → 25 \(\+5\) \|/);
+});
+
+test('compare marks a task missing from one record as absent instead of throwing', () => {
+  const rows = compareRecords([record('a', false, 100, 30_000)], [record('a', true, 80, 20_000), record('c', true, 10, 1_000)]);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1]!.a, undefined);
+  assert.equal(rows[1]!.deltas, undefined);
+  const text = formatComparison(rows);
+  assert.match(text, /\| c \| absent → pass \| absent → 10 \| absent → 1\.0 s \| absent → completed \|/);
 });

@@ -23,7 +23,7 @@ jev-code
 | TypeScript | `jev-code ast install builtin:typescript` — starter AST grammar. |
 | Other languages | Install an AST adapter; general files use bounded text choices. |
 
-Try: `write a for loop in Python and run it`.
+Try: `write a for loop in Python and run it`. From a source checkout, `npm run dev -- eval` runs the live eval ladder.
 
 `/help` · `/status` · `/files` · `/show main.py` · `/cancel` · `/permissions auto` · `/exit`
 
