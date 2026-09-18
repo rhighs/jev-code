@@ -45,13 +45,16 @@ test('registry snapshots cannot mutate registered ids, extensions or languages',
   assert.equal(registry.resolve({ argumentsSoFar: { path: 'README.md' }, task: { prompt: 'Explain Python in README.md.' } }), undefined);
 });
 
-test('bundled TypeScript adapter installs by stable name in any workspace', async t => {
+test('bundled adapters are registered by default and builtin: installs are accepted without writing config', async t => {
   const root = await mkdtemp(join(tmpdir(), 'jev-bundled-ast-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   assert.deepEqual(await installAstModule(root, 'builtin:typescript'), ['typescript']);
-  const adapters = await loadInstalledAsts(root);
-  assert.equal(adapters[0]?.id, 'typescript');
-  assert.equal(new AstRegistry(adapters).resolve({ argumentsSoFar: { path: 'main.ts' } })?.id, 'typescript');
+  await assert.rejects(installAstModule(root, 'builtin:cobol'), /Unknown bundled/);
+  assert.equal((await loadInstalledAsts(root)).length, 0);
+  const registry = new AstRegistry();
+  assert.equal(registry.resolve({ argumentsSoFar: { path: 'main.ts' } })?.id, 'typescript');
+  assert.equal(registry.resolve({ argumentsSoFar: { path: 'main.mjs' } })?.id, 'javascript');
+  assert.equal(registry.resolve({ task: { prompt: 'Write a JavaScript script.' } })?.id, 'javascript');
 });
 
 test('adapter source is validated and bounded before generation completes', async () => {
@@ -66,8 +69,8 @@ test('adapter source is validated and bounded before generation completes', asyn
   await assert.rejects(generateText(new Decisions(noModel, 10, new AbortController().signal), { argumentsSoFar: { path: 'settings.json' } }, 'content', 'Contents', { ...options, astRegistry: invalid }), /JSON/);
 });
 
-test('optional TypeScript adapter builds real compiler AST nodes and validates source', async () => {
-  const { typescriptAstAdapter } = await import('../src/typescript-ast.js');
+test('the bundled TypeScript adapter builds a program from productions and validates source', async () => {
+  const { typescriptAstAdapter } = await import('../src/lang/javascript.js');
   const provider: DecisionProvider = { decide: async (_state, questions) => {
     const question = questions.selection!;
     assert.equal(question.type, 'choice');
@@ -77,7 +80,7 @@ test('optional TypeScript adapter builds real compiler AST nodes and validates s
     if (input.generation.slot === 'number') selected = Object.entries(question.criteria).find(([, value]) => value === '42')![0];
     return { model: 'ts-fixture', usage: { input_tokens: 1, output_tokens: 1 }, answers: { selection: { type: 'choice', choice: selected, confidence: 1, probabilities: Object.fromEntries(Object.keys(question.criteria).map(key => [key, Number(key === selected)])) } } } as never;
   } };
-  const registry = new AstRegistry([typescriptAstAdapter]);
+  const registry = new AstRegistry();
   const source = await generateText(new Decisions(provider, 20, new AbortController().signal), { task: { prompt: 'TypeScript print 42.' }, argumentsSoFar: { path: 'main.ts' } }, 'content', 'Source', { maxSteps: 20, maxBytes: 8000, allowEmpty: false, fragments: [], astRegistry: registry });
   assert.equal(source, 'console.log(42);\n');
   await assert.rejects(typescriptAstAdapter.validate('const = ;', new AbortController().signal));

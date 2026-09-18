@@ -15,6 +15,7 @@ import { createPrinter, printRun } from './print.js';
 import { isInteractiveTTY } from './terminal-style.js';
 import { formatDuration } from './timing.js';
 import { AstRegistry, loadInstalledAsts, loadAstModule, installAstModule, removeAstAdapter } from './ast-adapters.js';
+import { bundledAstAdapters } from './lang/index.js';
 import { compareRecords, formatComparison, runEval, type EvalRecord } from './eval.js';
 import { runDecide } from './decide.js';
 import { NO_KEY, configPath, promptSecret, readConfig, resolveApiKey, writeConfig } from './config.js';
@@ -172,7 +173,7 @@ async function main(): Promise<void> {
     if (extra.length || !['install', 'list', 'remove'].includes(command ?? '') || (command === 'list' ? target !== undefined : !target)) throw new Error('Use ast install <module>, ast list, or ast remove <id>.');
     if (command === 'install') process.stdout.write(`Installed AST adapters: ${(await installAstModule(workspace, target!)).join(', ')}\n`);
     else if (command === 'remove') { await removeAstAdapter(workspace, target!); process.stdout.write(`Removed AST adapter: ${target}\n`); }
-    else for (const adapter of new AstRegistry(await loadInstalledAsts(workspace)).list()) process.stdout.write(`${adapter.id}\t${adapter.extensions.join(', ')}\t${adapter.id === 'python' ? 'built-in' : 'installed'}\n`);
+    else { const bundled = new Set(['python', ...bundledAstAdapters().map(a => a.id)]); for (const adapter of new AstRegistry(await loadInstalledAsts(workspace)).list()) process.stdout.write(`${adapter.id}\t${adapter.extensions.join(', ')}\t${bundled.has(adapter.id) ? 'built-in' : 'installed'}\n`); }
     return;
   }
   if (positionals[0] === 'eval' && positionals[1] === 'compare') {

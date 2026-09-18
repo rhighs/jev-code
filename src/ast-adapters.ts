@@ -7,6 +7,7 @@ import type { GenerateOptions } from './generation.js';
 import { generatePythonAst, generatePythonProject, validatePythonProject, validatePythonSource } from './python-ast.js';
 import { resolveWorkspacePath } from './workspace.js';
 import { atomicWrite } from './tools.js';
+import { bundledAstAdapters } from './lang/index.js';
 
 export interface AstAdapter {
   id: string;
@@ -26,7 +27,7 @@ export const pythonAstAdapter: AstAdapter = {
 
 export class AstRegistry {
   private adapters = new Map<string, AstAdapter>();
-  constructor(adapters: AstAdapter[] = []) { this.register(pythonAstAdapter); for (const adapter of adapters) this.register(adapter); }
+  constructor(adapters: AstAdapter[] = []) { this.register(pythonAstAdapter); for (const adapter of bundledAstAdapters()) this.register(adapter); for (const adapter of adapters) this.register(adapter); }
   register(adapter: AstAdapter): void {
     if (!adapter || !/^[a-z][a-z0-9-]{0,63}$/.test(adapter.id)) throw new Error('AST adapter requires a valid id.');
     if (this.adapters.has(adapter.id)) throw new Error(`Duplicate AST adapter: ${adapter.id}`);
@@ -68,7 +69,12 @@ async function readConfig(workspace: string): Promise<Installed[]> {
   return config.adapters as Installed[];
 }
 export async function loadAstModule(workspace: string, specifier: string): Promise<AstAdapter[]> {
-  if (specifier === 'builtin:typescript') return [(await import('./typescript-ast.js')).typescriptAstAdapter];
+  if (specifier.startsWith('builtin:')) {
+    const id = specifier.slice(8);
+    const adapter = bundledAstAdapters().find(a => a.id === id);
+    if (!adapter) throw new Error(`Unknown bundled AST adapter: ${id}. Bundled: ${bundledAstAdapters().map(a => a.id).join(', ')}.`);
+    return [adapter];
+  }
   const target = isAbsolute(specifier) || specifier.startsWith('.') ? resolve(workspace, specifier)
     : createRequire(join(resolve(workspace), 'package.json')).resolve(specifier);
   const module = await import(pathToFileURL(target).href) as { astAdapters?: AstAdapter[] };
@@ -93,6 +99,7 @@ async function updateConfig(workspace: string, update: (entries: Installed[]) =>
   finally { await lock.close(); await unlink(join(dirname(path), 'asts.lock')); }
 }
 export async function installAstModule(workspace: string, specifier: string): Promise<string[]> {
+  if (specifier.startsWith('builtin:')) return (await loadAstModule(workspace, specifier)).map(adapter => adapter.id);
   const module = isAbsolute(specifier) || specifier.startsWith('.') ? resolve(workspace, specifier) : specifier;
   const adapters = await loadAstModule(workspace, module);
   await updateConfig(workspace, async entries => {
