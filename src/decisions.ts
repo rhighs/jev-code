@@ -1,4 +1,4 @@
-import { choice, noul, type EntryType, type Questions, type SystemOneResult } from '@typesafe-ai/sdk';
+import { choice, noul, score, type EntryType, type Questions, type ScoreCriteria, type SystemOneResult } from '@typesafe-ai/sdk';
 import { DecisionError, LimitError, type DecisionProvider, type DecisionEventData } from './types.js';
 
 export type State = Record<string, unknown>;
@@ -98,6 +98,21 @@ export class Decisions {
     if (!Number.isFinite(value) || value < 0 || value > 1) throw new DecisionError('Jev returned an invalid noul.');
     await this.onDecision({ probability: value, model: response.model });
     return value;
+  }
+
+  async score(state: State, instructions: string, levels: string[]): Promise<{ expected: number; probabilities: number[] }> {
+    if (levels.length < 2) throw new Error('Score requires at least 2 levels.');
+    const response = await this.ask(state, { rating: score(instructions, levels as unknown as ScoreCriteria) });
+    const answer = response.answers.rating as { type?: string; score?: number; confidence?: number; probabilities?: Record<string, number> } | undefined;
+    if (!answer || answer.type !== 'score' || !answer.probabilities || typeof answer.probabilities !== 'object') throw new DecisionError('Jev returned an invalid score answer.');
+    if (Object.keys(answer.probabilities).some(key => !/^\d+$/.test(key) || Number(key) >= levels.length)) throw new DecisionError('Jev returned a score level outside the rubric.');
+    const probabilities = levels.map((_, i) => answer.probabilities![String(i)] ?? 0);
+    if (probabilities.some(p => !Number.isFinite(p) || p < 0 || p > 1)) throw new DecisionError('Jev returned an invalid score distribution.');
+    if (!Number.isFinite(answer.score) || answer.score! < 0 || answer.score! > levels.length - 1) throw new DecisionError('Jev returned an invalid score.');
+    if (!Number.isFinite(answer.confidence) || answer.confidence! < 0 || answer.confidence! > 1) throw new DecisionError('Jev returned invalid confidence.');
+    const expected = probabilities.reduce((sum, p, i) => sum + p * i, 0);
+    await this.onDecision({ choice: String(Math.round(expected)), confidence: answer.confidence!, model: response.model });
+    return { expected, probabilities };
   }
 
   /** Parallel positions, each with a scored categorical distribution over characters. */

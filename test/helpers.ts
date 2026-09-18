@@ -3,8 +3,8 @@ import type { EntryType, Question, Questions, SystemOneResult } from '@typesafe-
 import type { DecisionProvider } from '../src/types.js';
 
 export type SlotAnswer = string | { value: string } | { score: number } | { noul: number };
-export interface SlotEntry { phase?: string; slot?: string | RegExp; unit?: string; answer: SlotAnswer; once?: boolean }
-interface SlotState { generation?: { phase?: string; slot?: string; unit?: string } }
+export interface SlotEntry { phase?: string; slot?: string | RegExp; unit?: string; candidate?: number; answer: SlotAnswer; once?: boolean }
+interface SlotState { generation?: { phase?: string; slot?: string; unit?: string; candidate?: number } }
 
 const full = (labels: string[], hit: string | number): Record<string, number> => Object.fromEntries(labels.map(label => [label, String(label) === String(hit) ? 1 : 0]));
 
@@ -20,6 +20,7 @@ export class SlotProvider implements DecisionProvider {
     return this.script.find(entry => !this.used.has(entry) &&
       (entry.phase === undefined || entry.phase === gen?.phase) &&
       (entry.unit === undefined || entry.unit === gen?.unit) &&
+      (entry.candidate === undefined || entry.candidate === gen?.candidate) &&
       (entry.slot === undefined || (typeof entry.slot === 'string' ? entry.slot === slot : entry.slot.test(slot))));
   }
 

@@ -1,5 +1,6 @@
 import type { Decisions } from './decisions.js';
 import type { Builder, PythonNode, Scope, Vocab } from './python-ast.js';
+import { searchUnit, type SearchHooks } from './python-search.js';
 
 export interface Peer { name: string; arity: number; purpose: string; module?: string }
 export interface Unit extends Peer { params: string[]; def: PythonNode; body: PythonNode[] }
@@ -49,12 +50,27 @@ export async function decompose(root: Builder, scope: Scope, vocab: Vocab, peers
 export const isEntry = (unit: Peer): boolean => unit.module === undefined || unit.module === ENTRY;
 export const peersOf = (unit: Peer, all: Peer[]): Peer[] => isEntry(unit) ? all : all.filter(p => !isEntry(p));
 
-export async function fillUnits(units: Unit[], decisions: Decisions, makeBuilder: (unit: Unit, fork: Decisions) => Builder, parentFor: (unit: Unit) => Scope): Promise<void> {
+export type UnitSearch = Omit<SearchHooks, 'generate' | 'render' | 'check' | 'score' | 'report'> & {
+  render(unit: Unit, body: PythonNode[]): Promise<string>;
+  check(unit: Unit, source: string): Promise<string | undefined>;
+  score(unit: Unit, decisions: Decisions, source: string, candidate: number): Promise<number>;
+  report(unit: Unit, candidate: Parameters<SearchHooks['report']>[0]): Promise<void>;
+};
+
+export async function fillUnits(units: Unit[], decisions: Decisions, makeBuilder: (unit: Unit, fork: Decisions, candidate?: number, body?: PythonNode[]) => Builder, parentFor: (unit: Unit) => Scope, search?: UnitSearch): Promise<void> {
   const controller = new AbortController();
+  const scopeFor = (unit: Unit): Scope => ({ names: new Map(unit.params.map(p => [p, { kind: 'parameter' as const }])), parent: parentFor(unit), function: true, loop: false });
   const outcomes = await Promise.allSettled(units.map(async unit => {
     try {
-      const scope: Scope = { names: new Map(unit.params.map(p => [p, { kind: 'parameter' as const }])), parent: parentFor(unit), function: true, loop: false };
-      await makeBuilder(unit, decisions.fork(controller.signal)).block(unit.body, scope, 1, 'function_body');
+      const fork = decisions.fork(controller.signal);
+      if (search && search.width > 1) {
+        await searchUnit(unit, fork, {
+          width: search.width,
+          generate: (candidateFork, body, candidate) => makeBuilder(unit, candidateFork, candidate, body).block(body, scopeFor(unit), 1, 'function_body'),
+          render: body => search.render(unit, body), check: source => search.check(unit, source),
+          score: (d, source, candidate) => search.score(unit, d, source, candidate), report: candidate => search.report(unit, candidate),
+        });
+      } else await makeBuilder(unit, fork).block(unit.body, scopeFor(unit), 1, 'function_body');
     } catch (err) { controller.abort(err); throw err; }
   }));
   const failure = outcomes.find(o => o.status === 'rejected');

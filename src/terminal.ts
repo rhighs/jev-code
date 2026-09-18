@@ -211,6 +211,10 @@ export class TerminalSession {
       case 'text': {
         this.activity = `turn ${event.turn} · generating ${event.data.field} · ${event.data.bytes} B`;
         if (!this.tty) this.options.output.write(text);
+        else if (event.data.decoder === 'search' && event.data.ast) {
+          const { unit, candidate, kept, reason } = event.data.ast;
+          this.print(`  search · ${unit ?? event.data.field} · candidate ${candidate} · ${kept ? 'kept' : `dropped (${reason ?? 'scored lower'})`}`);
+        }
         if (event.data.done) this.finishDraft();
         else if (this.tty && !this.previewTimer) {
           this.previewTimer = setTimeout(() => { this.previewTimer = undefined; this.refreshPrompt(); }, 50);

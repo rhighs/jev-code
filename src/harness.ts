@@ -24,6 +24,7 @@ export interface HarnessOptions {
   gridBatchSize?: number;
   /** In-flight Jev requests shared by every concurrent generator in a run. */
   concurrency?: number;
+  searchWidth?: number;
   maxRunMs?: number;
   /** Opt into a strict Noul gate; by default completion uses a categorical choice. */
   completionThreshold?: number;
@@ -54,7 +55,7 @@ export class Harness {
       if (!Number.isSafeInteger(value) || value < 1 || value > 2_147_483_647) throw new Error(`${name} must be a positive integer <= 2147483647.`);
     }
     const threshold = options.completionThreshold ?? 0.85;
-    for (const [name, value, max] of [['gridBatchSize', options.gridBatchSize ?? 8, 128], ['concurrency', options.concurrency ?? 4, 16]] as const) {
+    for (const [name, value, max] of [['gridBatchSize', options.gridBatchSize ?? 8, 128], ['concurrency', options.concurrency ?? 4, 16], ['searchWidth', options.searchWidth ?? 1, 8]] as const) {
       if (!Number.isSafeInteger(value) || value < 1 || value > max) throw new Error(`${name} must be 1–${max}.`);
     }
     if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) throw new Error('completionThreshold must be between 0 and 1.');
@@ -198,7 +199,7 @@ export class Harness {
           maxSteps: this.options.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, fragments,
           astRegistry: this.astRegistry,
           experimentalGrid: this.options.experimentalGrid ?? false,
-          gridBatchSize: this.options.gridBatchSize ?? 8, concurrency: this.options.concurrency ?? 4,
+          gridBatchSize: this.options.gridBatchSize ?? 8, concurrency: this.options.concurrency ?? 4, searchWidth: this.options.searchWidth ?? 1,
           // Patch events preserve the scored cells without duplicating the draft per batch.
           onText: async (field: string, value: string, done: boolean, change?: TextChange, progress?: TextProgress) => emit('text', {
             field, bytes: progress?.bytes ?? Buffer.byteLength(value), done, change: change ?? null,

@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import type { Decisions, State } from './decisions.js';
 import type { GenerateOptions } from './generation.js';
 import { assemble, assembleProject, decompose, decomposeLayout, fillUnits, isEntry, peersOf, type Peer, type Unit } from './python-units.js';
+import { RUBRIC, wantsReturn } from './python-search.js';
 import { gridCursor } from './grid.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
 import { buildDecisionContext, PENDING, windowSource } from './decision-context.js';
@@ -176,10 +177,43 @@ export async function validatePythonProject(files: Record<string, string>, signa
   }
 }
 
+const checkBridge = String.raw`
+import ast, json, sys, builtins
+spec = json.load(sys.stdin)
+def done(reason):
+    print(json.dumps(reason)); sys.exit(0)
+try:
+    tree = ast.parse(spec['source'])
+    compile(tree, '<candidate>', 'exec')
+except Exception:
+    done('compile')
+fn = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == spec['name']), None)
+if fn is None: done('compile')
+defined = set(dir(builtins)) | set(spec['params']) | set(spec['peers']) | {spec['name']}
+for n in ast.walk(fn):
+    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store): defined.add(n.id)
+    elif isinstance(n, (ast.Import, ast.ImportFrom)): defined.update((a.asname or a.name).split('.')[0] for a in n.names)
+    elif isinstance(n, ast.FunctionDef): defined.add(n.name); defined.update(a.arg for a in n.args.args)
+    elif isinstance(n, ast.ExceptHandler) and n.name: defined.add(n.name)
+for n in ast.walk(fn):
+    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in defined: done('undefined')
+for n in ast.walk(fn):
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in spec['peers'] and (len(n.args) != spec['peers'][n.func.id] or n.keywords): done('arity')
+if spec['wantsReturn'] and not any(isinstance(n, ast.Return) and n.value is not None for n in ast.walk(fn)): done('return')
+done('ok')
+`;
+
+export interface CandidateSpec { name: string; params: string[]; peers: Record<string, number>; wantsReturn: boolean }
+/** Static only: compile, undefined names, peer arity, missing return. Nothing is executed. */
+export async function checkCandidate(source: string, spec: CandidateSpec, signal: AbortSignal): Promise<string | undefined> {
+  const reason = await runPythonJson({ source, ...spec }, signal, 16, checkBridge);
+  return reason === 'ok' ? undefined : reason;
+}
+
 export interface Vocab { words: string[]; identifiers: string[]; strings: string[]; numbers: number[]; purposes: string[] }
 export interface Shared { field: string; options: GenerateOptions; objective: string; context: State; budget: { step: number }; vocab: Vocab; maxDepth: number }
 export interface StepInfo { slot: string; production: string; symbols: string[] }
-export interface BuilderInput { decisions: Decisions; render: () => Promise<string>; report: (preview: string, info: StepInfo) => Promise<void>; unit?: string; peers?: Peer[] }
+export interface BuilderInput { decisions: Decisions; render: () => Promise<string>; report: (preview: string, info: StepInfo) => Promise<void>; unit?: string; peers?: Peer[]; candidate?: number }
 export interface Builder {
   pick(slot: string, scope: Scope, criteria: Record<string, string>, depth?: number): Promise<string>;
   terminal(slot: string, scope: Scope, values: Array<string | number>): Promise<string | number>;
@@ -209,7 +243,7 @@ export function vocabulary(objective: string): Vocab {
 }
 
 export function createBuilder(shared: Shared, input: BuilderInput): Builder {
-  const { decisions, render, report, unit, peers } = input;
+  const { decisions, render, report, unit, peers, candidate } = input;
   const { field, options, objective, context, budget, vocab, maxDepth } = shared;
   const { words, identifiers, strings, numbers } = vocab;
 
@@ -220,7 +254,7 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
     if (!keys.length) throw new Error(`No valid Python AST production for ${slot}.`);
     const preview = await render();
     const instruction = `Choose the next valid Python AST production for ${slot}. The rendered source marks the slot being filled with ${PENDING}. Satisfy the objective with the smallest sufficient program. Complete the current slot only; do not add unrequested behavior.`;
-    const core = { field, phase: 'ast', slot, ...(unit === undefined ? {} : { unit }), ...(peers === undefined || !peers.length ? {} : { peers: peers.map(peer => ({ ...peer })) }), symbols: visible(scope), symbolTable: symbolTable(scope),
+    const core = { field, phase: 'ast', slot, ...(unit === undefined ? {} : { unit }), ...(candidate === undefined ? {} : { candidate }), ...(peers === undefined || !peers.length ? {} : { peers: peers.map(peer => ({ ...peer })) }), symbols: visible(scope), symbolTable: symbolTable(scope),
       constraints: { depth, maxDepth, inFunction: scope.function, inLoop: scope.loop, remainingSteps: options.maxSteps - budget.step } };
     const assembleState = (values: Record<string, unknown>): State => ({
       task: values.task, ...(values.recent === undefined ? {} : { recent: values.recent }), ...(values.plan === undefined ? {} : { plan: values.plan }),
@@ -414,10 +448,25 @@ async function generate(decisions: Decisions, state: State, field: string, optio
     const assembled = (): Promise<string> => previewOf(node('Module', { body: [...(tree.body as PythonNode[]), node('Hole')], type_ignores: [] }));
     const parentFor = (unit: Unit): Scope => isEntry(unit) ? rootScope
       : { names: new Map(units.filter(u => !isEntry(u)).map(u => [u.name, { kind: 'function' as const, arity: u.arity }])), function: false, loop: false };
-    await fillUnits(units, decisions, (unit, fork) => createBuilder(shared, {
-      decisions: fork, unit: unit.name, peers: peersOf(unit, peers), render: () => previewOf(node('Module', { body: [unit.def], type_ignores: [] })),
+    const width = options.searchWidth ?? 1;
+    const defOf = (unit: Unit, body?: PythonNode[]): PythonNode => body === undefined ? unit.def : functionDef(unit.name, unit.params.map(p => node('arg', { arg: p, annotation: null, type_comment: null })), body);
+    await fillUnits(units, decisions, (unit, fork, candidate, body) => createBuilder(shared, {
+      decisions: fork, unit: unit.name, peers: peersOf(unit, peers), ...(candidate === undefined ? {} : { candidate }),
+      render: () => previewOf(node('Module', { body: [defOf(unit, body)], type_ignores: [] })),
       report: async (_preview, info) => emit(await assembled(), info, unit.name),
-    }), parentFor);
+    }), parentFor, width > 1 ? {
+      width,
+      render: (unit, body) => unparsePython(node('Module', { body: [defOf(unit, body)], type_ignores: [] }), decisions.signal, options.maxBytes),
+      check: (unit, source) => checkCandidate(source, { name: unit.name, params: unit.params, peers: Object.fromEntries(peersOf(unit, peers).filter(p => p.name !== unit.name).map(p => [p.name, p.arity])), wantsReturn: wantsReturn(unit.purpose) }, decisions.signal),
+      score: async (unit, d, source, candidate) => (await d.score({
+        task: { prompt: objective },
+        generation: { field, phase: 'search', slot: 'candidate_score', unit: unit.name, candidate, spec: { name: unit.name, arity: unit.arity, purpose: unit.purpose, params: unit.params }, peers: peersOf(unit, peers).map(p => ({ ...p })), candidateSource: source },
+      }, `Rate how well this candidate body for ${unit.name} fulfils its purpose: ${unit.purpose}. Judge correctness for the objective and minimality; unrequested behavior lowers the level.`, RUBRIC)).expected,
+      report: async (unit, c) => options.onText?.(field, c.source, false, { replace: c.source }, {
+        decoder: 'search', step: shared.budget.step, cursor: gridCursor(c.source), bytes: Buffer.byteLength(c.source),
+        ast: { slot: 'candidate', production: c.kept ? 'kept' : 'dropped', symbols: [], unit: unit.name, candidate: c.index, kept: c.kept, ...(c.reason === undefined ? {} : { reason: c.reason }) },
+      }),
+    } : undefined);
   }
   await root.block(tree.body as PythonNode[], rootScope, 0, 'module_body');
   if (layout) {
