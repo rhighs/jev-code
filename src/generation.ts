@@ -9,6 +9,7 @@ import { gridCursor } from './grid.js';
 import { LimitError } from './types.js';
 import { generateStructuredText } from './structured-text.js';
 import { generateBashAst } from './bash-ast.js';
+import { parseManifest } from './python-ast.js';
 
 const defaultAsts = new AstRegistry();
 
@@ -40,6 +41,20 @@ export function syntaxFeedback(state: State, field: string, text: string): Array
 
 export async function generateText(decisions: Decisions, state: State, field: string, description: string, options: GenerateOptions): Promise<string> {
   if (field === 'command' && !options.experimentalGrid) return generateBashAst(decisions, state, field, options);
+  if (field === 'files') {
+    const registry = options.astRegistry ?? defaultAsts;
+    const adapter = [registry.resolve(state), ...registry.list()].find(candidate => candidate?.generateProject && candidate.validateProject);
+    if (!adapter) throw new Error('No AST adapter can generate a multi-file project.');
+    const manifest = await adapter.generateProject!(decisions, state, field, { ...options,
+      ...(options.onText ? { onText: async (name: string, value: string, done: boolean, change?: TextChange, progress?: TextProgress) => { if (!done) await options.onText!(name, value, false, change, progress); } } : {}),
+    });
+    decisions.signal.throwIfAborted();
+    if (Buffer.byteLength(manifest) > options.maxBytes) throw new LimitError(`AST adapter ${adapter.id} returned a project outside its size constraints.`);
+    await adapter.validateProject!(parseManifest(manifest), decisions.signal);
+    decisions.signal.throwIfAborted();
+    await options.onText?.(field, manifest, true, { replace: manifest }, { decoder: 'ast', step: 0, cursor: gridCursor(manifest), bytes: Buffer.byteLength(manifest) });
+    return manifest;
+  }
   const adapter = field === 'content' ? (options.astRegistry ?? defaultAsts).resolve(state) : undefined;
   if (adapter) {
     const source = await adapter.generate(decisions, state, field, { ...options,

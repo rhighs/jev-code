@@ -1,7 +1,10 @@
 import { spawn } from 'node:child_process';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import type { Decisions, State } from './decisions.js';
 import type { GenerateOptions } from './generation.js';
-import { assemble, decompose, fillUnits, type Peer } from './python-units.js';
+import { assemble, assembleProject, decompose, decomposeLayout, fillUnits, isEntry, peersOf, type Peer, type Unit } from './python-units.js';
 import { gridCursor } from './grid.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
 import { buildDecisionContext, PENDING, windowSource } from './decision-context.js';
@@ -49,12 +52,12 @@ compile(ast.parse(source), '<jev-source>', 'exec')
 print(json.dumps(source))
 `;
 
-async function runPythonJson(input: unknown, signal: AbortSignal, maxBytes: number, script: string): Promise<string> {
+async function runPythonJson(input: unknown, signal: AbortSignal, maxBytes: number, script: string, cwd?: string): Promise<string> {
   signal.throwIfAborted();
   const env = { ...process.env };
   delete env.TYPESAFE_API_KEY;
   return new Promise((resolve, reject) => {
-    const child = spawn('python3', ['-I', '-c', script], { env, stdio: ['pipe', 'pipe', 'pipe'], signal, timeout: 10_000 });
+    const child = spawn('python3', ['-I', '-c', script], { env, stdio: ['pipe', 'pipe', 'pipe'], signal, timeout: 10_000, ...(cwd === undefined ? {} : { cwd }) });
     const output: Buffer[] = [];
     let outputBytes = 0, error = '', failed = false;
     const fail = (reason: unknown): void => { if (failed) return; failed = true; child.kill('SIGKILL'); reject(reason); };
@@ -86,6 +89,91 @@ export async function unparsePython(tree: PythonNode, signal: AbortSignal, maxBy
 }
 export async function validatePythonSource(source: string, signal: AbortSignal): Promise<void> {
   await runPythonJson(source, signal, Math.max(1, Buffer.byteLength(source)), "import ast,json,sys; source=json.load(sys.stdin); compile(ast.parse(source),'<jev>','exec'); print(json.dumps(source))");
+}
+
+/** Static only: every file is compiled and every import target is located on disk; nothing is imported or executed. */
+const projectBridge = String.raw`
+import ast, json, os, sys, importlib.util
+root = os.getcwd()
+paths = json.load(sys.stdin)
+sys.path.insert(0, root)
+def local(parts):
+    base = os.path.join(root, *parts)
+    if os.path.isfile(base + '.py'): return base + '.py'
+    if os.path.isdir(base) and os.path.isfile(os.path.join(base, '__init__.py')): return os.path.join(base, '__init__.py')
+    return None
+def resolve(name, where):
+    parts = name.split('.')
+    if local(parts[:1]) is None:
+        if importlib.util.find_spec(parts[0]) is None: raise ValueError(f'{where}: cannot resolve import {name}')
+        return None
+    for i in range(1, len(parts) + 1):
+        if local(parts[:i]) is None: raise ValueError(f'{where}: cannot resolve import {name}')
+    return local(parts)
+def exported(path):
+    names = set()
+    for stmt in ast.parse(open(path, encoding='utf-8').read()).body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)): names.add(stmt.name)
+        elif isinstance(stmt, ast.Assign): names.update(t.id for t in stmt.targets if isinstance(t, ast.Name))
+        elif isinstance(stmt, (ast.Import, ast.ImportFrom)): names.update((a.asname or a.name).split('.')[0] for a in stmt.names)
+    return names
+def check(path, tree):
+    for stmt in ast.walk(tree):
+        if isinstance(stmt, ast.Import):
+            for a in stmt.names: resolve(a.name, path)
+        elif isinstance(stmt, ast.ImportFrom):
+            if stmt.level: raise ValueError(f'{path}: relative imports are not supported')
+            target = resolve(stmt.module, path)
+            if target is None: continue
+            if target.endswith('__init__.py'):
+                pkg = os.path.dirname(target)
+                for a in stmt.names:
+                    if a.name != '*' and a.name not in exported(target) and local(stmt.module.split('.') + [a.name]) is None:
+                        raise ValueError(f'{path}: {stmt.module} has no name {a.name}')
+            else:
+                names = exported(target)
+                for a in stmt.names:
+                    if a.name != '*' and a.name not in names: raise ValueError(f'{path}: {stmt.module} has no name {a.name}')
+for path in paths:
+    source = open(os.path.join(root, path), encoding='utf-8').read()
+    try: tree = ast.parse(source, path)
+    except SyntaxError as err: raise ValueError(f'{path}: {err.msg} (line {err.lineno})')
+    compile(tree, path, 'exec')
+for path in paths:
+    check(path, ast.parse(open(os.path.join(root, path), encoding='utf-8').read(), path))
+print(json.dumps('ok'))
+`;
+
+export const manifestPath = /^(?:[A-Za-z_][A-Za-z0-9_]*\/)*[A-Za-z_][A-Za-z0-9_]*\.py$/;
+
+export function parseManifest(text: string): Record<string, string> {
+  let raw: unknown;
+  try { raw = JSON.parse(text); } catch { throw new Error('files must be a JSON manifest of path to content.'); }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('files must be a JSON manifest of path to content.');
+  const entries = Object.entries(raw as Record<string, unknown>);
+  if (!entries.length) throw new Error('files manifest is empty.');
+  for (const [path, content] of entries) {
+    if (!manifestPath.test(path)) throw new Error(`Invalid manifest path: ${path}`);
+    if (typeof content !== 'string') throw new Error(`Manifest content for ${path} must be a string.`);
+  }
+  return raw as Record<string, string>;
+}
+
+export async function validatePythonProject(files: Record<string, string>, signal: AbortSignal, dir?: string): Promise<void> {
+  signal.throwIfAborted();
+  const paths = Object.keys(files);
+  for (const path of paths) if (!manifestPath.test(path)) throw new Error(`Invalid manifest path: ${path}`);
+  const root = dir ?? await mkdtemp(join(tmpdir(), 'jev-project-'));
+  try {
+    for (const path of paths) {
+      const target = join(root, path);
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, files[path]!, 'utf8');
+    }
+    await runPythonJson(paths, signal, 16, projectBridge, root);
+  } finally {
+    if (dir === undefined) await rm(root, { recursive: true, force: true });
+  }
 }
 
 export interface Vocab { words: string[]; identifiers: string[]; strings: string[]; numbers: number[]; purposes: string[] }
@@ -302,7 +390,7 @@ export const functionDef = (id: string, parameters: PythonNode[], body: PythonNo
   node('FunctionDef', { name: id, args: node('arguments', { posonlyargs: [], args: parameters, vararg: null, kwonlyargs: [], kw_defaults: [], kwarg: null, defaults: [] }), body, decorator_list: [], returns: null, type_comment: null, type_params: [] });
 
 /** Decomposition first, then unit bodies concurrently, then the main block; zero units is the plain single-scope path. */
-export async function generatePythonAst(decisions: Decisions, state: State, field: string, options: GenerateOptions): Promise<string> {
+async function generate(decisions: Decisions, state: State, field: string, options: GenerateOptions, project: boolean): Promise<string> {
   const task = state.task as { prompt?: string; updates?: string[] } | undefined;
   const objective = [task?.prompt ?? '', ...(task?.updates ?? [])].join('\n');
   const shared: Shared = { field, options, objective, context: compactContext(state), budget: { step: 0 }, vocab: vocabulary(objective), maxDepth: 8 };
@@ -314,19 +402,35 @@ export async function generatePythonAst(decisions: Decisions, state: State, fiel
   const rootScope: Scope = { names: new Map(), function: false, loop: false };
   const peers: Peer[] = [];
   const root = createBuilder(shared, { decisions, peers, render: () => previewOf(tree), report: (preview, info) => emit(preview, info) });
-  const units = await decompose(root, rootScope, shared.vocab, peers);
+  const layout = project ? await decomposeLayout(root, rootScope) : undefined;
+  const units = await decompose(root, rootScope, shared.vocab, peers, layout);
   if (units.length) {
     for (const unit of units) rootScope.names.set(unit.name, { kind: 'function', arity: unit.arity });
     (tree.body as PythonNode[]).push(...units.map(unit => unit.def));
     const assembled = (): Promise<string> => previewOf(node('Module', { body: [...(tree.body as PythonNode[]), node('Hole')], type_ignores: [] }));
+    const parentFor = (unit: Unit): Scope => isEntry(unit) ? rootScope
+      : { names: new Map(units.filter(u => !isEntry(u)).map(u => [u.name, { kind: 'function' as const, arity: u.arity }])), function: false, loop: false };
     await fillUnits(units, decisions, (unit, fork) => createBuilder(shared, {
-      decisions: fork, unit: unit.name, peers, render: () => previewOf(node('Module', { body: [unit.def], type_ignores: [] })),
+      decisions: fork, unit: unit.name, peers: peersOf(unit, peers), render: () => previewOf(node('Module', { body: [unit.def], type_ignores: [] })),
       report: async (_preview, info) => emit(await assembled(), info, unit.name),
-    }), rootScope);
+    }), parentFor);
   }
   await root.block(tree.body as PythonNode[], rootScope, 0, 'module_body');
+  if (layout) {
+    const files = assembleProject(tree, units, layout);
+    const manifest: Record<string, string> = {};
+    for (const [path, module] of Object.entries(files)) manifest[path] = (module.body as PythonNode[]).length ? await unparsePython(module, decisions.signal, options.maxBytes) : '';
+    const text = JSON.stringify(manifest);
+    if (Buffer.byteLength(text) > options.maxBytes) throw new LimitError('Python project exceeds its byte budget.');
+    await options.onText?.(field, text, true, { replace: text }, { decoder: 'ast', step: shared.budget.step, cursor: gridCursor(text), bytes: Buffer.byteLength(text) });
+    return text;
+  }
   if (units.length) assemble(tree, units);
   const source = await unparsePython(tree, decisions.signal, options.maxBytes);
   await options.onText?.(field, source, true, { replace: source }, { decoder: 'ast', step: shared.budget.step, cursor: gridCursor(source), bytes: Buffer.byteLength(source) });
   return source;
 }
+
+export const generatePythonAst = (decisions: Decisions, state: State, field: string, options: GenerateOptions): Promise<string> => generate(decisions, state, field, options, false);
+/** Returns a JSON manifest of path to source for a package plus entry script. */
+export const generatePythonProject = (decisions: Decisions, state: State, field: string, options: GenerateOptions): Promise<string> => generate(decisions, state, field, options, true);

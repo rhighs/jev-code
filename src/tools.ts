@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { listWorkspace } from './workspace.js';
+import { manifestPath, parseManifest, validatePythonProject } from './python-ast.js';
 import type { Tool, ToolContext, ToolResult } from './types.js';
 import { StringDecoder } from 'node:string_decoder';
 
@@ -17,7 +18,9 @@ const number = (args: Args, key: string, fallback: number): number => {
   return value;
 };
 
-export async function atomicWrite(path: string, contents: string, signal: AbortSignal): Promise<void> {
+interface Staged { commit(): Promise<void>; discard(): Promise<void> }
+
+async function stage(path: string, contents: string, signal: AbortSignal): Promise<Staged> {
   signal.throwIfAborted();
   await mkdir(dirname(path), { recursive: true });
   const temp = `${path}.jev-${randomUUID()}.tmp`;
@@ -25,6 +28,7 @@ export async function atomicWrite(path: string, contents: string, signal: AbortS
   let existing = false;
   try { mode = (await stat(path)).mode & 0o777; existing = true; }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  const discard = (): Promise<void> => unlink(temp).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; });
   try {
     const file = await open(temp, 'wx', mode);
     try {
@@ -32,10 +36,22 @@ export async function atomicWrite(path: string, contents: string, signal: AbortS
       await file.writeFile(contents, 'utf8');
       await file.sync();
     } finally { await file.close(); }
-    signal.throwIfAborted();
-    await rename(temp, path);
+  } catch (error) { await discard(); throw error; }
+  return { commit: async () => { signal.throwIfAborted(); await rename(temp, path); }, discard };
+}
+
+export async function atomicWrite(path: string, contents: string, signal: AbortSignal): Promise<void> {
+  await atomicWriteAll([[path, contents]], signal);
+}
+
+/** Every file is staged before any is renamed into place, so a failure leaves the tree untouched. */
+export async function atomicWriteAll(entries: Array<[string, string]>, signal: AbortSignal): Promise<void> {
+  const staged: Staged[] = [];
+  try {
+    for (const [path, contents] of entries) staged.push(await stage(path, contents, signal));
+    for (const item of staged) await item.commit();
   } finally {
-    await unlink(temp).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; });
+    for (const item of staged) await item.discard();
   }
 }
 
@@ -164,6 +180,22 @@ export function builtInTools(): Tool[] {
         const content = text(args, 'content');
         await atomicWrite(path, content, context.signal);
         return { ok: true, output: `Wrote ${Buffer.byteLength(content)} bytes to ${text(args, 'path')}.`, data: { path, bytes: Buffer.byteLength(content) } };
+      },
+    },
+    {
+      name: 'write_files', effect: 'write', description: 'Write a multi-module Python project (a package plus an entry script) as one validated set: all files or none. Use write_file for a single file.',
+      fields: { files: { type: 'string', description: 'JSON manifest of relative .py paths to complete file contents.' } },
+      async execute(args, context) {
+        const files = parseManifest(text(args, 'files'));
+        const targets: Array<[string, string]> = [];
+        for (const [path, content] of Object.entries(files)) {
+          if (!manifestPath.test(path)) throw new Error(`Invalid manifest path: ${path}`);
+          targets.push([await context.resolvePath(path), content]);
+        }
+        await validatePythonProject(files, context.signal);
+        await atomicWriteAll(targets, context.signal);
+        const paths = Object.keys(files);
+        return { ok: true, output: `Wrote ${paths.length} files:\n${paths.join('\n')}`, data: { paths, bytes: paths.reduce((n, path) => n + Buffer.byteLength(files[path]!), 0) } };
       },
     },
     {

@@ -4,7 +4,7 @@ import { isAbsolute, resolve, join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { Decisions, State } from './decisions.js';
 import type { GenerateOptions } from './generation.js';
-import { generatePythonAst, validatePythonSource } from './python-ast.js';
+import { generatePythonAst, generatePythonProject, validatePythonProject, validatePythonSource } from './python-ast.js';
 import { resolveWorkspacePath } from './workspace.js';
 import { atomicWrite } from './tools.js';
 
@@ -15,9 +15,13 @@ export interface AstAdapter {
   generate(decisions: Decisions, state: State, field: string, options: GenerateOptions): Promise<string>;
   /** Reject invalid source; validation is mandatory before a write. */
   validate(source: string, signal: AbortSignal): Promise<void>;
+  /** Multi-file output as a JSON manifest of path to source, for the write_files tool. */
+  generateProject?(decisions: Decisions, state: State, field: string, options: GenerateOptions): Promise<string>;
+  validateProject?(files: Record<string, string>, signal: AbortSignal): Promise<void>;
 }
 export const pythonAstAdapter: AstAdapter = {
   id: 'python', extensions: ['.py'], languages: ['python'], generate: generatePythonAst, validate: validatePythonSource,
+  generateProject: generatePythonProject, validateProject: validatePythonProject,
 };
 
 export class AstRegistry {

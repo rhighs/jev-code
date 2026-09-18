@@ -6,6 +6,7 @@ export function completionSummary(records: ToolRecord[]): string {
   for (const record of records.filter(record => record.result.ok)) {
     switch (record.tool) {
       case 'write_file': facts.add(`Wrote ${String(record.args.path)}.`); break;
+      case 'write_files': for (const path of Array.isArray(record.result.data?.paths) ? record.result.data.paths as string[] : Object.keys(JSON.parse(String(record.args.files)) as object)) facts.add(`Wrote ${path}.`); break;
       case 'edit_file': facts.add(`Edited ${String(record.args.path)}.`); break;
       case 'read_file': facts.add(`Read ${String(record.args.path)}.`); break;
       case 'list_files': facts.add(`Listed ${String(record.args.path)}.`); break;
