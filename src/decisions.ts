@@ -1,7 +1,22 @@
 import { choice, noul, score, type EntryType, type Questions, type ScoreCriteria, type SystemOneResult } from '@typesafe-ai/sdk';
-import { DecisionError, LimitError, type DecisionProvider, type DecisionEventData } from './types.js';
+import { DecisionError, LimitError, type DecisionProvider, type DecisionEventData, type DecisionOption } from './types.js';
 
 export type State = Record<string, unknown>;
+
+const topOptions = (probabilities: Record<string, number>, labels: (key: string) => string = key => key): DecisionOption[] =>
+  Object.entries(probabilities).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([key, probability]) => ({ label: labels(key), probability }));
+
+const identity = (state: State): Pick<DecisionEventData, 'field' | 'phase' | 'slot' | 'unit' | 'candidate'> => {
+  const gen = (state.generation && typeof state.generation === 'object' ? state.generation : {}) as Record<string, unknown>;
+  const field = typeof gen.field === 'string' ? gen.field : typeof state.field === 'string' ? state.field : undefined;
+  return {
+    ...(field === undefined ? {} : { field }),
+    ...(typeof gen.phase === 'string' ? { phase: gen.phase } : {}),
+    ...(typeof gen.slot === 'string' ? { slot: gen.slot } : {}),
+    ...(typeof gen.unit === 'string' ? { unit: gen.unit } : {}),
+    ...(typeof gen.candidate === 'number' ? { candidate: gen.candidate } : {}),
+  };
+};
 interface Counters { requests: number; usage: { inputTokens: number; outputTokens: number }; inflight: number; waiters: Array<() => void> }
 
 export class Decisions {
@@ -89,7 +104,7 @@ export class Decisions {
       }
     }
     this.assertConfidence(answer.confidence);
-    await this.onDecision({ choice: answer.choice, confidence: answer.confidence, model: response.model });
+    await this.onDecision({ choice: answer.choice, confidence: answer.confidence, model: response.model, options: topOptions(answer.probabilities), ...identity(state) });
     return answer.choice;
   }
 
@@ -114,7 +129,7 @@ export class Decisions {
     if (!Number.isFinite(answer.score) || answer.score! < 0 || answer.score! > levels.length - 1) throw new DecisionError('Jev returned an invalid score.');
     this.assertConfidence(answer.confidence);
     const expected = probabilities.reduce((sum, p, i) => sum + p * i, 0);
-    await this.onDecision({ choice: String(Math.round(expected)), confidence: answer.confidence!, model: response.model });
+    await this.onDecision({ choice: String(Math.round(expected)), confidence: answer.confidence!, model: response.model, options: topOptions(answer.probabilities, key => levels[Number(key)]!), ...identity(state) });
     return { expected, probabilities };
   }
 

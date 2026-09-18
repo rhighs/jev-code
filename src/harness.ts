@@ -147,7 +147,7 @@ export class Harness {
         journal = join(directory, `${id}.jsonl`);
         journalHandle = await open(journal, 'a', 0o600);
       }
-      await emit('start', { prompt, workspace, decoder: 'dynamic', limits: { turns: this.options.maxTurns ?? DEFAULT_LIMITS.maxTurns, requests: this.options.maxRequests ?? DEFAULT_LIMITS.maxRequests }, journal: journal ?? null });
+      await emit('start', { schema: 1, prompt, workspace, decoder: 'dynamic', limits: { turns: this.options.maxTurns ?? DEFAULT_LIMITS.maxTurns, requests: this.options.maxRequests ?? DEFAULT_LIMITS.maxRequests }, journal: journal ?? null });
       const context = toolContext(workspace, signal, path => resolveWorkspacePath(workspace, path, this.options.allowOutsideWorkspace ?? false));
       context.onOutput = async (stream, text) => emit('tool_output', { stream, text });
       for (turn = 1; turn <= (this.options.maxTurns ?? DEFAULT_LIMITS.maxTurns); turn++) {

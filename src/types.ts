@@ -61,12 +61,20 @@ export interface RunResult {
   records: ToolRecord[];
 }
 
+export interface DecisionOption { label: string; probability: number }
 export interface DecisionEventData {
   model: string;
   choice?: string;
   confidence?: number;
   probability?: number;
   questions?: number;
+  /** Winner plus up to three runners-up, sorted by probability. */
+  options?: DecisionOption[];
+  field?: string;
+  phase?: string;
+  slot?: string;
+  unit?: string;
+  candidate?: number;
 }
 export interface TextEventData extends TextProgress {
   field: string;
@@ -75,7 +83,7 @@ export interface TextEventData extends TextProgress {
   change: TextChange | null;
 }
 export interface HarnessEventData {
-  start: { prompt: string; workspace: string; decoder: 'dynamic'; limits: { turns: number; requests: number }; journal: string | null };
+  start: { schema: 1; prompt: string; workspace: string; decoder: 'dynamic'; limits: { turns: number; requests: number }; journal: string | null };
   turn: { files: number; plan: string };
   turn_end: { durationMs: number; elapsedMs: number; requests: number };
   action: { tool: string };
