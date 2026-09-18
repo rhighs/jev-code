@@ -6,6 +6,7 @@ interface Counters { requests: number; usage: { inputTokens: number; outputToken
 
 export class Decisions {
   get requests(): number { return this.counters.requests; }
+  get exhausted(): boolean { return this.counters.requests >= this.maxRequests; }
   get usage(): { inputTokens: number; outputTokens: number } { return this.counters.usage; }
 
   constructor(

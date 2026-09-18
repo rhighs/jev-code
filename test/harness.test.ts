@@ -154,9 +154,10 @@ test('full turn loop writes JS, observes a real failure, edits, verifies, and jo
 
 test('unfinished generation never writes a partial file', async t => {
   const root = await workspace(t);
-  const provider = new ScriptedProvider([{ action: 'write_file', args: { path: 'some-new-file.txt', content: 'unfinished' } }]);
+  const provider = new ScriptedProvider([{ action: 'write_file', args: { path: 'some-new-file.txt', content: 'unfinished' } }, { action: 'finish', verdict: 1 }]);
   const result = await new Harness({ experimentalGrid: true, workspace: root, provider, maxGenerationSteps: 1, journalDirectory: false }).run('Create a new file.');
-  assert.equal(result.status, 'limited');
+  assert.equal(result.status, 'completed', result.summary);
+  assert.equal(result.records[0]?.result.ok, false);
   assert.deepEqual(await readdir(root), []);
 });
 

@@ -161,9 +161,12 @@ test('harness writes Python only after AST completion and verifies it with a rea
 test('incomplete AST budget exhaustion never writes a partial file', async t => {
   const root = await mkdtemp(join(tmpdir(), 'jev-ast-limit-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const fallback = new ScriptedProvider([{ action: 'write_file', args: { path: 'main.py' } }]);
+  const fallback = new ScriptedProvider([{ action: 'write_file', args: { path: 'main.py' } }, { action: 'finish', verdict: 1 }]);
   const result = await new Harness({ workspace: root, provider: new AstProvider(['0', ...hello()], fallback), maxGenerationSteps: 3, journalDirectory: false }).run('Create Python hello world.');
-  assert.equal(result.status, 'limited');
+  assert.equal(result.status, 'completed', result.summary);
+  assert.equal(result.records[0]?.tool, 'write_file');
+  assert.equal(result.records[0]?.result.ok, false);
+  assert.match(result.records[0]?.result.output ?? '', /production budget/);
   assert.deepEqual(await readdir(root), []);
 });
 

@@ -289,7 +289,7 @@ export class Harness {
           if (result.ok && typeof result.data?.plan === 'string') plan = result.data.plan;
           await emit('tool_end', record);
         } catch (error) {
-          if (signal.aborted || error instanceof LimitError || error instanceof DecisionError) throw error;
+          if (signal.aborted || error instanceof DecisionError || (error instanceof LimitError && decisions.exhausted)) throw error;
           const record: ToolRecord = { turn, tool: action, args, result: { ok: false, output: error instanceof Error ? error.message : String(error) } };
           records.push(record);
           await emit('tool_end', record);
