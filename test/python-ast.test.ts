@@ -175,6 +175,18 @@ test('custom AST terminals stay in AST choices and never enter grid decoding', a
   assert.ok(provider.states.every(state => state.generation.phase === 'ast'));
 });
 
+test('numeric terminals offer constants only and string spelling stops after three identical pieces', async () => {
+  const provider = new AstProvider(['0', 'for', { value: JSON.stringify('i') }, 'call', { value: 'range' }, '1', 'number', { value: '50' }, 'pass', 'finish', 'finish']);
+  const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Write a for loop in Python.' } }, 'content', options);
+  assert.equal(source, 'for i in range(50):\n    pass\n');
+  const number = provider.states.findIndex(state => state.generation.slot === 'number');
+  assert.ok(!Object.keys(provider.criteria[number]!).includes('custom'));
+  const spelled = new AstProvider(['0', 'expr', 'call', { value: 'print' }, '1', 'string', 'custom',
+    { value: JSON.stringify('a') }, { value: JSON.stringify('a') }, { value: JSON.stringify('a') }, 'finish']);
+  assert.equal(await generatePythonAst(decisions(spelled), state, 'content', options), "print('aaa')\n");
+  assert.ok(!spelled.states.some(state => String(state.generation.slot).startsWith('string_token:"aaa"')));
+});
+
 test('ordinary for-loop range bounds exclude zero and builtins are not variable references', async () => {
   const provider = new AstProvider(['0', 'for', { value: JSON.stringify('i') }, 'call', { value: 'range' }, '1', 'number', { value: '5' },
     'expr', 'call', { value: 'print' }, '1', 'name', 'finish', 'finish']);

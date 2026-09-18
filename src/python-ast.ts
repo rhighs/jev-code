@@ -204,7 +204,7 @@ export function vocabulary(objective: string): Vocab {
     if (count > 1) literals.push(words[start]![0]!.toUpperCase() + words[start]!.slice(1) + ', ' + words.slice(start + 1, start + count).join(' ') + '!');
   }
   const strings = [...new Set(literals)].slice(0, 220);
-  const numbers = [...new Set([0, 1, 2, 5, 10, ...((objective.match(/-?\d+(?:\.\d+)?/g) ?? []).map(Number))])].filter(Number.isFinite).slice(0, 200);
+  const numbers = [...new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 50, 100, 1000, -1, ...((objective.match(/-?\d+(?:\.\d+)?/g) ?? []).map(Number))])].filter(Number.isFinite).slice(0, 200);
   return { words, identifiers, strings, numbers, purposes: [...new Set(purposes)].slice(0, 160) };
 }
 
@@ -241,20 +241,24 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
 
   async function terminal(slot: string, scope: Scope, values: Array<string | number>): Promise<string | number> {
     const criteria: Record<string, string> = Object.fromEntries(values.map((value, index) => [`value_${index}`, JSON.stringify(value)]));
-    criteria.custom = 'Compose a different terminal value from valid token choices, staying in AST generation.';
+    const numeric = slot === 'number';
+    if (!numeric) criteria.custom = 'Compose a different terminal value from valid token choices, staying in AST generation.';
     const selected = await pick(slot, scope, criteria);
     if (selected !== 'custom') return values[Number(selected.slice(6))]!;
-    const numeric = slot === 'number';
-    const identifierSlot = slot !== 'string' && !slot.endsWith('_purpose') && !numeric;
-    const pieces = numeric ? '0123456789.-'.split('') : [...new Set([...words, ...identifiers, ...'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'.split(''), ...(identifierSlot ? [] : [' ', ', ', ': ', '!', '?', '.', '\n'])])].slice(0, 240);
-    let result = '';
-    for (let count = 0; count < 64; count++) {
+    const identifierSlot = slot !== 'string' && !slot.endsWith('_purpose');
+    const pieces = [...new Set([...words, ...identifiers, ...'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'.split(''), ...(identifierSlot ? [] : [' ', ', ', ': ', '!', '?', '.', '\n'])])].slice(0, 240);
+    let result = '', last = '', repeats = 0;
+    for (let count = 0; count < 32; count++) {
       const candidates: Record<string, string> = Object.fromEntries(pieces.map((piece, index) => [`piece_${index}`, JSON.stringify(piece)]));
       if (result || slot === 'string') candidates.end = 'This terminal value is complete.';
       const selected = await pick(`${slot}_token:${JSON.stringify(result)}`, scope, candidates);
       if (selected === 'end') return result;
-      result += pieces[Number(selected.slice(6))]!;
+      const piece = pieces[Number(selected.slice(6))]!;
+      repeats = piece === last ? repeats + 1 : 1;
+      last = piece;
+      result += piece;
       if (Buffer.byteLength(result) > Math.min(options.maxBytes, 8000)) throw new LimitError('AST terminal exceeds its byte budget.');
+      if (repeats >= 3) return result;
     }
     throw new LimitError('AST terminal token budget exhausted; no grid fallback was used.');
   }
