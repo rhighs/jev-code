@@ -90,7 +90,7 @@ export async function runEval(opts: RunEvalOptions): Promise<EvalRecord[]> {
     const ws = await mkdtemp(join(tmpdir(), `jev-eval-${task.name}-`));
     try {
       const harness = new Harness({
-        workspace: ws, provider: opts.provider, tools: builtInTools(), journalDirectory: join(ws, '.jev', 'runs'),
+        workspace: ws, provider: opts.provider, tools: builtInTools(), journalDirectory: join(resolve(opts.out), '.jev', 'eval', 'journals', task.name),
         maxTurns: task.limits.maxTurns ?? DEFAULT_LIMITS.maxTurns, maxRequests: task.limits.maxRequests ?? DEFAULT_LIMITS.maxRequests,
         maxGenerationSteps: task.limits.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, maxRunMs: task.limits.maxRunMs ?? DEFAULT_LIMITS.maxRunMs,
         authorize: () => true, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}),

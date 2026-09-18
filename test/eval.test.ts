@@ -141,8 +141,9 @@ export default async (ws: string) => ({ ok: (await readFile(join(ws, 'hi.txt'), 
   assert.equal(typeof r.durationMs, 'number');
   assert.match(r.runId, /^[0-9a-f-]{36}$/);
   assert.ok(r.commit === null || /^[0-9a-f]{40}$/.test(r.commit));
-  const files = await readdir(join(out, '.jev', 'eval'));
+  const files = (await readdir(join(out, '.jev', 'eval'))).filter(f => f.endsWith('.json'));
   assert.equal(files.length, 1);
+  assert.ok((await readdir(join(out, '.jev', 'eval', 'journals', 'trivial'))).length === 1);
   const saved = JSON.parse(await readFile(join(out, '.jev', 'eval', files[0]!), 'utf8')) as unknown[];
   assert.deepEqual(saved, records);
 });
