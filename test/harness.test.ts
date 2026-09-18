@@ -84,7 +84,9 @@ test('two consecutive writes to the same path without a read or run make write t
   const result = await new Harness({ workspace: root, provider, experimentalGrid: true, journalDirectory: false }).run('Write hello.txt with hello.');
   assert.equal(result.status, 'completed', result.summary);
   const third = provider.states.find(state => state.task.turn === 3) as { progressFeedback?: string } | undefined;
-  assert.match(third?.progressFeedback ?? '', /rewrote hello.txt/);
+  assert.match(third?.progressFeedback ?? '', /rewrote hello.txt without running it/);
+  assert.deepEqual(provider.actions.find(a => a.turn === 3)?.offered.sort(), ['bash', 'blocked', 'finish']);
+  assert.ok(provider.actions.find(a => a.turn === 4)?.offered.includes('write_file'));
   assert.ok(!(provider.states.find(state => state.task.turn === 2) as { progressFeedback?: string })?.progressFeedback);
 });
 

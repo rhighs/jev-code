@@ -195,8 +195,11 @@ export class Harness {
         };
         const rewritten = writtenPath(previous);
         if (rewritten !== undefined && rewritten === writtenPath(earlier)) {
-          for (const tool of this.registry.values()) if (tool.effect === 'write' && tool.name !== 'set_plan') delete criteria[tool.name];
-          state.progressFeedback = `The last two actions rewrote ${rewritten} without running or reading it. Run or inspect the current file before rewriting; write tools are unavailable for this turn.`;
+          const runnable = [...this.registry.values()].some(tool => tool.effect === 'shell');
+          for (const tool of this.registry.values()) if (runnable ? tool.effect !== 'shell' : tool.effect === 'write' && tool.name !== 'set_plan') delete criteria[tool.name];
+          state.progressFeedback = runnable
+            ? `The last two actions rewrote ${rewritten} without running it. Run the program now and use its output; only shell tools are available for this turn.`
+            : `The last two actions rewrote ${rewritten} without running or reading it. Run or inspect the current file before rewriting; write tools are unavailable for this turn.`;
         }
         criteria.finish = 'All requested work is complete and applicable verification has passed; summarize the observed outcome.';
         if (records.at(-1)?.tool === 'finish' && !records.at(-1)?.result.ok) delete criteria.finish;

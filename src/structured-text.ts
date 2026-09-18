@@ -24,7 +24,7 @@ export async function generateStructuredText(decisions: Decisions, state: State,
   for (let step = 1; step <= maxTokens; step++) {
     const criteria: Record<string, string> = Object.fromEntries(tokens.map(token => [token.key, JSON.stringify(token.value)]));
     if (text || options.allowEmpty) criteria.END = 'The complete field satisfies the task. Finish it now.';
-    const input = { ...context, generation: { field, phase: 'tokens', draft: text, tokens, remainingTokens: maxTokens - step } };
+    const input = { ...context, generation: { field, phase: 'tokens', draft: text, remainingTokens: maxTokens - step } };
     const instruction = `Construct the exact ${field}: ${description}. Choose the longest useful next span. Prefer existing paths, task literals and conventional filenames. Do not repeat text. END only when the complete value satisfies the objective. Current value: ${JSON.stringify(text)}.`;
     if (Buffer.byteLength(JSON.stringify({ state: input, questions: { selection: choice(instruction, criteria) } })) > MAX_GRID_REQUEST_BYTES) throw new LimitError(`Structured ${field} context exceeds the safe request budget.`);
     const selected = await decisions.choose(input, instruction, criteria);

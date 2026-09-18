@@ -152,6 +152,7 @@ export default async (ws: string) => ({ ok: (await readFile(join(ws, 'hi.txt'), 
   assert.equal(typeof r.requests, 'number');
   assert.equal(typeof r.inputTokens, 'number');
   assert.equal(typeof r.durationMs, 'number');
+  assert.equal(r.searchWidth, 1);
   assert.match(r.runId, /^[0-9a-f-]{36}$/);
   assert.ok(r.commit === null || /^[0-9a-f]{40}$/.test(r.commit));
   const files = (await readdir(join(out, '.jev', 'eval'))).filter(f => f.endsWith('.json'));
@@ -174,7 +175,7 @@ test('cli eval with an unknown task exits nonzero with a one-line error', async 
 });
 
 const record = (task: string, ok: boolean, requests: number, durationMs: number, status = 'completed'): EvalRecord => ({
-  task, stage: 'x', status, summary: '', check: { ok, reason: '' }, turns: 1, requests, inputTokens: 1, durationMs, runId: 'r', commit: null, startedAt: 's',
+  task, stage: 'x', status, summary: '', check: { ok, reason: '' }, turns: 1, requests, inputTokens: 1, durationMs, runId: 'r', commit: null, startedAt: 's', searchWidth: 1,
 });
 
 test('compare prints one row per task with deltas', () => {

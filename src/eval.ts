@@ -17,7 +17,7 @@ export interface TaskLimits { maxTurns?: number; maxRequests?: number; maxGenera
 export interface EvalTask { name: string; dir: string; prompt: string; stage: string; limits: TaskLimits; check: Checker }
 export interface EvalRecord extends Record<string, unknown> {
   task: string; stage: string; status: string; summary: string; check: CheckResult;
-  turns: number; requests: number; inputTokens: number; durationMs: number; runId: string; commit: string | null; startedAt: string;
+  turns: number; requests: number; inputTokens: number; durationMs: number; runId: string; commit: string | null; startedAt: string; searchWidth: number;
 }
 export interface RunPythonOptions {
   timeoutMs: number;
@@ -85,6 +85,7 @@ export interface RunEvalOptions {
   only?: string;
   onEvent?: (event: HarnessEvent) => void | Promise<void>;
   onRecord?: (record: EvalRecord) => void;
+  searchWidth?: number;
 }
 
 export async function runEval(opts: RunEvalOptions): Promise<EvalRecord[]> {
@@ -101,7 +102,7 @@ export async function runEval(opts: RunEvalOptions): Promise<EvalRecord[]> {
         workspace: ws, provider: opts.provider, tools: builtInTools(), journalDirectory: join(resolve(opts.out), '.jev', 'eval', 'journals', task.name),
         maxTurns: task.limits.maxTurns ?? DEFAULT_LIMITS.maxTurns, maxRequests: task.limits.maxRequests ?? DEFAULT_LIMITS.maxRequests,
         maxGenerationSteps: task.limits.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, maxRunMs: task.limits.maxRunMs ?? DEFAULT_LIMITS.maxRunMs,
-        authorize: () => true, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}),
+        authorize: () => true, searchWidth: opts.searchWidth ?? 1, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}),
       });
       const result = await harness.run(task.prompt);
       const check = result.status === 'completed'
@@ -110,7 +111,7 @@ export async function runEval(opts: RunEvalOptions): Promise<EvalRecord[]> {
       const record: EvalRecord = {
         task: task.name, stage: task.stage, status: result.status, summary: result.summary, check,
         turns: result.turns, requests: result.requests, inputTokens: result.usage.inputTokens, durationMs: result.durationMs,
-        runId: result.id, commit: sha, startedAt: result.startedAt,
+        runId: result.id, commit: sha, startedAt: result.startedAt, searchWidth: opts.searchWidth ?? 1,
       };
       records.push(record);
       await writeFile(file, JSON.stringify(records, null, 2) + '\n', { mode: 0o600 });

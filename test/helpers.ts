@@ -71,6 +71,7 @@ export interface TestState {
 
 export class ScriptedProvider implements DecisionProvider {
   states: TestState[] = [];
+  actions: Array<{ turn: number; offered: string[] }> = [];
   constructor(private readonly steps: Step[], private readonly inspect?: (state: TestState) => void) {}
   async decide<Q extends Questions>(input: EntryType, questions: Q, _signal?: AbortSignal): Promise<SystemOneResult<Q>> {
     const state = input as unknown as TestState;
@@ -88,6 +89,7 @@ export class ScriptedProvider implements DecisionProvider {
       assert.equal(question.type, 'choice');
       if (question.type !== 'choice') throw new Error('Only Choice and Noul are used.');
       let selected = step.action;
+      if (!state.generation && !state.completionCheck && !state.field) this.actions.push({ turn: state.task.turn, offered: Object.keys(question.criteria) });
       if (state.completionCheck) selected = (step.verdict ?? 1) >= 0.5 ? 'complete' : 'continue';
       if (state.generation?.phase.startsWith('plan')) selected = 'free';
       if (state.generation?.phase === 'bash_ast') {
@@ -100,7 +102,8 @@ export class ScriptedProvider implements DecisionProvider {
         const draft = state.generation.draft ?? '';
         assert.ok(target!.startsWith(draft));
         const remainder = target!.slice(draft.length);
-        const token = state.generation.tokens!.filter(token => remainder.startsWith(token.value)).sort((a, b) => b.value.length - a.value.length)[0];
+        const tokens = Object.entries(question.criteria).filter(([key]) => key !== 'END').map(([key, value]) => ({ key, value: JSON.parse(String(value)) as string }));
+        const token = tokens.filter(token => remainder.startsWith(token.value)).sort((a, b) => b.value.length - a.value.length)[0];
         selected = remainder ? token?.key ?? 'unavailable-token' : 'END';
       }
       if (state.generation?.phase === 'cells') {

@@ -41,7 +41,7 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
   ast install <module>    Install local/npm AST adapters in this workspace
   ast list               List available AST adapters
   ast remove <id>         Remove an installed adapter
-  eval [task]             Run the live eval ladder (dev-only, implies --yes)
+  eval [task]             Run the live eval ladder (dev-only, implies --yes; honors --search-width)
   eval compare <a> <b>    Compare two .jev/eval record files
   --eval-out <dir>        Directory for .jev/eval records (default: current directory)
   --json                  Emit JSONL events on stdout
@@ -97,7 +97,9 @@ async function main(): Promise<void> {
     if (extra.length) throw new Error('Use eval [task] or eval compare <a.json> <b.json>.');
     if (!process.env.TYPESAFE_API_KEY) throw new Error('eval needs TYPESAFE_API_KEY for live Jev runs.');
     process.stderr.write('eval runs unattended: agent Bash executes on this host without confirmation.\n');
-    const records = await runEval({ provider: new JevProvider(), out: resolve(values['eval-out'] ?? '.'), ...(only === undefined ? {} : { only }),
+    const width = values['search-width'];
+    if (width !== undefined && !/^[1-8]$/.test(width)) throw new Error('--search-width must be 1–8.');
+    const records = await runEval({ provider: new JevProvider(), out: resolve(values['eval-out'] ?? '.'), ...(only === undefined ? {} : { only }), searchWidth: width === undefined ? 1 : Number(width),
       onRecord: r => process.stdout.write(`${r.task}\t${r.check.ok ? 'pass' : 'fail'}\t${r.status}\t${r.turns} turns\t${r.requests} requests\t${formatDuration(r.durationMs)}\t${r.check.reason}\n`) });
     process.exitCode = records.every(r => r.check.ok) ? 0 : 1;
     return;
