@@ -41,14 +41,14 @@ const options = { maxSteps: 100, maxBytes: 8000, allowEmpty: false, fragments: [
 const decisions = (provider: DecisionProvider) => new Decisions(provider, 100, new AbortController().signal);
 
 test('Python AST builds a complete tree, streams productions and unparses executable source', async () => {
-  const provider = new AstProvider(hello());
+  const provider = new AstProvider(['0', ...hello()]);
   const progress: string[] = [];
   const source = await generatePythonAst(decisions(provider), state, 'content', { ...options,
     onText: async (_field, _text, _done, _change, event) => { if (event?.ast) progress.push(event.ast.production); },
   });
   assert.equal(source, "print('Hello, world!')\n");
-  assert.equal(progress.length, 7);
-  assert.deepEqual(progress.slice(0, 5), ['expr', 'call', 'name_0', '1', 'string']);
+  assert.equal(progress.length, 8);
+  assert.deepEqual(progress.slice(0, 6), ['0', 'expr', 'call', 'name_0', '1', 'string']);
   assert.equal(progress.at(-1), 'finish');
   assert.ok(provider.states.every(state => !Object.hasOwn(state.generation, 'partialAst')));
   const argument = provider.states.find(state => state.generation.slot === 'argument_0')!;
@@ -59,7 +59,7 @@ test('Python AST builds a complete tree, streams productions and unparses execut
 });
 
 test('function parameters enter the symbol table and return is allowed only in function scope', async () => {
-  const provider = new AstProvider(['function', { value: JSON.stringify('add') }, '2', { value: JSON.stringify('a') }, { value: JSON.stringify('b') },
+  const provider = new AstProvider(['0', 'function', { value: JSON.stringify('add') }, '2', { value: JSON.stringify('a') }, { value: JSON.stringify('b') },
     'return', 'binary', 'Add', 'name', { value: 'a' }, 'name', { value: 'b' }, 'finish']);
   const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Write Python add(a, b), return a plus b.' } }, 'content', options);
   assert.equal(source, 'def add(a, b):\n    return a + b\n');
@@ -69,13 +69,13 @@ test('function parameters enter the symbol table and return is allowed only in f
   const root = provider.states.at(-1)!;
   assert.equal(root.generation.constraints.inFunction, false);
   assert.ok(!root.generation.symbols.includes('a'));
-  assert.ok(!Object.hasOwn(provider.criteria[0]!, 'return'));
-  assert.ok(!Object.hasOwn(provider.criteria[0]!, 'break'));
-  assert.ok(Object.hasOwn(provider.criteria[5]!, 'return'));
+  assert.ok(!Object.hasOwn(provider.criteria[1]!, 'return'));
+  assert.ok(!Object.hasOwn(provider.criteria[1]!, 'break'));
+  assert.ok(Object.hasOwn(provider.criteria[6]!, 'return'));
 });
 
 test('nested functions reset loop scope and cannot break an enclosing function’s loop', async () => {
-  const provider = new AstProvider(['for', { value: JSON.stringify('i') }, 'call', { value: 'range' }, '1', 'number', { value: '2' },
+  const provider = new AstProvider(['0', 'for', { value: JSON.stringify('i') }, 'call', { value: 'range' }, '1', 'number', { value: '2' },
     'function', { value: JSON.stringify('main') }, '0', 'pass', 'finish', 'break', 'finish']);
   const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Python loop with i in range(2), define main with an empty body, then break.' } }, 'content', options);
   assert.match(source, /for i in range\(2\):\n+    def main\(\):\n        pass\n    break/);
@@ -89,7 +89,7 @@ test('nested functions reset loop scope and cannot break an enclosing function�
 
 test('AST terminal strings preserve Unicode and escapes through Python unparse', async () => {
   const message = 'héllo 🌍 \\ end';
-  const provider = new AstProvider(['expr', 'call', { value: 'print' }, '1', 'string', { value: JSON.stringify(message) }, 'finish']);
+  const provider = new AstProvider(['0', 'expr', 'call', { value: 'print' }, '1', 'string', { value: JSON.stringify(message) }, 'finish']);
   const source = await generatePythonAst(decisions(provider), { task: { prompt: `Python print "${message}".` } }, 'content', options);
   assert.equal(source, "print('héllo 🌍 \\\\ end')\n");
 });
@@ -102,7 +102,7 @@ test('completed empty modules and byte limits are validated without executing so
 });
 
 test('assignment RHS cannot reference a name before it is defined', async () => {
-  const provider = new AstProvider(['assign', { value: JSON.stringify('message') }, 'string', { value: JSON.stringify('hello') },
+  const provider = new AstProvider(['0', 'assign', { value: JSON.stringify('message') }, 'string', { value: JSON.stringify('hello') },
     'expr', 'call', { value: 'print' }, '1', 'name', 'finish']);
   const source = await generatePythonAst(decisions(provider), { task: { prompt: 'In Python assign hello to message and print message.' } }, 'content', options);
   assert.equal(source, "message = 'hello'\nprint(message)\n");
@@ -111,7 +111,7 @@ test('assignment RHS cannot reference a name before it is defined', async () => 
 });
 
 test('defined functions constrain call arity from the symbol table', async () => {
-  const provider = new AstProvider(['function', { value: JSON.stringify('add') }, '2', { value: JSON.stringify('a') }, { value: JSON.stringify('b') },
+  const provider = new AstProvider(['0', 'function', { value: JSON.stringify('add') }, '2', { value: JSON.stringify('a') }, { value: JSON.stringify('b') },
     'return', 'binary', 'Add', 'name', { value: 'a' }, 'name', { value: 'b' },
     'expr', 'call', { value: 'print' }, '1', 'call', { value: 'add' }, 'number', { value: '1' }, 'number', { value: '2' }, 'finish']);
   const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Python define add(a, b) returning a + b, then print add(1, 2).' } }, 'content', options);
@@ -121,7 +121,7 @@ test('defined functions constrain call arity from the symbol table', async () =>
 });
 
 test('calls to imported module members use a defined receiver', async () => {
-  const provider = new AstProvider(['import', 'math', 'expr', 'call', { value: 'print' }, '1', 'call', 'member', { value: 'math' },
+  const provider = new AstProvider(['0', 'import', 'math', 'expr', 'call', { value: 'print' }, '1', 'call', 'member', { value: 'math' },
     { value: JSON.stringify('sqrt') }, '1', 'number', { value: '16' }, 'finish']);
   const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Python import math and print math.sqrt(16).' } }, 'content', options);
   assert.equal(source, 'import math\nprint(math.sqrt(16))\n');
@@ -144,7 +144,7 @@ test('harness writes Python only after AST completion and verifies it with a rea
     { action: 'finish', args: { summary: 'Created and verified hello world.' } },
   ]);
   const events: HarnessEvent[] = [];
-  const result = await new Harness({ workspace: root, provider: new AstProvider(hello(), fallback), journalDirectory: false,
+  const result = await new Harness({ workspace: root, provider: new AstProvider(['0', ...hello()], fallback), journalDirectory: false,
     onEvent: async event => {
       events.push(event);
       if (event.type === 'text' && event.data.decoder === 'ast' && event.data.field === 'content') assert.deepEqual(await readdir(root), []);
@@ -162,13 +162,13 @@ test('incomplete AST budget exhaustion never writes a partial file', async t => 
   const root = await mkdtemp(join(tmpdir(), 'jev-ast-limit-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const fallback = new ScriptedProvider([{ action: 'write_file', args: { path: 'main.py' } }]);
-  const result = await new Harness({ workspace: root, provider: new AstProvider(hello(), fallback), maxGenerationSteps: 3, journalDirectory: false }).run('Create Python hello world.');
+  const result = await new Harness({ workspace: root, provider: new AstProvider(['0', ...hello()], fallback), maxGenerationSteps: 3, journalDirectory: false }).run('Create Python hello world.');
   assert.equal(result.status, 'limited');
   assert.deepEqual(await readdir(root), []);
 });
 
 test('custom AST terminals stay in AST choices and never enter grid decoding', async () => {
-  const provider = new AstProvider(['expr', 'call', { value: 'print' }, '1', 'string', 'custom',
+  const provider = new AstProvider(['0', 'expr', 'call', { value: 'print' }, '1', 'string', 'custom',
     { value: JSON.stringify('a') }, { value: JSON.stringify('b') }, 'end', 'finish']);
   const source = await generatePythonAst(decisions(provider), state, 'content', options);
   assert.equal(source, "print('ab')\n");
@@ -176,7 +176,7 @@ test('custom AST terminals stay in AST choices and never enter grid decoding', a
 });
 
 test('ordinary for-loop range bounds exclude zero and builtins are not variable references', async () => {
-  const provider = new AstProvider(['for', { value: JSON.stringify('i') }, 'call', { value: 'range' }, '1', 'number', { value: '5' },
+  const provider = new AstProvider(['0', 'for', { value: JSON.stringify('i') }, 'call', { value: 'range' }, '1', 'number', { value: '5' },
     'expr', 'call', { value: 'print' }, '1', 'name', 'finish', 'finish']);
   const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Write a for loop in Python.' } }, 'content', options);
   assert.equal(source, 'for i in range(5):\n    print(i)\n');
@@ -187,7 +187,7 @@ test('ordinary for-loop range bounds exclude zero and builtins are not variable 
 
 test('explicitly requested empty and negative ranges retain their literal bounds', async () => {
   for (const bound of [0, -2]) {
-    const provider = new AstProvider(['for', { value: JSON.stringify('i') }, 'call', { value: 'range' }, '1', 'number', { value: String(bound) }, 'pass', 'finish', 'finish']);
+    const provider = new AstProvider(['0', 'for', { value: JSON.stringify('i') }, 'call', { value: 'range' }, '1', 'number', { value: String(bound) }, 'pass', 'finish', 'finish']);
     const source = await generatePythonAst(decisions(provider), { task: { prompt: `Python for i in range(${bound}), empty body.` } }, 'content', options);
     assert.equal(source, `for i in range(${bound}):\n    pass\n`);
   }

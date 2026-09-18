@@ -25,7 +25,7 @@ export interface GenerateOptions {
   astRegistry?: AstRegistry;
   experimentalGrid?: boolean;
   gridBatchSize?: number;
-  gridConcurrency?: number;
+  concurrency?: number;
   onText?: (field: string, value: string, done: boolean, change?: TextChange, progress?: TextProgress) => Promise<void>;
 }
 

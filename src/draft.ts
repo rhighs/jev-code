@@ -64,7 +64,7 @@ export class GenerationDisplay {
     if (!this.current) return [];
     const width = Math.max(1, columns);
     const { field, decoder, cursor, bytes, done, grid, ast, step } = this.current.data;
-    const header = `Draft · ${this.action}.${field} · ${decoder} · ${ast && !done ? `step ${step} · ${ast.slot} → ${ast.production}` : grid && !done ? `${grid.completed}/${grid.total} cells · round ${grid.round}` : `${cursor.row + 1}:${cursor.column + 1} · ${bytes} B`}${done ? ' · complete' : ''}`;
+    const header = `Draft · ${this.action}.${field} · ${decoder} · ${ast && !done ? `step ${step} · ${ast.unit ? `${ast.unit} · ` : ''}${ast.slot} → ${ast.production}` : grid && !done ? `${grid.completed}/${grid.total} cells · round ${grid.round}` : `${cursor.row + 1}:${cursor.column + 1} · ${bytes} B`}${done ? ' · complete' : ''}`;
     if (grid && !done) {
       const result = [fitLine(header, width)];
       for (let row = 0; row < Math.min(grid.rows, maxLines); row++) {
@@ -80,7 +80,7 @@ export class GenerationDisplay {
       const selected = tail.slice(-maxLines);
       const start = Math.max(1, tail.length - selected.length + 1);
       const title = `${this.path ?? 'File preview'} · ${done ? 'ready to write' : 'building'} · ${bytes} B`;
-      const detail = done ? 'Complete source · awaiting tool execution' : ast ? `AST step ${step} · ${ast.slot} → ${ast.production}` : 'Draft · not yet written';
+      const detail = done ? 'Complete source · awaiting tool execution' : ast ? `AST step ${step} · ${ast.unit ? `${ast.unit} · ` : ''}${ast.slot} → ${ast.production}` : 'Draft · not yet written';
       const rows = selected.map((line, index) => {
         const prefix = `│ ${String(start + index).padStart(3)}  `;
         return paint(prefix, 2, color) + highlightCode(fitLine(displayText(line), Math.max(1, width - prefix.length)), color);

@@ -41,7 +41,7 @@ test('experimental grid asks one Choice per output cell concurrently and decodes
   } };
   const changes: unknown[] = [];
   const actual = await generateText(new Decisions(provider, 50, new AbortController().signal), {}, 'content', 'Write a file.', {
-    experimentalGrid: true, fragments: [], maxSteps: 8, maxBytes: 100, allowEmpty: false, gridBatchSize: 2, gridConcurrency: 4,
+    experimentalGrid: true, fragments: [], maxSteps: 8, maxBytes: 100, allowEmpty: false, gridBatchSize: 2, concurrency: 4,
     onText: async (_field, _text, _done, change) => { if (change) changes.push(change); },
   });
   assert.equal(actual, target);

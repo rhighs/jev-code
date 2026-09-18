@@ -72,7 +72,7 @@ class LongProvider implements DecisionProvider {
 test('a long partial program keeps every decision request under the cap and generation continues', async () => {
   const literal = 'lorem ipsum '.repeat(45).trim();
   const lines = 40;
-  const script = Array.from({ length: lines }, () => ['expr', 'call', { value: 'print' }, '1', 'string', { value: JSON.stringify(literal) }]).flat().concat('finish');
+  const script = ['0' as string | { value: string }].concat(Array.from({ length: lines }, () => ['expr', 'call', { value: 'print' }, '1', 'string', { value: JSON.stringify(literal) }]).flat(), 'finish');
   const expected = script.length;
   const provider = new LongProvider(script);
   const decisions = new Decisions(provider, 1000, new AbortController().signal);

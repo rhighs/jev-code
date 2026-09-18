@@ -9,7 +9,7 @@ import type { HarnessOptions } from '../src/harness.js';
 import type { DecisionProvider, HarnessEvent, Tool } from '../src/types.js';
 import { ScriptedProvider, type Step } from './helpers.js';
 
-async function setup(t: test.TestContext, provider: DecisionProvider, yes = true, onEvent?: (event: HarnessEvent) => void, tools?: Tool[], gridOptions?: Pick<HarnessOptions, 'gridBatchSize' | 'gridConcurrency'>) {
+async function setup(t: test.TestContext, provider: DecisionProvider, yes = true, onEvent?: (event: HarnessEvent) => void, tools?: Tool[], gridOptions?: Pick<HarnessOptions, 'gridBatchSize' | 'concurrency'>) {
   const workspace = await mkdtemp(join(tmpdir(), 'jev-terminal-'));
   const input = new PassThrough(), output = new PassThrough();
   let transcript = '';
@@ -194,7 +194,7 @@ test('generated content streams before the file is written', async t => {
     if (generation?.field === 'content' && generation.phase === 'cells' && !questions.cell_0_0) await gate;
     return base.decide(state, questions, signal);
   } };
-  const { input, wait, workspace, transcript } = await setup(t, provider, true, undefined, undefined, { gridBatchSize: 2, gridConcurrency: 4 });
+  const { input, wait, workspace, transcript } = await setup(t, provider, true, undefined, undefined, { gridBatchSize: 2, concurrency: 4 });
   t.after(resume);
   input.write('Write streamed.txt with hello.\n');
   try {

@@ -22,7 +22,8 @@ export interface HarnessOptions {
   maxRequests?: number;
   maxGenerationSteps?: number;
   gridBatchSize?: number;
-  gridConcurrency?: number;
+  /** In-flight Jev requests shared by every concurrent generator in a run. */
+  concurrency?: number;
   maxRunMs?: number;
   /** Opt into a strict Noul gate; by default completion uses a categorical choice. */
   completionThreshold?: number;
@@ -53,7 +54,7 @@ export class Harness {
       if (!Number.isSafeInteger(value) || value < 1 || value > 2_147_483_647) throw new Error(`${name} must be a positive integer <= 2147483647.`);
     }
     const threshold = options.completionThreshold ?? 0.85;
-    for (const [name, value, max] of [['gridBatchSize', options.gridBatchSize ?? 8, 128], ['gridConcurrency', options.gridConcurrency ?? 4, 16]] as const) {
+    for (const [name, value, max] of [['gridBatchSize', options.gridBatchSize ?? 8, 128], ['concurrency', options.concurrency ?? 4, 16]] as const) {
       if (!Number.isSafeInteger(value) || value < 1 || value > max) throw new Error(`${name} must be 1–${max}.`);
     }
     if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) throw new Error('completionThreshold must be between 0 and 1.');
@@ -133,7 +134,7 @@ export class Harness {
       eventQueue = write.catch(() => {});
       return write;
     };
-    const decisions = new Decisions(this.options.provider, this.options.maxRequests ?? DEFAULT_LIMITS.maxRequests, signal, data => emit('decision', data));
+    const decisions = new Decisions(this.options.provider, this.options.maxRequests ?? DEFAULT_LIMITS.maxRequests, signal, data => emit('decision', data), this.options.concurrency ?? 4);
     let status: RunStatus = 'limited', summary = 'Turn budget exhausted; task was not reported complete.';
     let modelSummary: string | undefined;
     try {
@@ -197,7 +198,7 @@ export class Harness {
           maxSteps: this.options.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, fragments,
           astRegistry: this.astRegistry,
           experimentalGrid: this.options.experimentalGrid ?? false,
-          gridBatchSize: this.options.gridBatchSize ?? 8, gridConcurrency: this.options.gridConcurrency ?? 4,
+          gridBatchSize: this.options.gridBatchSize ?? 8, concurrency: this.options.concurrency ?? 4,
           // Patch events preserve the scored cells without duplicating the draft per batch.
           onText: async (field: string, value: string, done: boolean, change?: TextChange, progress?: TextProgress) => emit('text', {
             field, bytes: progress?.bytes ?? Buffer.byteLength(value), done, change: change ?? null,

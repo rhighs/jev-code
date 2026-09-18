@@ -20,7 +20,7 @@ test('all text argument grids generate concurrently and preserve arbitrary white
   const args = await generateArguments(new Decisions(provider, 100, new AbortController().signal), {
     task: { turn: 1, prompt: 'Create sum.ts.', updates: [] }, action: 'write_file',
   }, { path: { type: 'string', description: 'Path.' }, content: { type: 'string', description: 'Contents.' } }, {
-    experimentalGrid: true, fragments: [], maxSteps: 64, gridBatchSize: 8, gridConcurrency: 4,
+    experimentalGrid: true, fragments: [], maxSteps: 64, gridBatchSize: 8, concurrency: 4,
     onText: async (field, _value, done) => { active.add(field); if (active.size > 1) overlap = true; if (done) active.delete(field); },
   });
   assert.deepEqual(args, { path: 'sum.ts', content: 'export const value = 42;\n' });

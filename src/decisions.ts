@@ -2,6 +2,7 @@ import { choice, noul, type EntryType, type Questions, type SystemOneResult } fr
 import { DecisionError, LimitError, type DecisionProvider, type DecisionEventData } from './types.js';
 
 export type State = Record<string, unknown>;
+interface Counters { requests: number; usage: { inputTokens: number; outputTokens: number }; inflight: number; waiters: Array<() => void> }
 
 export class Decisions {
   get requests(): number { return this.counters.requests; }
@@ -12,11 +13,33 @@ export class Decisions {
     private readonly maxRequests: number,
     readonly signal: AbortSignal,
     private readonly onDecision: (data: DecisionEventData) => Promise<void> = async () => {},
-    private readonly counters = { requests: 0, usage: { inputTokens: 0, outputTokens: 0 } },
-  ) {}
+    private readonly concurrency = 4,
+    private readonly counters: Counters = { requests: 0, usage: { inputTokens: 0, outputTokens: 0 }, inflight: 0, waiters: [] },
+  ) {
+    if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new Error('concurrency must be a positive integer.');
+  }
 
   fork(signal: AbortSignal): Decisions {
-    return new Decisions(this.provider, this.maxRequests, AbortSignal.any([this.signal, signal]), this.onDecision, this.counters);
+    return new Decisions(this.provider, this.maxRequests, AbortSignal.any([this.signal, signal]), this.onDecision, this.concurrency, this.counters);
+  }
+
+  private acquire(): Promise<void> {
+    if (this.counters.inflight < this.concurrency) { this.counters.inflight++; return Promise.resolve(); }
+    return new Promise((resolve, reject) => {
+      const waiter = (): void => { this.signal.removeEventListener('abort', onAbort); resolve(); };
+      const onAbort = (): void => {
+        const idx = this.counters.waiters.indexOf(waiter);
+        if (idx >= 0) this.counters.waiters.splice(idx, 1);
+        reject(this.signal.reason);
+      };
+      this.signal.addEventListener('abort', onAbort, { once: true });
+      this.counters.waiters.push(waiter);
+    });
+  }
+
+  private release(): void {
+    const next = this.counters.waiters.shift();
+    if (next) next(); else this.counters.inflight--;
   }
 
   assertRequestBudget(count: number): void {
@@ -26,15 +49,20 @@ export class Decisions {
   private async ask<Q extends Questions>(state: State, questions: Q): Promise<SystemOneResult<Q>> {
     this.signal.throwIfAborted();
     if (this.requests >= this.maxRequests) throw new LimitError(`Request budget exhausted (${this.maxRequests}).`);
-    this.counters.requests++;
-    // Make the transport boundary explicit: state must contain JSON values only.
+    await this.acquire();
     let response: SystemOneResult<Q>;
     try {
-      response = await this.provider.decide(JSON.parse(JSON.stringify(state)) as EntryType, questions, this.signal);
-    } catch (error) {
       this.signal.throwIfAborted();
-      throw new DecisionError(error instanceof Error ? error.message : String(error), { cause: error });
-    }
+      if (this.requests >= this.maxRequests) throw new LimitError(`Request budget exhausted (${this.maxRequests}).`);
+      this.counters.requests++;
+      // Make the transport boundary explicit: state must contain JSON values only.
+      try {
+        response = await this.provider.decide(JSON.parse(JSON.stringify(state)) as EntryType, questions, this.signal);
+      } catch (error) {
+        this.signal.throwIfAborted();
+        throw new DecisionError(error instanceof Error ? error.message : String(error), { cause: error });
+      }
+    } finally { this.release(); }
     this.signal.throwIfAborted();
     if (!response.usage || !Number.isFinite(response.usage.input_tokens) || response.usage.input_tokens < 0 ||
       !Number.isFinite(response.usage.output_tokens) || response.usage.output_tokens < 0) throw new DecisionError('Jev returned invalid usage metadata.');

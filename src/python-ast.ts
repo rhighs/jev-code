@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import type { Decisions, State } from './decisions.js';
 import type { GenerateOptions } from './generation.js';
+import { assemble, decompose, fillUnits, type Peer } from './python-units.js';
 import { gridCursor } from './grid.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
 import { buildDecisionContext, PENDING, windowSource } from './decision-context.js';
@@ -8,16 +9,16 @@ import { LimitError } from './types.js';
 import { choice } from '@typesafe-ai/sdk';
 
 export interface PythonNode { _type: string; [field: string]: unknown }
-const node = (_type: string, fields: Record<string, unknown> = {}): PythonNode => ({ _type, ...fields });
-const name = (id: string, store = false): PythonNode => node('Name', { id, ctx: node(store ? 'Store' : 'Load') });
+export const node = (_type: string, fields: Record<string, unknown> = {}): PythonNode => ({ _type, ...fields });
+export const name = (id: string, store = false): PythonNode => node('Name', { id, ctx: node(store ? 'Store' : 'Load') });
 const keywords = new Set('False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case'.split(' '));
 const builtins = ['print', 'range', 'len', 'str', 'int', 'float', 'list', 'dict', 'set', 'sum', 'min', 'max', 'abs', 'sorted', 'enumerate', 'zip', 'input', 'open'];
-interface Symbol { kind: 'builtin' | 'variable' | 'parameter' | 'function' | 'module'; arity?: number }
-interface Scope { names: Map<string, Symbol>; parent?: Scope; function: boolean; loop: boolean }
+export interface Symbol { kind: 'builtin' | 'variable' | 'parameter' | 'function' | 'module'; arity?: number }
+export interface Scope { names: Map<string, Symbol>; parent?: Scope; function: boolean; loop: boolean }
 const symbolTable = (scope: Scope): Record<string, Symbol> => ({ ...(scope.parent ? symbolTable(scope.parent) : Object.fromEntries(builtins.map(id => [id, { kind: 'builtin' }]))), ...Object.fromEntries(scope.names) });
 const visible = (scope: Scope): string[] => [...new Set([...scope.names.keys(), ...(scope.parent ? visible(scope.parent) : builtins)])];
 
-function previewTree(value: unknown, field = ''): unknown {
+export function previewTree(value: unknown, field = ''): unknown {
   if (Array.isArray(value)) return value.length ? value.map(item => previewTree(item, field)) : field === 'body' ? [node('Pass')] : [];
   if (!value || typeof value !== 'object') return value;
   const ast = value as PythonNode;
@@ -87,38 +88,53 @@ export async function validatePythonSource(source: string, signal: AbortSignal):
   await runPythonJson(source, signal, Math.max(1, Buffer.byteLength(source)), "import ast,json,sys; source=json.load(sys.stdin); compile(ast.parse(source),'<jev>','exec'); print(json.dumps(source))");
 }
 
-/** Sequential productions are dependent; independent text/tool fields remain parallel. */
-export async function generatePythonAst(decisions: Decisions, state: State, field: string, options: GenerateOptions): Promise<string> {
-  const task = state.task as { prompt?: string; updates?: string[] } | undefined;
-  const objective = [task?.prompt ?? '', ...(task?.updates ?? [])].join('\n');
-  const tree = node('Module', { body: [], type_ignores: [] });
-  let step = 0;
-  const maxDepth = 8;
+export interface Vocab { words: string[]; identifiers: string[]; strings: string[]; numbers: number[]; purposes: string[] }
+export interface Shared { field: string; options: GenerateOptions; objective: string; context: State; budget: { step: number }; vocab: Vocab; maxDepth: number }
+export interface StepInfo { slot: string; production: string; symbols: string[] }
+export interface BuilderInput { decisions: Decisions; render: () => Promise<string>; report: (preview: string, info: StepInfo) => Promise<void>; unit?: string; peers?: Peer[] }
+export interface Builder {
+  pick(slot: string, scope: Scope, criteria: Record<string, string>, depth?: number): Promise<string>;
+  terminal(slot: string, scope: Scope, values: Array<string | number>): Promise<string | number>;
+  identifier(slot: string, scope: Scope, exclude?: string[]): Promise<string>;
+  expression(target: PythonNode, scope: Scope, depth: number, slot?: string, numberConstraint?: 'positive' | 'nonzero'): Promise<void>;
+  block(body: PythonNode[], scope: Scope, depth: number, slot: string): Promise<void>;
+}
+
+export function vocabulary(objective: string): Vocab {
   const words = objective.match(/[A-Za-z_][A-Za-z_0-9]*/g) ?? [];
   const identifiers = [...new Set([...words.filter(word => /^[a-z_][a-z_0-9]*$/.test(word) && !keywords.has(word)), 'message', 'result', 'value', 'i', 'main', 'add', 'a', 'b', 'guess', 'target', 'attempts', 'randint', 'append', 'read', 'write', 'strip', 'lower'])].slice(0, 180);
   const quoted = [...objective.matchAll(/`([^`\n]+)`|"([^"\n]+)"|'([^'\n]+)'/g)].map(match => match[1] ?? match[2] ?? match[3]!);
   const literals: string[] = [...quoted];
+  const purposes: string[] = [];
   // Candidates are terminal values derived from the objective, never source templates.
-  for (let start = 0; start < words.length; start++) for (let count = 1; count <= 3 && start + count <= words.length; count++) {
+  for (let start = 0; start < words.length; start++) for (let count = 1; count <= 4 && start + count <= words.length; count++) {
     const phrase = words.slice(start, start + count).join(' ');
+    purposes.push(phrase.toLowerCase());
+    if (count > 3) continue;
     const capital = phrase[0]!.toUpperCase() + phrase.slice(1);
     literals.push(phrase, capital, capital + '!');
     if (count > 1) literals.push(words[start]![0]!.toUpperCase() + words[start]!.slice(1) + ', ' + words.slice(start + 1, start + count).join(' ') + '!');
   }
   const strings = [...new Set(literals)].slice(0, 220);
   const numbers = [...new Set([0, 1, 2, 5, 10, ...((objective.match(/-?\d+(?:\.\d+)?/g) ?? []).map(Number))])].filter(Number.isFinite).slice(0, 200);
-  const context = compactContext(state);
+  return { words, identifiers, strings, numbers, purposes: [...new Set(purposes)].slice(0, 160) };
+}
+
+export function createBuilder(shared: Shared, input: BuilderInput): Builder {
+  const { decisions, render, report, unit, peers } = input;
+  const { field, options, objective, context, budget, vocab, maxDepth } = shared;
+  const { words, identifiers, strings, numbers } = vocab;
 
   async function pick(slot: string, scope: Scope, criteria: Record<string, string>, depth = 0): Promise<string> {
     decisions.signal.throwIfAborted();
-    if (++step > options.maxSteps) throw new LimitError(`Python AST production budget exhausted (${options.maxSteps}).`);
+    if (++budget.step > options.maxSteps) throw new LimitError(`Python AST production budget exhausted (${options.maxSteps}).`);
     const keys = Object.keys(criteria);
     if (!keys.length) throw new Error(`No valid Python AST production for ${slot}.`);
-    const preview = await unparsePython(previewTree(tree) as PythonNode, decisions.signal, options.maxBytes);
+    const preview = await render();
     const instruction = `Choose the next valid Python AST production for ${slot}. The rendered source marks the slot being filled with ${PENDING}. Satisfy the objective with the smallest sufficient program. Complete the current slot only; do not add unrequested behavior.`;
-    const core = { field, phase: 'ast', slot, symbols: visible(scope), symbolTable: symbolTable(scope),
-      constraints: { depth, maxDepth, inFunction: scope.function, inLoop: scope.loop, remainingSteps: options.maxSteps - step } };
-    const assemble = (values: Record<string, unknown>): State => ({
+    const core = { field, phase: 'ast', slot, ...(unit === undefined ? {} : { unit }), ...(peers === undefined || !peers.length ? {} : { peers: peers.map(peer => ({ ...peer })) }), symbols: visible(scope), symbolTable: symbolTable(scope),
+      constraints: { depth, maxDepth, inFunction: scope.function, inLoop: scope.loop, remainingSteps: options.maxSteps - budget.step } };
+    const assembleState = (values: Record<string, unknown>): State => ({
       task: values.task, ...(values.recent === undefined ? {} : { recent: values.recent }), ...(values.plan === undefined ? {} : { plan: values.plan }),
       generation: { ...core, partialSource: values.source, ...(values.trimmed === undefined ? {} : { trimmed: values.trimmed }) },
     });
@@ -128,12 +144,10 @@ export async function generatePythonAst(decisions: Decisions, state: State, fiel
       { key: 'source', value: preview, shrink: windowSource },
       { key: 'recent', value: context.recent ?? [] },
       ...(typeof context.plan === 'string' && context.plan ? [{ key: 'plan', value: context.plan }] : []),
-    ], parts => Buffer.byteLength(JSON.stringify({ state: assemble(parts), questions: { selection: choice(instruction, criteria) } })), MAX_GRID_REQUEST_BYTES);
-    const input = assemble(trimmed.length ? { ...values, trimmed } : values);
-    const selected = keys.length === 1 ? keys[0]! : await decisions.choose(input, instruction, criteria);
-    await options.onText?.(field, preview, false, { replace: preview }, {
-      decoder: 'ast', step, cursor: gridCursor(preview), bytes: Buffer.byteLength(preview), ast: { slot, production: selected, symbols: visible(scope) },
-    });
+    ], parts => Buffer.byteLength(JSON.stringify({ state: assembleState(parts), questions: { selection: choice(instruction, criteria) } })), MAX_GRID_REQUEST_BYTES);
+    const state = assembleState(trimmed.length ? { ...values, trimmed } : values);
+    const selected = keys.length === 1 ? keys[0]! : await decisions.choose(state, instruction, criteria);
+    await report(preview, { slot, production: selected, symbols: visible(scope) });
     return selected;
   }
 
@@ -143,7 +157,7 @@ export async function generatePythonAst(decisions: Decisions, state: State, fiel
     const selected = await pick(slot, scope, criteria);
     if (selected !== 'custom') return values[Number(selected.slice(6))]!;
     const numeric = slot === 'number';
-    const identifierSlot = slot !== 'string' && !numeric;
+    const identifierSlot = slot !== 'string' && !slot.endsWith('_purpose') && !numeric;
     const pieces = numeric ? '0123456789.-'.split('') : [...new Set([...words, ...identifiers, ...'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'.split(''), ...(identifierSlot ? [] : [' ', ', ', ': ', '!', '?', '.', '\n'])])].slice(0, 240);
     let result = '';
     for (let count = 0; count < 64; count++) {
@@ -257,7 +271,7 @@ export async function generatePythonAst(decisions: Decisions, state: State, fiel
       } else if (production === 'function') {
         const id = await identifier('function_name', scope);
         const parameters: PythonNode[] = [], nestedBody: PythonNode[] = [];
-        Object.assign(statement, node('FunctionDef', { name: id, args: node('arguments', { posonlyargs: [], args: parameters, vararg: null, kwonlyargs: [], kw_defaults: [], kwarg: null, defaults: [] }), body: nestedBody, decorator_list: [], returns: null, type_comment: null, type_params: [] }));
+        Object.assign(statement, functionDef(id, parameters, nestedBody));
         scope.names.set(id, { kind: 'function' });
         const child: Scope = { names: new Map(), parent: scope, function: true, loop: false };
         const count = Number(await pick('parameter_count', scope, { '0': 'No parameters.', '1': 'One parameter.', '2': 'Two parameters.', '3': 'Three parameters.' }));
@@ -281,8 +295,38 @@ export async function generatePythonAst(decisions: Decisions, state: State, fiel
       }
     }
   }
-  await block(tree.body as PythonNode[], { names: new Map(), function: false, loop: false }, 0, 'module_body');
+  return { pick, terminal, identifier, expression, block };
+}
+
+export const functionDef = (id: string, parameters: PythonNode[], body: PythonNode[]): PythonNode =>
+  node('FunctionDef', { name: id, args: node('arguments', { posonlyargs: [], args: parameters, vararg: null, kwonlyargs: [], kw_defaults: [], kwarg: null, defaults: [] }), body, decorator_list: [], returns: null, type_comment: null, type_params: [] });
+
+/** Decomposition first, then unit bodies concurrently, then the main block; zero units is the plain single-scope path. */
+export async function generatePythonAst(decisions: Decisions, state: State, field: string, options: GenerateOptions): Promise<string> {
+  const task = state.task as { prompt?: string; updates?: string[] } | undefined;
+  const objective = [task?.prompt ?? '', ...(task?.updates ?? [])].join('\n');
+  const shared: Shared = { field, options, objective, context: compactContext(state), budget: { step: 0 }, vocab: vocabulary(objective), maxDepth: 8 };
+  const tree = node('Module', { body: [], type_ignores: [] });
+  const previewOf = (root: PythonNode): Promise<string> => unparsePython(previewTree(root) as PythonNode, decisions.signal, options.maxBytes);
+  const emit = async (preview: string, info: StepInfo, unit?: string): Promise<void> => options.onText?.(field, preview, false, { replace: preview }, {
+    decoder: 'ast', step: shared.budget.step, cursor: gridCursor(preview), bytes: Buffer.byteLength(preview), ast: { ...info, ...(unit === undefined ? {} : { unit }) },
+  });
+  const rootScope: Scope = { names: new Map(), function: false, loop: false };
+  const peers: Peer[] = [];
+  const root = createBuilder(shared, { decisions, peers, render: () => previewOf(tree), report: (preview, info) => emit(preview, info) });
+  const units = await decompose(root, rootScope, shared.vocab, peers);
+  if (units.length) {
+    for (const unit of units) rootScope.names.set(unit.name, { kind: 'function', arity: unit.arity });
+    (tree.body as PythonNode[]).push(...units.map(unit => unit.def));
+    const assembled = (): Promise<string> => previewOf(node('Module', { body: [...(tree.body as PythonNode[]), node('Hole')], type_ignores: [] }));
+    await fillUnits(units, decisions, (unit, fork) => createBuilder(shared, {
+      decisions: fork, unit: unit.name, peers, render: () => previewOf(node('Module', { body: [unit.def], type_ignores: [] })),
+      report: async (_preview, info) => emit(await assembled(), info, unit.name),
+    }), rootScope);
+  }
+  await root.block(tree.body as PythonNode[], rootScope, 0, 'module_body');
+  if (units.length) assemble(tree, units);
   const source = await unparsePython(tree, decisions.signal, options.maxBytes);
-  await options.onText?.(field, source, true, { replace: source }, { decoder: 'ast', step, cursor: gridCursor(source), bytes: Buffer.byteLength(source) });
+  await options.onText?.(field, source, true, { replace: source }, { decoder: 'ast', step: shared.budget.step, cursor: gridCursor(source), bytes: Buffer.byteLength(source) });
   return source;
 }

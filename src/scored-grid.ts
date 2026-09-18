@@ -23,9 +23,9 @@ export function compactContext(state: State): State {
 
 export async function generateScoredGrid(decisions: Decisions, state: State, field: string, description: string,
   options: GenerateOptions, syntaxFeedback: SyntaxChecker): Promise<string> {
-  const batchSize = options.gridBatchSize ?? 8, concurrency = options.gridConcurrency ?? 4;
+  const batchSize = options.gridBatchSize ?? 8, concurrency = options.concurrency ?? 4;
   if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 128) throw new Error('gridBatchSize must be 1–128.');
-  if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 16) throw new Error('gridConcurrency must be 1–16.');
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 16) throw new Error('concurrency must be 1–16.');
   const maxCells = Math.min(options.maxSteps, options.maxBytes + 1, MAX_CELLS);
   const alphabet = characterAlphabet([JSON.stringify(state), ...options.fragments]);
   const values = new Map(alphabet.map(symbol => [symbol.key, symbol.value]));
