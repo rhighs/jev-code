@@ -226,3 +226,10 @@ test('explicitly requested empty and negative ranges retain their literal bounds
     assert.equal(source, `for i in range(${bound}):\n    pass\n`);
   }
 });
+
+test('an else branch renders its pending slot as a statement so the preview never rejects the tree', async () => {
+  const provider = new AstProvider(['0', 'if', 'boolean', 'true', 'pass', 'finish', 'yes', 'pass', 'finish', 'finish']);
+  assert.equal(await generatePythonAst(decisions(provider), state, 'content', options), 'if True:\n    pass\nelse:\n    pass\n');
+  const elseBody = provider.states.find(s => s.generation.slot === 'else_body');
+  assert.match(elseBody?.generation.partialSource ?? '', /else:\n\s+__jev_pending__/);
+});

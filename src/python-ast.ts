@@ -25,11 +25,13 @@ export interface Scope { names: Map<string, Symbol>; parent?: Scope; function: b
 const symbolTable = (scope: Scope): Record<string, Symbol> => ({ ...(scope.parent ? symbolTable(scope.parent) : Object.fromEntries(builtins.map(id => [id, { kind: 'builtin' }]))), ...Object.fromEntries(scope.names) });
 const visible = (scope: Scope): string[] => [...new Set([...scope.names.keys(), ...(scope.parent ? visible(scope.parent) : builtins)])];
 
+const statementLists = new Set(['body', 'orelse', 'finalbody']);
+
 export function previewTree(value: unknown, field = ''): unknown {
   if (Array.isArray(value)) return value.length ? value.map(item => previewTree(item, field)) : field === 'body' ? [node('Pass')] : [];
   if (!value || typeof value !== 'object') return value;
   const ast = value as PythonNode;
-  if (ast._type === 'Hole') return field === 'body' ? node('Expr', { value: name(PENDING) }) : name(PENDING);
+  if (ast._type === 'Hole') return statementLists.has(field) ? node('Expr', { value: name(PENDING) }) : name(PENDING);
   return Object.fromEntries(Object.entries(ast).map(([key, child]) => [key, ast._type === 'Module' && key === 'body' && Array.isArray(child) && !child.length ? [] : previewTree(child, key)]));
 }
 
