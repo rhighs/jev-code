@@ -14,6 +14,8 @@ import { formatDuration } from './timing.js';
 import { AstRegistry, loadInstalledAsts, loadAstModule, installAstModule, removeAstAdapter } from './ast-adapters.js';
 import { compareRecords, formatComparison, runEval, type EvalRecord } from './eval.js';
 import { runDecide } from './decide.js';
+import { NO_KEY, configPath, promptSecret, readConfig, resolveApiKey, writeConfig } from './config.js';
+import { MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
 import { checkSchema, findJournal, readJournal, replayPlain } from './replay.js';
 import type { HarnessOptions } from './harness.js';
 import type { Tool } from './types.js';
@@ -50,6 +52,8 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
   decide --spec <file.json>   Run [{ question, choices } | { true, threshold? } | { score }] over stdin; one JSON line each
     --lines                   With --true or --score: one request per stdin line, ranked best first
     --json                    Print each decide answer as a decision event; failures exit 125
+  login                   Enter your typesafe.ai API key and save it under ~/.config/jev-code
+  logout                  Forget the saved API key
   replay <run-id>         Render a saved .jev/runs or .jev/eval journal through the transcript
     --speed <x>               Pace events at x times real time (default: instant; gaps capped at 2 s)
     --plain                   Print cards as text instead of the Ink view
@@ -59,7 +63,7 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
   --demo                  Offline scripted demo with real file and Bash tools
   --help                  Show help
 
-Set TYPESAFE_API_KEY for live Jev runs. Ctrl-C cancels the current run.
+The first run asks for your API key; TYPESAFE_API_KEY in the environment overrides the saved one. Ctrl-C cancels the current run.
 Direct file tools stay in the workspace unless --allow-outside is set.
 Bash is an ordinary host shell, with the workspace as its initial directory.
 `;
@@ -97,13 +101,51 @@ async function replay(args: string[]): Promise<void> {
   if (controller.signal.aborted) process.exitCode = 130;
 }
 
+const ignoreEpipe = (stream: NodeJS.WriteStream): void => { stream.on('error', (err: NodeJS.ErrnoException) => { if (err.code !== 'EPIPE') throw err; }); };
+
+async function readStdin(limit: number): Promise<string> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of process.stdin) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    chunks.push(buf);
+    total += buf.length;
+    if (total >= limit) { process.stdin.destroy(); break; }
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+const KEY_PROMPT = 'Paste your typesafe.ai API key (saved to ~/.config/jev-code/config.json): ';
+
+async function ensureApiKey(interactive: boolean): Promise<void> {
+  const key = await resolveApiKey(interactive ? () => promptSecret(KEY_PROMPT) : async () => undefined);
+  if (!key) throw new Error(NO_KEY);
+  process.env.TYPESAFE_API_KEY = key;
+}
+
+async function login(): Promise<void> {
+  const key = await promptSecret(KEY_PROMPT);
+  if (!key) throw new Error('login needs a terminal and a non-empty key.');
+  process.stdout.write(`Saved API key to ${await writeConfig({ ...await readConfig(), apiKey: key })}\n`);
+}
+
+async function logout(): Promise<void> {
+  const { apiKey: _apiKey, ...rest } = await readConfig();
+  await writeConfig(rest);
+  process.stdout.write(`Removed the API key from ${configPath()}\n`);
+}
+
 async function main(): Promise<void> {
+  ignoreEpipe(process.stdout);
+  ignoreEpipe(process.stderr);
   try { loadEnvFile(); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  if (process.argv[2] === 'login') return login();
+  if (process.argv[2] === 'logout') return logout();
   if (process.argv[2] === 'decide') {
-    if (!process.env.TYPESAFE_API_KEY) { process.stderr.write('decide: TYPESAFE_API_KEY is required.\n'); process.exitCode = 125; return; }
-    let input = '';
-    for await (const chunk of process.stdin) input += String(chunk);
+    try { await ensureApiKey(false); }
+    catch (error) { process.stderr.write(`decide: ${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 125; return; }
+    const input = await readStdin(MAX_GRID_REQUEST_BYTES * 4);
     const res = await runDecide(process.argv.slice(3), input, new JevProvider());
     process.stdout.write(res.stdout);
     process.stderr.write(res.stderr);
@@ -140,7 +182,7 @@ async function main(): Promise<void> {
   if (positionals[0] === 'eval') {
     const [, only, ...extra] = positionals;
     if (extra.length) throw new Error('Use eval [task] or eval compare <a.json> <b.json>.');
-    if (!process.env.TYPESAFE_API_KEY) throw new Error('eval needs TYPESAFE_API_KEY for live Jev runs.');
+    await ensureApiKey(false);
     process.stderr.write('eval runs unattended: agent Bash executes on this host without confirmation.\n');
     const width = values['search-width'];
     if (width !== undefined && !/^[1-8]$/.test(width)) throw new Error('--search-width must be 1–8.');
@@ -179,6 +221,7 @@ async function main(): Promise<void> {
     if (!Number.isSafeInteger(value) || value < 1 || value > 2_147_483_647) throw new Error(`--${name} must be a positive integer <= 2147483647.`);
     return value;
   };
+  await ensureApiKey(tty);
   const provider = new JevProvider();
   const harnessOptions: Omit<HarnessOptions, 'onEvent' | 'authorize'> = {
     workspace, provider, tools: [...builtInTools(), ...extraTools],

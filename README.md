@@ -12,9 +12,10 @@ export PATH="$HOME/.local/bin:$PATH"
 An interactive coding CLI powered by [Jev](https://typesafe.ai). Watch source take shape, run tools, send updates, and see elapsed time after every turn.
 
 ```bash
-export TYPESAFE_API_KEY="your-typesafe-key"
 jev-code
 ```
+
+The first run asks for your typesafe.ai API key and keeps it in `~/.config/jev-code/config.json`; `jev-code login` and `jev-code logout` manage it later, and `TYPESAFE_API_KEY` in the environment still wins when set.
 
 | Language | Support |
 | --- | --- |
