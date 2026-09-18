@@ -175,35 +175,32 @@ The journal's `start` event carries `schema: 1`. A journal from a newer schema i
 
 ## Install AST adapters
 
-Python is built in. An optional TypeScript starter grammar is included and uses the actual TypeScript compiler factory and printer. It supports const declarations, console.log, constants, references to defined variables, and arithmetic; it is not the full TypeScript grammar.
+Python, JavaScript, TypeScript, C, Rust, Go, Lua and Ruby are built in; `jev-code ast list` shows them. Python has its own builder (`src/python-ast.ts`). The other seven share one generator (`src/lang/core.ts`): a small intermediate representation of statements and expressions is built production by production with the same decision context and pending-slot preview as Python, and a dialect (`src/lang/<language>.ts`) supplies the keyword set, builtins with arities and return types, a feature set (functions, while, counted range, foreach, lists, index, string comparison, string join), a renderer, and a validator that runs the real toolchain. Typed dialects (TypeScript annotations, C, Rust, Go) only build expressions whose type the core can infer, so declarations and parameters carry types; the core also closes every typed function with a default return when a path falls through, keeps functions at the top level, hides main-local variables from function bodies, refuses self-assignment and assignment to loop variables, and never divides by a zero literal, because gcc, rustc and go vet reject each of those.
 
-After the curl installation, enable it in any workspace with:
+`test/lang-fuzz.test.ts` drives each dialect with random valid productions and compiles every rendered program with its toolchain; `JEV_FUZZ_ROUNDS` sets the count. Validators are `gcc -fsyntax-only` (or `clang`), `rustc --emit=metadata`, `go vet` in a temporary module, `luac -p`, `ruby -c`, and the TypeScript compiler for JavaScript and TypeScript. A missing validator fails the write with a message that names the tool.
 
-```bash
-jev-code ast install builtin:typescript
-jev-code ast list
-```
+To add a language, write a dialect and export `adapterFor(dialect)` from a module; see `examples/dialect-ast.mjs` for a Racket dialect in forty lines. `builtin:<id>` remains accepted by `ast install` for the bundled ids and is a no-op.
 
 To install an adapter module from a source checkout:
 
 ```bash
 npm run build
-npm run dev -- ast install ./examples/typescript-ast.mjs
+npm run dev -- ast install ./examples/dialect-ast.mjs
 npm run dev -- ast list
 npm run dev
 # Later, remove it:
-npm run dev -- ast remove typescript
+npm run dev -- ast remove racket
 ```
 
 Installation records adapter modules in `<workspace>/.jev/asts.json`; subsequent CLI sessions load them automatically. Use `--workspace /path/to/project` for another workspace. Local module paths resolve against that workspace and are stored as absolute paths. To load an adapter for one session without installation:
 
 ```bash
-npm run dev -- --asts ./examples/typescript-ast.mjs
+npm run dev -- --asts ./examples/dialect-ast.mjs
 ```
 
 Packages work too: install an adapter package into your workspace using npm, then run `npm run dev -- ast install <package-name>` from this harness with the target `--workspace`. The package must provide a Node-resolvable ESM module exporting an `astAdapters` array. A parser package alone is not a Jev generator: an adapter must implement the production loop, AST rendering, and source validation. Adapter modules execute as trusted host code, like tool modules.
 
-An adapter implements the exported `AstAdapter` interface: `id`, `extensions`, `languages`, `generate(decisions, state, field, options)`, and mandatory `validate(source, signal)`. Generation uses the shared Jev request budget and abort signal. The host checks byte limits and validates returned source before marking generation complete or executing a file tool. Registered language/file extensions choose their AST adapter automatically, and adapter errors terminate that draft without reverting to the grid. Duplicate ids, languages, or extensions are rejected. Library hosts can pass `astAdapters` in `HarnessOptions` or call `harness.registerAst(adapter)` between runs. See [the TypeScript adapter](../src/typescript-ast.ts) for a working implementation.
+An adapter implements the exported `AstAdapter` interface: `id`, `extensions`, `languages`, `generate(decisions, state, field, options)`, and mandatory `validate(source, signal)`. Generation uses the shared Jev request budget and abort signal. The host checks byte limits and validates returned source before marking generation complete or executing a file tool. Registered language/file extensions choose their AST adapter automatically, and adapter errors terminate that draft without reverting to the grid. Duplicate ids, languages, or extensions are rejected. Library hosts can pass `astAdapters` in `HarnessOptions` or call `harness.registerAst(adapter)` between runs. See [the JavaScript dialect](../src/lang/javascript.ts) and [the shared core](../src/lang/core.ts) for the bundled implementation.
 
 ## Extend
 

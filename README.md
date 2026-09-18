@@ -79,7 +79,7 @@ jev-code
 | `jev-code replay <run-id>` | Render a saved journal through the same transcript. |
 | `jev-code login` | Enter the API key and save it. |
 | `jev-code logout` | Remove the saved API key. |
-| `jev-code ast install <module>` | Install an AST adapter from a local path, an npm package, or a `builtin:` id. |
+| `jev-code ast install <module>` | Install an AST adapter module from a local path or an npm package. |
 | `jev-code ast list` | List the installed AST adapters. |
 | `jev-code ast remove <id>` | Remove an installed AST adapter. |
 | `jev-code --demo` | Run an offline scripted session. No API key is used. |
@@ -106,12 +106,22 @@ Session commands, typed at the prompt:
 
 ## LANGUAGES
 
-| Language | Support |
-| --- | --- |
-| Python | Built-in AST generation. Needs Python 3.9 or newer. |
-| Bash | Built-in command ASTs: arguments, pipes, redirects, conditions, sequences. |
-| TypeScript | `jev-code ast install builtin:typescript`. Starter grammar. |
-| Other | Install an AST adapter. Files without an adapter use bounded text choices. |
+Every language below is built in. jev-code selects the grammar from the file extension, or from the language named in the task.
+
+| Language | Extensions | Grammar | Validator |
+| --- | --- | --- | --- |
+| Python | `.py` | Full builder: functions, loops, conditions, calls, lists, imports, helper units in parallel, multi-file packages. | `python3` compile |
+| Bash | commands | Program, arguments, pipes, redirects, `&&`, `\|\|`, `;`. | `bash -n` |
+| JavaScript | `.js` `.mjs` `.cjs` `.jsx` | Shared imperative core: variables, functions, if/else, while, counted and foreach loops, lists, index, arithmetic, comparison, string join. | TypeScript compiler |
+| TypeScript | `.ts` `.tsx` `.mts` `.cts` | Same core, typed declarations. | TypeScript compiler |
+| C | `.c` | Same core, typed. `long`, `const char *`, `bool`; functions before `main`. | `gcc -fsyntax-only` or `clang` |
+| Rust | `.rs` | Same core, typed. `i64`, `&str`, `bool`; `let mut`. | `rustc --emit=metadata` |
+| Go | `.go` | Same core, typed. `int`, `string`, `bool`; `_ = x` after each declaration. | `go vet` |
+| Lua | `.lua` | Same core. 1-based index, `goto continue`. | `luac -p` |
+| Ruby | `.rb` | Same core. `puts`, `each`, `next`. | `ruby -c` |
+| Other | any | Install an adapter module. Files without an adapter use bounded text choices. | adapter |
+
+A validator must be on `PATH` before Jev writes a file in that language. A missing validator stops the write with a message that names the tool. Each rendered program of the shared core is checked by its real toolchain: a fuzz suite in `test/lang-fuzz.test.ts` drives every dialect with random productions and compiles the result.
 
 ## DECIDE
 

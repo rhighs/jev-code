@@ -40,9 +40,13 @@ export async function generateBashAst(decisions: Decisions, state: State, field:
     ...recent.flatMap(record => typeof record.args?.path === 'string' ? [record.args.path] : []), ...(inventory?.files ?? []).slice(0, 100)])];
   const exact = [...objective.matchAll(/`([^`\n]+)`/g)].map(match => match[1]!).filter(source => !files.includes(source));
   const plans: BashAst[] = exact.map(source => ({ type: 'literal', source }));
+  const cmd = (program: string, ...args: string[]): BashAst => ({ type: 'command', program, args, redirects: [] });
   for (const file of files) {
+    const base = file.replace(/^.*\//, '').replace(/\.[^.]+$/, '');
     const program = file.endsWith('.py') ? 'python3' : /\.[cm]?js$/.test(file) ? 'node' : file.endsWith('.ts') ? 'node' : file.endsWith('.sh') ? 'bash' : file.endsWith('.rb') ? 'ruby' : file.endsWith('.lua') ? 'lua' : file.endsWith('.go') ? 'go' : undefined;
-    if (program) plans.push({ type: 'command', program, args: file.endsWith('.ts') ? ['--experimental-strip-types', file] : file.endsWith('.go') ? ['run', file] : [file], redirects: [] });
+    if (program) plans.push(cmd(program, ...(file.endsWith('.ts') ? ['--experimental-strip-types', file] : file.endsWith('.go') ? ['run', file] : [file])));
+    if (file.endsWith('.c')) plans.push({ type: 'binary', operator: '&&', left: cmd('gcc', '-o', base, file), right: cmd(`./${base}`) });
+    if (file.endsWith('.rs')) plans.push({ type: 'binary', operator: '&&', left: cmd('rustc', '-o', base, file), right: cmd(`./${base}`) });
   }
   let step = 0;
   let tree: BashAst | undefined;
