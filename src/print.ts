@@ -1,8 +1,9 @@
 import { createInterface } from 'node:readline/promises';
 import { Harness, type HarnessOptions } from './harness.js';
 import { renderItem, renderStep, renderSummary } from './render-plain.js';
-import { terminalColor } from './terminal-style.js';
-import { initialState, reduce, type TranscriptState } from './transcript.js';
+import { displayText, terminalColor } from './terminal-style.js';
+import { autoApproved } from './tools.js';
+import { initialState, reduce, type ToolItem } from './transcript.js';
 import type { HarnessEvent, RunResult, ToolRecord } from './types.js';
 
 type Out = NodeJS.WritableStream & { isTTY?: boolean };
@@ -13,29 +14,36 @@ export interface Printer {
   permission: (tool: string, args: ToolRecord['args']) => void;
   resolve: (tool: string, allowed: boolean) => void;
   summary: () => string[];
-  state: () => TranscriptState;
 }
 
-/** Cards land on stderr as they complete; with a json stream every event goes there instead and nothing is rendered. */
+const withoutBody = (item: ToolItem): ToolItem => { const { body: _body, ...rest } = item; return rest; };
+
 export function createPrinter(stderr: Out, json?: Out): Printer {
   const opts = { color: terminalColor(Boolean(stderr.isTTY)) };
-  let state = initialState(), printed = 0;
+  let state = initialState(), printed = 0, partial = '', streamed = false;
   const write = (lines: string[]): void => { if (lines.length) stderr.write(lines.join('\n') + '\n'); };
+  const stream = (text: string): void => {
+    const parts = (partial + text).split('\n');
+    partial = parts.pop() ?? '';
+    if (parts.length) { streamed = true; write(parts.map(line => `  │ ${displayText(line)}`)); }
+  };
   return {
     onEvent: event => {
       if (json) { json.write(JSON.stringify(event) + '\n'); return; }
       state = reduce(state, event);
       if (event.type === 'text' && event.data.ast && state.live) write([renderStep(state.live, event.data.decoder === 'search')]);
-      for (const item of state.items.slice(printed)) if (item.kind !== 'summary') write(renderItem(item, opts));
+      if (event.type === 'tool_output') stream(event.data.text);
+      if (event.type === 'tool_end') { if (partial) stream('\n'); }
+      for (const item of state.items.slice(printed)) if (item.kind !== 'summary') write(renderItem(streamed && item.kind === 'tool' ? withoutBody(item) : item, opts));
+      if (event.type === 'tool_end') streamed = false;
       printed = state.items.length;
     },
     permission: (tool, args) => {
       state = reduce(state, { type: 'permission', data: { tool, args } });
-      if (state.live) write(renderItem(state.live.card, opts));
+      if (!json && state.live) write(renderItem(state.live.card, opts));
     },
     resolve: (tool, allowed) => { state = reduce(state, { type: 'permission_result', data: { tool, allowed } }); },
     summary: () => { const item = state.items.at(-1); return item?.kind === 'summary' ? renderSummary(item) : []; },
-    state: () => state,
   };
 }
 
@@ -54,7 +62,7 @@ export async function printRun(opts: PrintOptions): Promise<RunResult> {
   if (opts.onInterrupt) readline?.on('SIGINT', opts.onInterrupt);
   const harness = new Harness({ ...opts.harness, onEvent: printer.onEvent,
     authorize: async (tool, args, signal) => {
-      if (opts.yes || (tool.effect !== 'shell' && !(opts.confirmWrites && tool.effect === 'write'))) return true;
+      if (opts.yes || autoApproved(tool, opts.confirmWrites)) return true;
       printer.permission(tool.name, args);
       const allowed = readline ? /^y(?:es)?$/i.test((await readline.question('Execute? [y/N] ', { signal })).trim()) : false;
       if (!readline) opts.stderr.write(`Tool ${tool.name} needs confirmation; run with --yes for unattended execution.\n`);

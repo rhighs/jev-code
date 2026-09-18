@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import { Decisions } from '../src/decisions.js';
-import { DecisionError, type DecisionProvider } from '../src/types.js';
+import { DecisionError, type DecisionEventData, type DecisionProvider } from '../src/types.js';
 
 const levels = ['bad', 'partial', 'noisy', 'good'];
 const provider = (answer: unknown): DecisionProvider => ({ decide: async <Q extends Questions>(_state: EntryType, questions: Q) =>
@@ -32,4 +32,22 @@ test('a request queued behind the in-flight cap rejects when the shared signal a
   ctrl.abort(new Error('stop'));
   await assert.rejects(first, /stop/);
   await assert.rejects(second, /stop/);
+});
+
+test('choose, probability and score all attach the generation identity and the winner options', async () => {
+  const seen: DecisionEventData[] = [];
+  const state = { generation: { field: 'content', phase: 'ast', slot: 'module_body', unit: 'greet', candidate: 1 } };
+  const d = (answer: unknown) => new Decisions(provider(answer), 10, new AbortController().signal).observe(async data => { seen.push(data); });
+  await d({ type: 'choice', choice: 'a', confidence: 0.9, probabilities: { a: 0.9, b: 0.1 } }).choose(state, 'pick', { a: 'A', b: 'B' });
+  await d({ type: 'noul', noul: 0.7, confidence: 0.7 }).probability(state, 'true?');
+  await d({ type: 'score', score: 2, confidence: 0.8, legend: {}, probabilities: { '0': 0, '1': 0, '2': 1, '3': 0 } }).score(state, 'rate', levels);
+  for (const data of seen) {
+    assert.equal(data.field, 'content');
+    assert.equal(data.slot, 'module_body');
+    assert.equal(data.unit, 'greet');
+    assert.equal(data.candidate, 1);
+  }
+  assert.deepEqual(seen[0]!.options, [{ label: 'a', probability: 0.9 }, { label: 'b', probability: 0.1 }]);
+  assert.equal(seen[1]!.probability, 0.7);
+  assert.deepEqual(seen[2]!.options, [{ label: 'noisy', probability: 1 }, { label: 'bad', probability: 0 }, { label: 'partial', probability: 0 }, { label: 'good', probability: 0 }]);
 });

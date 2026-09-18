@@ -217,7 +217,6 @@ test('text events update the live path, source, and slot, and tool_end clears th
   assert.equal(state.live?.card.status, 'generating');
   assert.equal(state.live?.path, 'app.py');
   assert.equal(state.live?.source, source);
-  assert.equal(state.live?.decoder, 'ast');
   assert.equal(state.live?.slot, 'body');
   const done = run([ev('tool_start', { tool: 'write_file', args: { path: 'app.py', content: 'def main():\n    pass\n' } }),
     ev('tool_end', record('write_file', { path: 'app.py', content: 'def main():\n    pass\n' }, true, 'Wrote 22 bytes to app.py.'))], state);
@@ -235,4 +234,40 @@ test('input events become update rows and host commands become run cards', () =>
   assert.equal(card.host, true);
   assert.equal(card.status, 'done');
   assert.deepEqual(card.body, { kind: 'output', lines: ['a', 'b'], remaining: 0 });
+});
+
+test('a root-level step after a unit clears the stale unit and candidate, so pairing and labels stay right', () => {
+  const state = run([start(), ev('turn', { files: 0, plan: '' }), ev('action', { tool: 'write_file' }),
+    text('content', 'def area():\n    __jev_pending__\n', { slot: 'function_body', production: 'return', unit: 'area', candidate: 1 }),
+    text('content', 'def area():\n    return 1\n__jev_pending__\n', { slot: 'module_body', production: 'Expr' }),
+    ev('decision', { model: 'm', choice: 'Expr', confidence: 0.9, field: 'content', slot: 'module_body', options: [{ label: 'Expr', probability: 0.9 }, { label: 'Assign', probability: 0.1 }] }),
+  ]);
+  assert.equal(state.live?.unit, undefined);
+  assert.equal(state.live?.candidate, undefined);
+  assert.equal(state.live?.decision?.choice, 'Expr');
+  assert.deepEqual(state.live?.decision?.options.length, 2);
+});
+
+test('grid changes fold into the live source with unknown cells marked, and the strip shows the round progress', () => {
+  const grid = (round: number, completed: number, cells: Array<{ index: number; value: string }>): HarnessEvent =>
+    ev('text', { field: 'content', bytes: 0, done: false, decoder: 'grid', step: round, cursor: { row: 0, column: 0, offset: 0 },
+      change: { grid: { rows: 2, columns: 3, round, completed, total: 6, cells: cells.map(c => ({ ...c, row: Math.floor(c.index / 3), column: c.index % 3, score: 1, probabilities: {} })) } } });
+  const state = run([start(), ev('turn', { files: 0, plan: '' }), ev('action', { tool: 'write_file' }), grid(1, 2, [{ index: 0, value: 'x' }, { index: 4, value: '=' }]), grid(1, 3, [{ index: 1, value: ' ' }])]);
+  assert.equal(state.live?.source, 'x ·\n·=·');
+  assert.equal(decisionStrip(state), 'grid · round 1 · 3/6 cells · 0 req');
+  const next = run([grid(2, 1, [{ index: 5, value: '1' }])], state);
+  assert.equal(next.live?.source, '···\n··1');
+});
+
+test('unknown event types leave the state untouched', () => {
+  const state = run([start()]);
+  assert.deepEqual(run([{ ...ev('turn', { files: 0, plan: '' }), type: 'future' } as unknown as HarnessEvent], state).items, state.items);
+});
+
+test('a pending multi-file write shows no count, and an awaiting multi-line bash lists every command line', () => {
+  const state = run([start(), ev('turn', { files: 0, plan: '' }), ev('action', { tool: 'write_files' })]);
+  assert.equal(state.live?.card.target, '');
+  const awaiting = run([start(), ev('turn', { files: 0, plan: '' }), ev('action', { tool: 'bash' }), { type: 'permission', data: { tool: 'bash', args: { command: 'echo one\necho two\necho three' } } }]);
+  assert.equal(awaiting.live?.card.target, 'echo one …');
+  assert.deepEqual(awaiting.live?.card.body, { kind: 'output', lines: ['echo one', 'echo two', 'echo three'], remaining: 0 });
 });

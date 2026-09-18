@@ -16,12 +16,12 @@ export type Body =
   | { kind: 'paths'; paths: string[]; remaining: number };
 
 export interface ToolItem {
-  kind: 'tool'; turn: number; status: ToolStatus; tool: string; target: string; args: ToolRecord['args'];
+  kind: 'tool'; turn: number; status: ToolStatus; tool: string; target: string;
   body?: Body; startedMs: number; durationMs?: number; requests: number; exitCode?: number; host?: true;
 }
 export interface Decision {
   turn: number; choice: string; confidence?: number; options: DecisionOption[]; lowConfidence: boolean;
-  field?: string; phase?: string; slot?: string; unit?: string; candidate?: number;
+  field?: string; slot?: string; unit?: string; candidate?: number;
 }
 export type Item =
   | { kind: 'prompt'; text: string }
@@ -32,8 +32,8 @@ export type Item =
   | (RunSummary & { kind: 'summary'; runId: string; turns: number; requests: number; limits?: { turns: number; requests: number }; usage: { inputTokens: number; outputTokens: number }; durationMs: number });
 
 export interface Live {
-  card: ToolItem; path?: string; field?: string; source?: string; decoder?: string; slot?: string; production?: string; unit?: string; candidate?: number;
-  decision?: Decision; latest: Record<string, Decision>; output: string; search?: string;
+  card: ToolItem; path?: string; field?: string; source?: string; slot?: string; production?: string; unit?: string; candidate?: number;
+  decision?: Decision; latest: Record<string, Decision>; output: string; search?: string; grid?: { round: number; columns: number; cells: Array<string | null>; completed: number; total: number };
 }
 export interface TranscriptState {
   schema?: number; items: Item[]; live?: Live; decisions: Decision[]; requests: number; files: string[]; turn: number; elapsedMs: number;
@@ -41,7 +41,8 @@ export interface TranscriptState {
 }
 
 export const RING = 20;
-const SOURCE_LINES = 8, OUTPUT_LINES = 6, PATH_LINES = 8;
+const SOURCE_LINES = 8, OUTPUT_LINES = 6, PATH_LINES = 8, COMMAND_LINES = 40;
+export { OUTPUT_LINES };
 
 export const initialState = (): TranscriptState => ({ items: [], decisions: [], requests: 0, files: [], turn: 0, elapsedMs: 0, records: [] });
 
@@ -49,10 +50,16 @@ const lines = (text: string): string[] => text === '' ? [] : text.replace(/\n$/,
 const clip = <T>(all: T[], max: number): { head: T[]; remaining: number } => ({ head: all.slice(0, max), remaining: Math.max(0, all.length - max) });
 const key = (d: { field?: string; unit?: string; candidate?: number }): string => `${d.field ?? ''}|${d.unit ?? ''}|${d.candidate ?? ''}`;
 const str = (val: unknown): string => typeof val === 'string' ? val : '';
+const pendingBody = (b: Body): Body => b.kind === 'source' ? { ...b, hint: 'written after approval' } : b;
+const gridSource = (cells: Array<string | null>, columns: number): string => {
+  const rows: string[] = [];
+  for (let i = 0; i < cells.length; i += columns) rows.push(cells.slice(i, i + columns).map(c => c ?? '·').join(''));
+  return rows.join('\n');
+};
 
 const target = (tool: string, args: ToolRecord['args'], data?: Record<string, unknown>): string => {
   if (tool === 'bash') return str(args.command);
-  if (tool === 'write_files') return `${Array.isArray(data?.paths) ? data.paths.length : 0} files`;
+  if (tool === 'write_files') return Array.isArray(data?.paths) ? `${data.paths.length} files` : '';
   if (tool === 'set_plan') return 'plan';
   return str(args.path);
 };
@@ -83,7 +90,7 @@ const lowConfidence = (options: DecisionOption[], confidence: number | undefined
   (confidence !== undefined && confidence < 0.5) || (options.length > 1 && options[0]!.probability - options[1]!.probability < 0.1);
 
 const card = (turn: number, tool: string, startedMs: number, args: ToolRecord['args'] = {}, status: ToolStatus = 'pending'): ToolItem =>
-  ({ kind: 'tool', turn, status, tool, target: target(tool, args), args, startedMs, requests: 0 });
+  ({ kind: 'tool', turn, status, tool, target: target(tool, args), startedMs, requests: 0 });
 
 const live = (state: TranscriptState, card: ToolItem): Live => ({ card, latest: {}, output: '', ...(state.live ? { latest: state.live.latest } : {}) });
 
@@ -92,7 +99,7 @@ const finish = (state: TranscriptState, record: ToolRecord, elapsedMs: number): 
   const denied = cur.status === 'denied' || (!record.result.ok && record.result.output.startsWith('Host declined'));
   const exitCode = typeof record.result.data?.exitCode === 'number' ? record.result.data.exitCode : undefined;
   const done: ToolItem = {
-    ...cur, status: denied ? 'denied' : record.result.ok ? 'done' : 'failed', args: record.args, target: target(record.tool, record.args, record.result.data),
+    ...cur, status: denied ? 'denied' : record.result.ok ? 'done' : 'failed', target: target(record.tool, record.args, record.result.data),
     body: body(record, state.live?.output ?? ''), durationMs: Math.max(0, elapsedMs - cur.startedMs), ...(exitCode === undefined ? {} : { exitCode }),
   };
   const { live: _live, ...rest } = state;
@@ -115,9 +122,9 @@ export function reduce(state: TranscriptState, event: HarnessEvent | SessionEven
       const requests = state.requests + 1;
       const cur = state.live;
       if (event.data.choice === undefined) return { ...state, requests, ...(cur ? { live: { ...cur, card: { ...cur.card, requests: cur.card.requests + 1 } } } : {}) };
-      const { choice, confidence, options = [], field, phase, slot, unit, candidate } = event.data;
+      const { choice, confidence, options = [], field, slot, unit, candidate } = event.data;
       const d: Decision = { turn: event.turn, choice, options, lowConfidence: lowConfidence(options, confidence),
-        ...(confidence === undefined ? {} : { confidence }), ...(field === undefined ? {} : { field }), ...(phase === undefined ? {} : { phase }),
+        ...(confidence === undefined ? {} : { confidence }), ...(field === undefined ? {} : { field }),
         ...(slot === undefined ? {} : { slot }), ...(unit === undefined ? {} : { unit }), ...(candidate === undefined ? {} : { candidate }) };
       const decisions = [...state.decisions, d].slice(-RING);
       if (!cur) return { ...state, requests, decisions };
@@ -127,14 +134,23 @@ export function reduce(state: TranscriptState, event: HarnessEvent | SessionEven
     case 'text': {
       const { field, change, decoder, ast } = event.data;
       const cur = state.live ?? live(state, card(event.turn, 'text', at));
-      const next: Live = { ...cur, field, decoder, card: cur.card.status === 'pending' ? { ...cur.card, status: 'generating' } : cur.card };
+      const next: Live = { ...cur, field, card: cur.card.status === 'pending' ? { ...cur.card, status: 'generating' } : cur.card };
       if (decoder === 'search' && ast) return { ...state, live: { ...next, search: formatSearchOutcome(field, ast) } };
       if (change && 'replace' in change) {
         if (field === 'path') next.path = change.replace;
         else next.source = change.replace;
       }
+      if (change && 'grid' in change) {
+        const { round, columns, completed, total, cells: filled } = change.grid;
+        const cells = cur.grid?.round === round ? [...cur.grid.cells] : Array<string | null>(total).fill(null);
+        for (const cell of filled) cells[cell.index] = cell.value;
+        next.grid = { round, columns, cells, completed, total };
+        next.source = gridSource(cells, columns);
+      }
       if (ast) {
-        Object.assign(next, { slot: ast.slot, production: ast.production }, ast.unit === undefined ? {} : { unit: ast.unit }, ast.candidate === undefined ? {} : { candidate: ast.candidate });
+        next.slot = ast.slot; next.production = ast.production;
+        if (ast.unit === undefined) delete next.unit; else next.unit = ast.unit;
+        if (ast.candidate === undefined) delete next.candidate; else next.candidate = ast.candidate;
         const paired = cur.latest[key({ field, ...(ast.unit === undefined ? {} : { unit: ast.unit }), ...(ast.candidate === undefined ? {} : { candidate: ast.candidate }) })];
         next.decision = paired?.slot === ast.slot ? paired
           : { turn: event.turn, choice: ast.production, options: [], lowConfidence: false, field, slot: ast.slot, ...(ast.unit === undefined ? {} : { unit: ast.unit }), ...(ast.candidate === undefined ? {} : { candidate: ast.candidate }) };
@@ -143,7 +159,7 @@ export function reduce(state: TranscriptState, event: HarnessEvent | SessionEven
     }
     case 'tool_start': {
       const cur = state.live ?? live(state, card(event.turn, event.data.tool, at));
-      return { ...state, live: { ...cur, card: { ...cur.card, status: 'running', args: event.data.args, target: target(event.data.tool, event.data.args), startedMs: at } } };
+      return { ...state, live: { ...cur, card: { ...cur.card, status: 'running', target: target(event.data.tool, event.data.args), startedMs: at } } };
     }
     case 'tool_output': return state.live ? { ...state, live: { ...state.live, output: state.live.output + event.data.text } } : state;
     case 'tool_end': return finish(state, event.data, at);
@@ -153,6 +169,7 @@ export function reduce(state: TranscriptState, event: HarnessEvent | SessionEven
       const item: Item = { kind: 'summary', runId: event.runId, ...runSummary(status, summary, state.records), turns, requests, usage, durationMs, ...(state.limits ? { limits: state.limits } : {}) };
       return { ...rest, items: [...state.items, item] };
     }
+    default: return state;
   }
 }
 
@@ -161,8 +178,11 @@ function reduceSession(state: TranscriptState, event: SessionEvent): TranscriptS
     case 'permission': {
       const { tool, args } = event.data;
       const cur = state.live ?? live(state, card(state.turn, tool, state.elapsedMs));
-      const preview = ['write_file', 'edit_file'].includes(tool) ? { body: body({ turn: state.turn, tool, args, result: { ok: true, output: '' } }, '') } : {};
-      return { ...state, live: { ...cur, card: { ...cur.card, status: 'awaiting', args, target: target(tool, args), ...preview } } };
+      const command = lines(str(args.command));
+      const preview = ['write_file', 'edit_file'].includes(tool) ? { body: pendingBody(body({ turn: state.turn, tool, args, result: { ok: true, output: '' } }, '')) }
+        : tool === 'bash' && command.length > 1 ? { body: { kind: 'output' as const, ...(({ head, remaining }) => ({ lines: head, remaining }))(clip(command, COMMAND_LINES)) } } : {};
+      const shown = tool === 'bash' && command.length > 1 ? `${command[0]} …` : target(tool, args);
+      return { ...state, live: { ...cur, card: { ...cur.card, status: 'awaiting', target: shown, ...preview } } };
     }
     case 'permission_result':
       return state.live ? { ...state, live: { ...state.live, card: { ...state.live.card, status: event.data.allowed ? 'running' : 'denied' } } } : state;
@@ -173,10 +193,15 @@ function reduceSession(state: TranscriptState, event: SessionEvent): TranscriptS
 
 export const traceItem = (state: TranscriptState, n = RING): TranscriptState => ({ ...state, items: [...state.items, { kind: 'trace', decisions: state.decisions.slice(-n) }] });
 
-const pct = (val: number): string => `${Math.round(val * 100)}%`;
+export const pct = (val: number): string => `${Math.round(val * 100)}%`;
+export const decisionHead = (d: Decision): string[] =>
+  [`${d.slot ?? d.field ?? 'action'} → ${d.choice}`, d.options[0] ? pct(d.options[0].probability) : '', d.lowConfidence ? 'low confidence' : ''].filter(Boolean);
 export function decisionStrip(state: TranscriptState): string {
   const d = state.live?.decision;
+  const grid = state.live?.grid;
+  if (grid && !d) return `grid · round ${grid.round} · ${grid.completed}/${grid.total} cells · ${state.requests} req`;
   if (!d) return 'choosing…';
-  const confidence = d.options[0] ? ` · ${pct(d.options[0].probability)}` : '';
-  return `${d.slot ?? d.field ?? 'action'} → ${d.choice}${confidence}${d.lowConfidence ? ' · low confidence' : ''} · ${state.requests} req`;
+  return [...decisionHead(d), `${state.requests} req`].join(' · ');
 }
+export const livePhase = (live: Live): string =>
+  live.card.status === 'generating' ? `generating ${live.field ?? ''}`.trim() : live.card.status === 'running' ? `running ${live.card.tool}` : 'deciding';

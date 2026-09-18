@@ -2,7 +2,6 @@ export interface DiffLine { kind: 'context' | 'remove' | 'add' | 'skip'; text: s
 
 const split = (text: string): string[] => text === '' ? [] : text.replace(/\n$/, '').split('\n');
 
-/** Line-level LCS; unchanged runs keep at most 2 lines on each side of a change. */
 export function diffLines(before: string, after: string, context = 2): DiffLine[] {
   const a = split(before), b = split(after);
   const n = a.length, m = b.length;

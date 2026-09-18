@@ -5,8 +5,8 @@ import { render } from 'ink';
 import { DEFAULT_LIMITS, Harness, type HarnessOptions } from '../harness.js';
 import { highlightCode, isInteractiveTTY, terminalColor } from '../terminal-style.js';
 import { formatDuration } from '../timing.js';
-import { runBash } from '../tools.js';
-import { initialState, reduce, traceItem, type Item, type SessionEvent, type TranscriptState } from '../transcript.js';
+import { autoApproved, runBash } from '../tools.js';
+import { initialState, livePhase, reduce, traceItem, type Item, type SessionEvent, type TranscriptState } from '../transcript.js';
 import type { HarnessEvent, RunResult, RunStatus, Tool, ToolRecord } from '../types.js';
 import { resolveWorkspacePath } from '../workspace.js';
 import { App } from './app.js';
@@ -30,6 +30,8 @@ Ctrl-C cancels current work; at an empty idle prompt it exits. Tab completes com
 
 export const TRACE_DEFAULT = 10, TRACE_MAX = 20;
 export const APPROVAL_KEYS = 'y allow · n deny · a always';
+export const APPROVAL_DRAFT = 'send or erase your line, then y allow · n deny · a always';
+export const APPROVAL_GRACE_MS = 300;
 
 export interface SessionOptions {
   harness: Omit<HarnessOptions, 'onEvent' | 'authorize'>;
@@ -37,6 +39,7 @@ export interface SessionOptions {
   initialPrompt?: string;
   yes?: boolean;
   confirmWrites?: boolean;
+  approvalGraceMs?: number;
   tty?: boolean;
   onEvent?: (event: HarnessEvent) => void | Promise<void>;
 }
@@ -52,7 +55,6 @@ export interface Session {
   subscribe(fn: () => void): () => void;
   submit(line: string): void;
   answer(key: 'y' | 'n' | 'a'): void;
-  /** Returns true when the prompt line should be cleared. */
   interrupt(hasText: boolean): boolean;
   complete(line: string): string[];
   onEvent(event: HarnessEvent): void;
@@ -73,7 +75,8 @@ export function createSession(opts: SessionOptions): Session {
   let model = opts.model, plan = '', closing = false;
   let active: { controller: AbortController; kind: 'agent' | 'shell'; started: number } | undefined;
   let paste: string[] | undefined;
-  let pending: { tool: string; settle: (allowed: boolean) => void } | undefined;
+  let pending: { tool: string; settle: (allowed: boolean) => void; since: number } | undefined;
+  const grace = opts.approvalGraceMs ?? APPROVAL_GRACE_MS;
   const allowed = new Set<string>();
   let lastRun: RunResult | undefined;
   let work: Promise<void> | undefined;
@@ -96,7 +99,7 @@ export function createSession(opts: SessionOptions): Session {
     if (event.type === 'text') later(); else flush();
   };
   const authorize = (tool: Tool, args: ToolRecord['args'], signal: AbortSignal): boolean | Promise<boolean> => {
-    if (mode === 'auto' || allowed.has(tool.name) || (tool.effect !== 'shell' && !(opts.confirmWrites && tool.effect === 'write'))) return true;
+    if (mode === 'auto' || allowed.has(tool.name) || autoApproved(tool, opts.confirmWrites)) return true;
     signal.throwIfAborted();
     return new Promise(resolve => {
       const settle = (ok: boolean): void => {
@@ -107,14 +110,14 @@ export function createSession(opts: SessionOptions): Session {
         resolve(ok);
       };
       const deny = (): void => settle(false);
-      pending = { tool: tool.name, settle };
+      pending = { tool: tool.name, settle, since: performance.now() };
       signal.addEventListener('abort', deny, { once: true });
       apply({ type: 'permission', data: { tool: tool.name, args } });
       flush();
     });
   };
   const answer = (key: 'y' | 'n' | 'a'): void => {
-    if (!pending) return;
+    if (!pending || performance.now() - pending.since < grace) return;
     if (key === 'a') allowed.add(pending.tool);
     pending.settle(key !== 'n');
   };
@@ -185,11 +188,12 @@ export function createSession(opts: SessionOptions): Session {
     void Promise.resolve(work).then(() => resolveClosed(code));
   };
 
+  const permissions = (): string => `Permissions: ${mode}${allowed.size ? ` · always: ${[...allowed].join(', ')}` : ''}`;
   const phase = (): string => {
     const live = state.live;
     if (!active) return 'ready';
     if (!live) return active.kind === 'shell' ? 'bash' : 'deciding';
-    return live.card.status === 'generating' ? `generating ${live.field ?? ''}`.trim() : live.card.status === 'running' ? `running ${live.card.tool}` : 'deciding';
+    return livePhase(live);
   };
 
   const command = (text: string): void => {
@@ -198,7 +202,7 @@ export function createSession(opts: SessionOptions): Session {
       case '/help': return note(HELP);
       case '/exit': return close(0);
       case '/cancel': return cancel();
-      case '/status': return note([`Workspace: ${workspace}`, `Model: ${model}`, `Permissions: ${mode}`,
+      case '/status': return note([`Workspace: ${workspace}`, `Model: ${model}`, permissions(),
         `Activity: ${phase()}${active ? ` · ${formatDuration(performance.now() - active.started)} elapsed` : ''}`,
         `Current turn: ${state.turn} · ${state.requests} decisions answered`,
         ...(lastRun ? [`Last run: ${lastRun.status} · ${formatDuration(lastRun.durationMs)} · ${lastRun.id}`] : [])].join('\n'));
@@ -208,13 +212,14 @@ export function createSession(opts: SessionOptions): Session {
       case '/show': void show(text.slice(cmd.length).trim()).catch(err => note(`Error: ${msg(err)}`, 33)); return;
       case '/clear':
         if (active) return note('Use /cancel and wait for it to stop before /clear.', 33);
-        harness.reset(); history.length = 0; plan = ''; lastRun = undefined;
+        harness.reset(); history.length = 0; plan = ''; lastRun = undefined; allowed.clear();
         return note('Fresh conversation. Files and journals kept.');
       case '/permissions':
-        if (args.length === 0) return note(`Permissions: ${mode}. Use /permissions ask or /permissions auto.`);
+        if (args.length === 0) return note(`${permissions()}. Use /permissions ask or /permissions auto.`);
         if (args.length !== 1 || (args[0] !== 'ask' && args[0] !== 'auto')) return note('Use /permissions ask or /permissions auto.', 33);
         mode = args[0];
-        return note(`Permissions: ${mode}.`);
+        if (mode === 'ask') allowed.clear();
+        return note(`${permissions()}.`);
       case '/paste': paste = []; return note('Paste a multiline task. /end submits; /abort discards.');
       case '/trace': {
         const n = args[0] === undefined ? TRACE_DEFAULT : Number(args[0]);
@@ -240,6 +245,7 @@ export function createSession(opts: SessionOptions): Session {
     if (active) {
       if (active.kind === 'shell') return note('A direct command is running. Use /cancel, then submit a task.', 33);
       if (text.startsWith('!')) return note('Wait for the agent, or /cancel before running a direct command.', 33);
+      if (text.length > 32_000) return note('Update exceeds 32000 characters.', 33);
       harness.enqueue(text);
       return note('Update queued for the next turn.');
     }

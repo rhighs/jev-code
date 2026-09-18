@@ -14,7 +14,7 @@ import { ScriptedProvider } from './helpers.js';
 
 const off = { color: false };
 const tool = (over: Partial<ToolItem>): ToolItem =>
-  ({ kind: 'tool', turn: 1, status: 'done', tool: 'write_file', target: 'hello.py', args: {}, startedMs: 0, durationMs: 12, requests: 1, ...over });
+  ({ kind: 'tool', turn: 1, status: 'done', tool: 'write_file', target: 'hello.py', startedMs: 0, durationMs: 12, requests: 1, ...over });
 const summary = (over: Partial<Extract<Item, { kind: 'summary' }>> = {}): Extract<Item, { kind: 'summary' }> => ({
   kind: 'summary', status: 'completed', reason: '', facts: ['Wrote hello.py.', 'Bash exited with code 0.'], omitted: 0,
   turns: 2, requests: 4, limits: { turns: 50, requests: 512 }, usage: { inputTokens: 10, outputTokens: 2 }, durationMs: 500, runId: 'r1', ...over,
@@ -186,4 +186,38 @@ test('the real cli --demo writes cards to stderr and the summary to stdout witho
   assert.match(stderr, /  │   1  Hello from a Jev turn loop!\n/);
   assert.match(stderr, /✓ bash test .* · exit 0/);
   assert.match(stdout, /^\[completed\]\n  Wrote hello\.txt\.\n  Bash exited with code 0\.\n.* · run [0-9a-f-]{36}\nDemo workspace: /);
+});
+
+test('a running command shows its last output lines in the live area, and a narrow pane keeps only the strip', () => {
+  const events = [start(), ev('turn', { files: 0, plan: '' }), ev('action', { tool: 'bash' }), ev('tool_start', { tool: 'bash', args: { command: 'python3 -m http.server' } })];
+  const state = [...events, ...Array.from({ length: 8 }, (_, i) => ev('tool_output', { stream: 'stdout' as const, text: `line ${i + 1}\n` }))].reduce(reduce, initialState());
+  assert.ok(state.live);
+  const pane = renderLive(state.live, state, off);
+  assert.equal(pane[0], '◐ bash python3 -m http.server · running · 0 req');
+  assert.deepEqual(pane.slice(1, -1), ['  │ line 3', '  │ line 4', '  │ line 5', '  │ line 6', '  │ line 7', '  │ line 8']);
+  assert.deepEqual(renderLive(state.live, state, off, 0), ['  choosing…']);
+});
+
+test('the awaiting card renders in full, untruncated, even on a narrow pane', () => {
+  const command = `echo ${'a'.repeat(100)}\ntouch x`;
+  const state = [start(), ev('turn', { files: 0, plan: '' }), ev('action', { tool: 'bash' }), { type: 'permission' as const, data: { tool: 'bash', args: { command } } }].reduce(reduce, initialState());
+  assert.ok(state.live);
+  const pane = renderLive(state.live, state, { color: false, width: 40 }, 0);
+  assert.equal(pane[0], `? bash echo ${'a'.repeat(100)} … · needs approval · 0 req`);
+  assert.equal(pane[1], `  │ echo ${'a'.repeat(100)}`);
+  assert.equal(pane[2], '  │ touch x');
+});
+
+test('--print streams running output as it arrives and prints the finished card once without repeating the body', () => {
+  const stderr = new PassThrough();
+  const err = collect(stderr);
+  const { onEvent } = createPrinter(stderr);
+  for (const e of [start(), ev('turn', { files: 0, plan: '' }), ev('action', { tool: 'bash' }), ev('tool_start', { tool: 'bash', args: { command: 'printf ready' } })]) onEvent(e);
+  onEvent(ev('tool_output', { stream: 'stdout', text: 'Server ready at http://localhost:3000\npar' }));
+  onEvent(ev('tool_output', { stream: 'stdout', text: 'tial\n' }));
+  onEvent(ev('tool_end', record('bash', { command: 'printf ready' }, true, 'Server ready at http://localhost:3000\npartial\n', { exitCode: 0 })));
+  assert.equal(count(err(), 'Server ready at http://localhost:3000'), 1);
+  assert.equal(count(err(), '  │ partial'), 1);
+  assert.equal(count(err(), '✓ bash printf ready · exit 0'), 1);
+  assert.ok(err().indexOf('Server ready') < err().indexOf('✓ bash printf ready'));
 });

@@ -10,7 +10,6 @@ export function highlightCode(line: string, enabled: boolean): string {
     token => paint(token, token.startsWith('#') ? 2 : /^["']/.test(token) ? 32 : /^\d/.test(token) ? 35 : 36, true));
 }
 
-/** Preserve the exact text; escape controls only when presenting it to the terminal. */
 export const displayText = (text: string): string => stripVTControlCharacters(text).replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g,
   char => char === '\t' ? '    ' : JSON.stringify(char).slice(1, -1));
 

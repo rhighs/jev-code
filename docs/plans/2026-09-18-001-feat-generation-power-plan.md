@@ -145,7 +145,7 @@ There is also no way to measure progress. Tests use a scripted provider and neve
 
 ### Scope Boundaries
 
-- The premium terminal experience (formatting, completions, layout parity with Claude Code, Pi, Codex) is a separate brainstorm.
+- The premium terminal experience (formatting, completions, layout parity with Pi and Codex) is a separate brainstorm.
 - Grammar growth toward idiomatic Python (elif, f-strings, try/except, keyword arguments, comprehensions, classes) is deferred.
 - Other language adapters are untouched. The TypeScript starter adapter and Bash AST are not part of this track.
 - Cost and latency optimization is deferred until correctness holds.

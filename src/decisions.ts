@@ -118,7 +118,7 @@ export class Decisions {
     if (!answer || answer.type !== 'noul') throw new DecisionError('Jev returned an invalid noul answer.');
     const value = answer.noul;
     if (!Number.isFinite(value) || value < 0 || value > 1) throw new DecisionError('Jev returned an invalid noul.');
-    await this.onDecision({ probability: value, model: response.model });
+    await this.onDecision({ probability: value, model: response.model, ...identity(state) });
     return value;
   }
 

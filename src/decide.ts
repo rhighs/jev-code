@@ -13,16 +13,16 @@ export interface SpecEntry { question?: string; choices?: string[]; true?: strin
 const FAIL = 125;
 const MAX_CHOICES = 100;
 const LEVELS = ['does not satisfy', 'partially satisfies', 'mostly satisfies', 'fully satisfies'];
-const decoder = new TextDecoder();
 
 const shrinkText = (value: unknown, level: number): unknown => {
   const keep = MAX_GRID_REQUEST_BYTES - level * 1024;
   if (typeof value !== 'string' || keep <= 0) return undefined;
-  return decoder.decode(Buffer.from(value).subarray(0, keep), { stream: true });
+  return new TextDecoder().decode(Buffer.from(value).subarray(0, keep), { stream: true });
 };
 
-const parseLabels = (raw: string): string[] => {
-  const labels = raw.split(',').map(s => s.trim());
+const parseLabels = (raw: string): string[] => validateLabels(raw.split(','));
+const validateLabels = (raw: string[]): string[] => {
+  const labels = raw.map(s => s.trim());
   if (labels.some(l => !l)) throw new Error('--choices labels must be non-empty.');
   if (new Set(labels).size !== labels.length) throw new Error('--choices labels must be unique.');
   if (labels.length < 2 || labels.length > MAX_CHOICES) throw new Error(`--choices needs 2 to ${MAX_CHOICES} labels.`);
@@ -47,7 +47,7 @@ const parseSpec = (text: string): SpecEntry[] => {
     if (e.choices !== undefined) {
       if (!Array.isArray(e.choices) || e.choices.some(c => typeof c !== 'string') || typeof e.question !== 'string' || !e.question) throw new Error(`--spec entry ${i} needs a question and a string array of choices.`);
       out.question = e.question;
-      out.choices = parseLabels((e.choices as string[]).join(','));
+      out.choices = validateLabels(e.choices as string[]);
     }
     if (e.true !== undefined) { if (typeof e.true !== 'string' || !e.true) throw new Error(`--spec entry ${i}: true must be a statement.`); out.true = e.true; }
     if (e.score !== undefined) { if (typeof e.score !== 'string' || !e.score) throw new Error(`--spec entry ${i}: score must be a criteria string.`); out.score = e.score; }
@@ -93,14 +93,14 @@ export async function runDecide(argv: string[], input: string, provider: Decisio
   const startedAt = Date.now();
   const runId = randomUUID();
   const out: string[] = [], err: string[] = [];
-  const event = (data: DecisionEventData, extra: Record<string, unknown> = {}): string => {
+  const event = (data: DecisionEventData): string => {
     const e: HarnessEvent = { type: 'decision', runId, timestamp: new Date().toISOString(), elapsedMs: Date.now() - startedAt, turn: 0, data };
-    return JSON.stringify({ ...e, ...extra }) + '\n';
+    return JSON.stringify(e) + '\n';
   };
   try {
     const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: {
       choices: { type: 'string' }, true: { type: 'string' }, score: { type: 'string' }, spec: { type: 'string' },
-      threshold: { type: 'string' }, lines: { type: 'boolean' }, json: { type: 'boolean' },
+      threshold: { type: 'string' }, lines: { type: 'boolean' }, json: { type: 'boolean' }, truncate: { type: 'boolean' },
     } });
     const modes = (['choices', 'true', 'score', 'spec'] as const).filter(k => values[k] !== undefined);
     if (modes.length !== 1) throw new Error('Use exactly one of "<question>" --choices a,b, --true "<statement>", --score "<criteria>", or --spec <file.json>.');
@@ -116,6 +116,7 @@ export async function runDecide(argv: string[], input: string, provider: Decisio
     const measure = (parts: Record<string, unknown>): number => Buffer.byteLength(JSON.stringify({ state: parts, question: positionals[0] ?? values.true ?? values.score ?? '' }));
     const { values: ctx, trimmed } = buildDecisionContext([{ key: 'input', value: input, shrink: shrinkText }], measure, MAX_GRID_REQUEST_BYTES);
     const text = String(ctx.input ?? '');
+    if (trimmed.length && !values.truncate) throw new Error(`input is ${Buffer.byteLength(input)} bytes; only ${Buffer.byteLength(text)} fit. Pass --truncate to decide on the head alone.`);
     if (trimmed.length) err.push(`input truncated to ${Buffer.byteLength(text)} bytes\n`);
     const lines = values.lines ? text.split('\n').filter(l => l.trim()) : [];
     const count = values.lines ? lines.length : mode === 'spec' ? spec.length : 1;
@@ -128,7 +129,7 @@ export async function runDecide(argv: string[], input: string, provider: Decisio
         return { line, value: 'value' in res ? res.value : res.expected, data: res.data };
       }))).sort((a, b) => b.value - a.value)
         .filter(r => mode !== 'true' || values.threshold === undefined || r.value >= threshold);
-      for (const r of ranked) out.push(values.json ? event(r.data, { line: r.line }) : `${fixed(r.value)}\t${r.line}\n`);
+      for (const r of ranked) out.push(values.json ? event({ ...r.data, line: r.line }) : `${fixed(r.value)}\t${r.line}\n`);
     } else if (mode === 'spec') {
       const answers = await Promise.all(spec.map(async entry => {
         if (entry.choices) {

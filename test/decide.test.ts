@@ -158,9 +158,12 @@ test('a provider decision failure exits 125 and names the reason', async () => {
   assert.match(failed.stderr, /connection refused/);
 });
 
-test('oversized stdin is truncated to the request budget with a note on stderr', async () => {
+test('oversized stdin fails with 125 unless --truncate allows deciding on the head', async () => {
+  const refused = await runDecide(['q', '--choices', 'yes,no'], 'x'.repeat(MAX_GRID_REQUEST_BYTES * 2), fake(pick('yes')));
+  assert.equal(refused.code, 125);
+  assert.match(refused.stderr, /Pass --truncate/);
   const states: Record<string, unknown>[] = [];
-  const res = await runDecide(['q', '--choices', 'yes,no'], 'x'.repeat(MAX_GRID_REQUEST_BYTES * 2), fake(pick('yes'), states));
+  const res = await runDecide(['q', '--choices', 'yes,no', '--truncate'], 'x'.repeat(MAX_GRID_REQUEST_BYTES * 2), fake(pick('yes'), states));
   assert.equal(res.code, 0);
   assert.match(res.stderr, /^input truncated to \d+ bytes\n$/);
   const sent = String(states[0]!.input);
@@ -172,8 +175,25 @@ test('cli decide without TYPESAFE_API_KEY exits 125 with a message', async t => 
   const run = promisify(execFile);
   const env = { ...process.env };
   delete env.TYPESAFE_API_KEY;
+  env.JEV_CODE_CONFIG_DIR = await mkdtemp(join(tmpdir(), 'jev-cfg-'));
   const cwd = await mkdtemp(join(tmpdir(), 'jev-decide-'));
-  t.after(() => rm(cwd, { recursive: true, force: true }));
+  t.after(async () => { await rm(cwd, { recursive: true, force: true }); await rm(env.JEV_CODE_CONFIG_DIR!, { recursive: true, force: true }); });
   await assert.rejects(run('npx', ['tsx', resolve('src/cli.ts'), 'decide', 'Is this an error?', '--choices', 'yes,no'], { cwd, env, timeout: 60_000 }),
-    (err: Error & { code?: unknown; stderr?: string }) => err.code === 125 && /TYPESAFE_API_KEY/.test(err.stderr ?? ''));
+    (err: Error & { code?: unknown; stderr?: string }) => err.code === 125 && /jev-code login.*TYPESAFE_API_KEY/.test(err.stderr ?? ''));
+});
+
+test('--json --lines keeps the event shape and carries the line inside data', async () => {
+  const res = await runDecide(['--score', 'clear', '--lines', '--json'], 'alpha\nbeta\n', fake(rate(() => ({ '0': 0, '1': 0, '2': 1, '3': 0 }))));
+  const events = res.stdout.trim().split('\n').map(line => JSON.parse(line) as HarnessEvent);
+  assert.equal(events.length, 2);
+  for (const event of events) {
+    assert.deepEqual(Object.keys(event).sort(), ['data', 'elapsedMs', 'runId', 'timestamp', 'turn', 'type']);
+    if (event.type === 'decision') assert.match(String(event.data.line), /^(alpha|beta)$/);
+  }
+});
+
+test('--spec choices may contain commas', async t => {
+  const res = await runDecide(['--spec', await spec(t, [{ question: 'Which?', choices: ['a, b', 'c'] }])], 'text', fake(pick('a, b')));
+  assert.equal(res.code, 0);
+  assert.equal((JSON.parse(res.stdout) as { choice: string }).choice, 'a, b');
 });

@@ -26,7 +26,6 @@ export function completionSummary(records: ToolRecord[]): string {
   return values.slice(0, 12).join('\n') + (values.length > 12 ? `\n${values.length - 12} additional outcomes are in the run log.` : '');
 }
 
-/** The reason is whatever the run reported beyond the facts already carried by the records. */
 export function runSummary(status: RunStatus, summary: string, records: ToolRecord[]): RunSummary {
   const facts = summaryFacts(records);
   const stated = completionSummary(records);

@@ -87,8 +87,9 @@ test('at 60 columns the pane is hidden, the strip stays and no line exceeds the 
   assert.equal(plain.includes('__jev_pending__'), false);
   assert.equal(plain.includes('x = 1'), false);
   assert.match(plain, /module_body → expr · 41% · low confidence · 2 req/);
-  const tail = lines(plain).slice(lines(plain).findIndex(line => line.startsWith('◔')));
-  assert.ok(tail.length >= 4 && tail.every(line => [...line].length <= 60), plain);
+  assert.equal(lines(plain).some(line => line.startsWith('◔')), false, plain);
+  const tail = lines(plain).slice(lines(plain).findIndex(line => line.startsWith('── turn')));
+  assert.ok(tail.length >= 3 && tail.every(line => [...line].length <= 60), plain);
 });
 
 test('an update typed mid-run keeps prior rows and adds an update row when applied', async t => {

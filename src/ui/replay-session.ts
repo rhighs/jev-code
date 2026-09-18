@@ -49,10 +49,12 @@ export async function runReplay(opts: RunReplayOptions): Promise<number> {
   const app = render(createElement(App, { session, footer: replayFooter(opts.runId, opts.speed) }), { stdout, stdin, patchConsole: false, exitOnCtrlC: false });
   const controller = new AbortController();
   void session.closed.then(() => controller.abort());
-  await drive(opts.events, opts.speed, session.onEvent, controller.signal);
-  session.close(0);
-  const code = await session.closed;
-  app.unmount();
-  await app.waitUntilExit();
-  return code;
+  try {
+    await drive(opts.events, opts.speed, session.onEvent, controller.signal);
+  } finally {
+    session.close(0);
+    app.unmount();
+    await app.waitUntilExit();
+  }
+  return session.closed;
 }

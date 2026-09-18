@@ -22,7 +22,7 @@ export const lines = (frame: string): string[] => frame.trimEnd().split('\n');
 
 export async function setup(t: test.TestContext, provider: DecisionProvider, extra: Partial<SessionOptions> = {}, harness: Partial<HarnessOptions> = {}): Promise<Setup> {
   const workspace = await mkdtemp(join(tmpdir(), 'jev-ui-'));
-  const session = createSession({ harness: { experimentalGrid: true, workspace, provider, journalDirectory: false, ...harness }, model: 'test-jev', yes: true, tty: true, ...extra });
+  const session = createSession({ harness: { experimentalGrid: true, workspace, provider, journalDirectory: false, ...harness }, model: 'test-jev', yes: true, tty: true, approvalGraceMs: 0, ...extra });
   const ui: Ui = render(<App session={session} />);
   await tick(10);
   t.after(async () => { session.close(0); await session.closed; ui.unmount(); await rm(workspace, { recursive: true, force: true }); });

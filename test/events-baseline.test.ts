@@ -10,7 +10,7 @@ import type { HarnessEvent } from '../src/types.js';
 import { ScriptedProvider } from './helpers.js';
 
 const FIXTURE = new URL('./fixtures/events-baseline.jsonl', import.meta.url);
-const ADDED = new Set(['schema', 'options', 'field', 'phase', 'slot', 'unit', 'candidate']);
+const ADDED: Record<string, string[]> = { start: ['schema'], decision: ['options', 'field', 'phase', 'slot', 'unit', 'candidate', 'line'] };
 
 const mask = (event: HarnessEvent, ws: string): Record<string, unknown> => {
   const val = JSON.parse(JSON.stringify(event).replaceAll(ws, '<ws>')) as Record<string, unknown>;
@@ -20,10 +20,10 @@ const mask = (event: HarnessEvent, ws: string): Record<string, unknown> => {
   return val;
 };
 
-const strip = (val: unknown): unknown => {
-  if (Array.isArray(val)) return val.map(strip);
-  if (val && typeof val === 'object') return Object.fromEntries(Object.entries(val).filter(([k]) => !ADDED.has(k)).map(([k, v]) => [k, strip(v)]));
-  return val;
+const strip = (event: Record<string, unknown>): Record<string, unknown> => {
+  const added = ADDED[String(event.type)] ?? [];
+  const data = Object.fromEntries(Object.entries(event.data as Record<string, unknown>).filter(([k]) => !added.includes(k)));
+  return { ...event, data };
 };
 
 const PROMPT = 'Write hello into hello.txt and print it.';
@@ -41,7 +41,7 @@ const workspace = async (t: test.TestContext): Promise<string> => {
 
 const compare = async (events: HarnessEvent[], ws: string): Promise<void> => {
   const baseline = (await readFile(FIXTURE, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as unknown);
-  assert.deepEqual(events.map(e => strip(mask(e, ws))), baseline.map(strip));
+  assert.deepEqual(events.map(e => strip(mask(e, ws))), baseline);
 };
 
 /** Regenerate with UPDATE_FIXTURES=1 npm test -- test/events-baseline.test.ts */
@@ -50,8 +50,12 @@ test('--json events only gain fields relative to the recorded baseline', async t
   const events: HarnessEvent[] = [];
   const result = await new Harness({ workspace: ws, provider: script(), experimentalGrid: true, journalDirectory: false, onEvent: e => { events.push(e); } }).run(PROMPT);
   assert.equal(result.status, 'completed', result.summary);
-  if (process.env.UPDATE_FIXTURES) { await writeFile(FIXTURE, events.map(e => JSON.stringify(mask(e, ws))).join('\n') + '\n'); return; }
+  if (process.env.UPDATE_FIXTURES) { await writeFile(FIXTURE, events.map(e => JSON.stringify(strip(mask(e, ws)))).join('\n') + '\n'); return; }
   await compare(events, ws);
+  const text = events.find(e => e.type === 'text')!;
+  const { field: _field, ...without } = text.data;
+  const broken = events.map(e => e === text ? { ...e, data: without } as unknown as HarnessEvent : e);
+  await assert.rejects(compare(broken, ws));
 });
 
 test('the --print path with --json emits the same one-event-per-line stream on stdout and nothing else', async t => {

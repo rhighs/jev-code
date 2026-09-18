@@ -1,6 +1,5 @@
 import { Box, Text, useInput } from 'ink';
 import TextInput from 'ink-text-input';
-import { useState } from 'react';
 import { paint } from '../terminal-style.js';
 import type { Session, Snapshot } from './session.js';
 
@@ -12,8 +11,7 @@ const commonPrefix = (words: string[]): string => {
   return prefix;
 };
 
-export function Prompt({ session, snap, frame }: { session: Session; snap: Snapshot; frame: number }) {
-  const [value, setValue] = useState('');
+export function Prompt({ session, snap, frame, value, onChange: setValue }: { session: Session; snap: Snapshot; frame: number; value: string; onChange: (value: string) => void }) {
   useInput((input, key) => {
     if (key.ctrl && input === 'c') { if (session.interrupt(value !== '')) setValue(''); return; }
     if (!key.tab || !value.startsWith('/')) return;
@@ -26,7 +24,7 @@ export function Prompt({ session, snap, frame }: { session: Session; snap: Snaps
   return (
     <Box>
       <Text>{paint(label, snap.running ? 36 : 1, snap.color)}</Text>
-      <TextInput value={value} onChange={setValue} onSubmit={submit} showCursor={snap.color} focus={!snap.awaiting} />
+      <TextInput value={value} onChange={setValue} onSubmit={submit} showCursor={snap.color} focus={!snap.awaiting || value !== ''} />
     </Box>
   );
 }

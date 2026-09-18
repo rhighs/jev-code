@@ -68,8 +68,8 @@ export interface DecisionEventData {
   confidence?: number;
   probability?: number;
   questions?: number;
-  /** Winner plus up to three runners-up, sorted by probability. */
   options?: DecisionOption[];
+  line?: string;
   field?: string;
   phase?: string;
   slot?: string;

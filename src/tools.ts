@@ -111,9 +111,7 @@ export async function runBash(command: string, cwd: string, timeoutMs: number, s
     const abort = (): void => { cancelled = true; stop(); };
     const forward = (stream: 'stdout' | 'stderr', text: string): void => {
       if (!text || !onOutput) return;
-      outputQueue = outputQueue.then(() => {
-        if (!outputFailed) return onOutput(stream, text);
-      }).catch(error => { outputFailed = true; outputError = error; stop(); });
+      outputQueue = outputQueue.then(() => outputFailed ? undefined : onOutput(stream, text)).catch(error => { outputFailed = true; outputError = error; stop(); });
     };
     const timer = setTimeout(() => { timedOut = true; stop(); }, timeoutMs);
     signal.addEventListener('abort', abort, { once: true });
@@ -156,6 +154,8 @@ export async function runBash(command: string, cwd: string, timeoutMs: number, s
     });
   });
 }
+
+export const autoApproved = (tool: Tool, confirmWrites: boolean | undefined): boolean => tool.effect !== 'shell' && !(confirmWrites && tool.effect === 'write');
 
 export function builtInTools(): Tool[] {
   return [

@@ -24,7 +24,6 @@ export async function readJournal(path: string): Promise<HarnessEvent[]> {
   return (await readFile(path, 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line) as HarnessEvent);
 }
 
-/** Returns a warning for older journals; throws for newer or malformed ones. */
 export function checkSchema(events: HarnessEvent[]): string | undefined {
   const first = events[0];
   if (!first || first.type !== 'start') throw new Error('Journal does not begin with a start event.');

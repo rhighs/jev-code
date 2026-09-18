@@ -13,7 +13,7 @@ execution: code
 
 ## Goal Capsule
 
-- **Objective:** Make a jev-code session read like a peer of Claude Code or Codex: a scrolling transcript of designed tool cards, a pinned live area that shows the file being built and the decision behind the current step, single-keypress approvals, and the same rendering for live, `--print`, and replay. Add a pipe utility that turns stdin into one Jev decision.
+- **Objective:** Make a jev-code session read like a peer of Codex or Pi: a scrolling transcript of designed tool cards, a pinned live area that shows the file being built and the decision behind the current step, single-keypress approvals, and the same rendering for live, `--print`, and replay. Add a pipe utility that turns stdin into one Jev decision.
 - **Product authority:** Roberto Montalti (sole maintainer). Decisions confirmed in dialogue on 2026-09-18.
 - **Authority hierarchy:** Product Contract, then Planning Contract, then Implementation Units. Repo conventions in the root instructions override unit approach notes where they conflict.
 - **Execution profile:** Land the transcript model and plain renderer first, then the pipe utility (it depends only on the event shape), then the Ink session, then approvals (the old terminal is deleted here, once approvals work), then trace, then replay, then degradation and docs. Each unit is verifiable on its own.
@@ -152,7 +152,7 @@ The audience is wider than one terminal: README recordings, live demos, contribu
 
 ### Success Criteria
 
-- A recorded run of the guessing-game eval task, placed next to Claude Code doing the same task, reads as a peer product, not a prototype.
+- A recorded run of the guessing-game eval task, placed next to Codex doing the same task, reads as a peer product, not a prototype.
 - Every event type has a snapshot test in TTY and `--print` renderings.
 - A documented shell one-liner using `decide` works end to end, for example gating a commit on a diff verdict.
 - Narrow terminal, `NO_COLOR`, tmux, and non-TTY each produce readable output with no cursor garbage, verified by tests where possible and a manual checklist otherwise.

@@ -1,9 +1,9 @@
 import { Text } from 'ink';
 import { renderLive, type RenderOpts } from '../render-plain.js';
+import { PENDING } from '../decision-context.js';
 import { paint } from '../terminal-style.js';
 import type { TranscriptState } from '../transcript.js';
 
-const PENDING = '__jev_pending__';
 const NARROW = 80;
 const RESERVED = 9;
 const MAX_LINES = 14;

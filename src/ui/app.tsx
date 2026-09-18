@@ -2,26 +2,19 @@ import { Text, useApp, useInput, useWindowSize } from 'ink';
 import { useEffect, useState, useSyncExternalStore } from 'react';
 import type { RenderOpts } from '../render-plain.js';
 import { fitLine, paint } from '../terminal-style.js';
+import { livePhase } from '../transcript.js';
 import { formatDuration } from '../timing.js';
 import { Approval } from './approval.js';
 import { LiveArea } from './live-area.js';
 import { Prompt } from './prompt.js';
-import { APPROVAL_KEYS, type Snapshot, type Session } from './session.js';
+import { APPROVAL_DRAFT, APPROVAL_KEYS, type Snapshot, type Session } from './session.js';
 import { TranscriptView } from './transcript-view.js';
 
-const phase = (snap: Snapshot): string => {
-  const live = snap.state.live;
-  if (!live) return snap.running ? 'deciding' : 'you';
-  switch (live.card.status) {
-    case 'generating': return `generating ${live.field ?? ''}`.trim();
-    case 'running': return `running ${live.card.tool}`;
-    default: return 'deciding';
-  }
-};
+const phase = (snap: Snapshot): string => snap.state.live ? livePhase(snap.state.live) : snap.running ? 'deciding' : 'you';
 
-const statusLine = (snap: Snapshot, width: number): string => {
+const statusLine = (snap: Snapshot, width: number, draft: boolean): string => {
   const { state } = snap;
-  if (snap.awaiting) return fitLine(APPROVAL_KEYS, width);
+  if (snap.awaiting) return fitLine(draft ? APPROVAL_DRAFT : APPROVAL_KEYS, width);
   const elapsed = snap.started === undefined ? state.elapsedMs : performance.now() - snap.started;
   const limit = state.limits?.requests ?? snap.requestLimit;
   return fitLine(`${formatDuration(elapsed)} · turn ${state.turn} · ${state.requests}/${limit} req · ${phase(snap)}`, width);
@@ -32,6 +25,7 @@ export function App({ session, footer }: { session: Session; footer?: string }) 
   const { exit } = useApp();
   const { columns, rows } = useWindowSize();
   const [frame, setFrame] = useState(0);
+  const [draft, setDraft] = useState('');
   useEffect(() => { if (snap.closing) exit(); }, [snap.closing, exit]);
   useEffect(() => {
     if (!snap.running || footer !== undefined) return;
@@ -43,9 +37,9 @@ export function App({ session, footer }: { session: Session; footer?: string }) 
     <>
       <TranscriptView rows={snap.rows} opts={opts} />
       <LiveArea state={snap.state} opts={opts} rows={rows} />
-      <Text>{paint(statusLine(snap, columns), snap.awaiting ? 33 : 2, snap.color)}</Text>
+      <Text>{paint(statusLine(snap, columns, draft !== ''), snap.awaiting ? 33 : 2, snap.color)}</Text>
       {footer === undefined
-        ? <><Approval session={session} active={snap.awaiting} /><Prompt session={session} snap={snap} frame={frame} /></>
+        ? <><Approval session={session} active={snap.awaiting && draft === ''} /><Prompt session={session} snap={snap} frame={frame} value={draft} onChange={setDraft} /></>
         : <Footer session={session} text={fitLine(footer, columns)} color={snap.color} />}
     </>
   );

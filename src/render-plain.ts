@@ -1,7 +1,7 @@
 import { formatHunk, type DiffLine } from './diff.js';
 import { displayText, fitLine, highlightCode, paint } from './terminal-style.js';
 import { formatDuration } from './timing.js';
-import { decisionStrip, type Body, type Decision, type Item, type Live, type ToolItem, type ToolStatus, type TranscriptState } from './transcript.js';
+import { OUTPUT_LINES, decisionHead, decisionStrip, pct, type Body, type Decision, type Item, type Live, type ToolItem, type ToolStatus, type TranscriptState } from './transcript.js';
 
 export interface RenderOpts { color: boolean; width?: number }
 type Summary = Extract<Item, { kind: 'summary' }>;
@@ -13,7 +13,6 @@ const DIFF: Record<DiffLine['kind'], number> = { context: 0, remove: 31, add: 32
 const LIVE_LINES = 8;
 
 const plural = (n: number, noun: string): string => `${n} ${noun}${n === 1 ? '' : 's'}`;
-const pct = (val: number): string => `${Math.round(val * 100)}%`;
 const fit = (text: string, opts: RenderOpts, used = 0): string => opts.width === undefined ? displayText(text) : fitLine(text, Math.max(2, opts.width - used));
 const dim = (text: string, opts: RenderOpts): string => paint(text, 2, opts.color);
 const bar = (text: string, opts: RenderOpts): string => `  ${dim('│', opts)} ${text}`;
@@ -39,7 +38,8 @@ const renderBody = (body: Body, opts: RenderOpts): string[] => {
 
 const renderDecision = (d: Decision): string => {
   const alt = d.options.slice(1).map(o => `${o.label} ${pct(o.probability)}`).join(', ');
-  return [`${d.unit ? `${d.unit} · ` : ''}${d.slot ?? d.field ?? 'action'} → ${d.choice}`, d.options[0] ? pct(d.options[0].probability) : '', d.lowConfidence ? 'low confidence' : '', alt ? `alt ${alt}` : ''].filter(Boolean).join(' · ');
+  const [head, ...rest] = decisionHead(d);
+  return [`${d.unit ? `${d.unit} · ` : ''}${head}`, ...rest, alt ? `alt ${alt}` : ''].filter(Boolean).join(' · ');
 };
 
 export function renderItem(item: Item, opts: RenderOpts): string[] {
@@ -65,10 +65,17 @@ export function renderSummary(summary: Summary, opts: RenderOpts = { color: fals
 }
 
 export function renderLive(live: Live, state: TranscriptState, opts: RenderOpts, max = LIVE_LINES): string[] {
+  const strip = `  ${fit(decisionStrip(state), opts, 2)}`;
+  if (live.card.status === 'awaiting') return [...renderItem(live.card, { color: opts.color }), strip];
+  if (max === 0) return [strip];
   const card: ToolItem = { ...live.card, target: live.path ?? live.card.target };
+  if (live.card.status === 'running') {
+    const out = live.output === '' ? [] : live.output.replace(/\n$/, '').split('\n').slice(-Math.min(max, OUTPUT_LINES));
+    return [header(card, opts), ...out.map(line => bar(fit(line, opts, 4), opts)), strip];
+  }
   const all = live.source === undefined ? [] : live.source.replace(/\n$/, '').split('\n');
-  const tail = max > 0 ? all.slice(-max) : [];
-  return [header(card, opts), ...numbered(tail, all.length - tail.length + 1, opts), ...(live.search ? [`  ${fit(`search · ${live.search}`, opts, 2)}`] : []), `  ${fit(decisionStrip(state), opts, 2)}`];
+  const tail = all.slice(-max);
+  return [header(card, opts), ...numbered(tail, all.length - tail.length + 1, opts), ...(live.search ? [`  ${fit(`search · ${live.search}`, opts, 2)}`] : []), strip];
 }
 
 export const renderStep = (live: Live, search = false): string =>
