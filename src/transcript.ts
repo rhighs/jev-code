@@ -171,7 +171,7 @@ function reduceSession(state: TranscriptState, event: SessionEvent): TranscriptS
   }
 }
 
-export const traceItem = (state: TranscriptState): TranscriptState => ({ ...state, items: [...state.items, { kind: 'trace', decisions: [...state.decisions] }] });
+export const traceItem = (state: TranscriptState, n = RING): TranscriptState => ({ ...state, items: [...state.items, { kind: 'trace', decisions: state.decisions.slice(-n) }] });
 
 const pct = (val: number): string => `${Math.round(val * 100)}%`;
 export function decisionStrip(state: TranscriptState): string {

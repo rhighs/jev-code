@@ -64,10 +64,10 @@ export function renderSummary(summary: Summary, opts: RenderOpts = { color: fals
     dim(fit(budget.join(' · '), opts), opts)];
 }
 
-export function renderLive(live: Live, state: TranscriptState, opts: RenderOpts): string[] {
+export function renderLive(live: Live, state: TranscriptState, opts: RenderOpts, max = LIVE_LINES): string[] {
   const card: ToolItem = { ...live.card, target: live.path ?? live.card.target };
   const all = live.source === undefined ? [] : live.source.replace(/\n$/, '').split('\n');
-  const tail = all.slice(-LIVE_LINES);
+  const tail = max > 0 ? all.slice(-max) : [];
   return [header(card, opts), ...numbered(tail, all.length - tail.length + 1, opts), ...(live.search ? [`  ${fit(`search · ${live.search}`, opts, 2)}`] : []), `  ${fit(decisionStrip(state), opts, 2)}`];
 }
 
