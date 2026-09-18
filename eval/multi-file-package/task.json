@@ -1,5 +1,10 @@
 {
   "stage": "baseline",
-  "limits": { "maxTurns": 60, "maxRequests": 4000, "maxGenerationSteps": 2000, "maxRunMs": 1500000 },
-  "prompt": "Create a small Python project with two parts: a package holding a module with one function that takes a name and returns the greeting text 'Hello, <name>!', and an entry script at the project root that imports that function from the package and prints the greeting for the name World. Choose the package, module and file names yourself. Run the entry script with python3 to verify it prints Hello, World!"
+  "limits": {
+    "maxTurns": 60,
+    "maxRequests": 4000,
+    "maxGenerationSteps": 2000,
+    "maxRunMs": 1500000
+  },
+  "prompt": "Create a small Python project with two parts: a package holding a module with one function that takes a name and returns a greeting string made of 'Hello, ' followed by the name and then '!', and an entry script at the project root that imports that function from the package and prints the greeting for the name World. Choose the package, module and file names yourself. Run the entry script with python3 to verify it prints Hello, World!"
 }
