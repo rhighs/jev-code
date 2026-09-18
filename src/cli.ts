@@ -13,6 +13,7 @@ import { TerminalSession } from './terminal.js';
 import { GenerationDisplay } from './draft.js';
 import { formatDuration } from './timing.js';
 import { AstRegistry, loadInstalledAsts, loadAstModule, installAstModule, removeAstAdapter } from './ast-adapters.js';
+import { runEval } from './eval.js';
 import type { HarnessOptions } from './harness.js';
 import type { HarnessEvent, Tool } from './types.js';
 
@@ -39,6 +40,8 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
   ast install <module>    Install local/npm AST adapters in this workspace
   ast list               List available AST adapters
   ast remove <id>         Remove an installed adapter
+  eval [task]             Run the live eval ladder (dev-only, implies --yes)
+  --eval-out <dir>        Directory for .jev/eval records (default: current directory)
   --json                  Emit JSONL events on stdout
   --no-journal            Disable .jev/runs JSONL persistence
   --demo                  Offline scripted demo with real file and Bash tools
@@ -68,6 +71,7 @@ async function main(): Promise<void> {
     'max-turns': { type: 'string' }, 'max-requests': { type: 'string' }, 'max-steps': { type: 'string' },
     'timeout-ms': { type: 'string' }, 'grid-batch-size': { type: 'string' }, 'grid-concurrency': { type: 'string' }, tools: { type: 'string' }, json: { type: 'boolean' },
     'experimental-grid': { type: 'boolean' }, asts: { type: 'string', multiple: true }, 'no-journal': { type: 'boolean' }, demo: { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
+    'eval-out': { type: 'string' },
   } });
   if (values.help) { process.stdout.write(HELP); return; }
   const workspace = resolve(values.workspace ?? '.');
@@ -77,6 +81,16 @@ async function main(): Promise<void> {
     if (command === 'install') process.stdout.write(`Installed AST adapters: ${(await installAstModule(workspace, target!)).join(', ')}\n`);
     else if (command === 'remove') { await removeAstAdapter(workspace, target!); process.stdout.write(`Removed AST adapter: ${target}\n`); }
     else for (const adapter of new AstRegistry(await loadInstalledAsts(workspace)).list()) process.stdout.write(`${adapter.id}\t${adapter.extensions.join(', ')}\t${adapter.id === 'python' ? 'built-in' : 'installed'}\n`);
+    return;
+  }
+  if (positionals[0] === 'eval') {
+    const [, only, ...extra] = positionals;
+    if (extra.length) throw new Error('Use eval [task].');
+    if (!process.env.TYPESAFE_API_KEY) throw new Error('eval needs TYPESAFE_API_KEY for live Jev runs.');
+    process.stderr.write('eval runs unattended: agent Bash executes on this host without confirmation.\n');
+    const records = await runEval({ provider: new JevProvider(), out: resolve(values['eval-out'] ?? '.'), ...(only === undefined ? {} : { only }),
+      onRecord: r => process.stdout.write(`${r.task}\t${r.check.ok ? 'pass' : 'fail'}\t${r.status}\t${r.turns} turns\t${r.requests} requests\t${formatDuration(r.durationMs)}\t${r.check.reason}\n`) });
+    process.exitCode = records.every(r => r.check.ok) ? 0 : 1;
     return;
   }
   let streamed = false;

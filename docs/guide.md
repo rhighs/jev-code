@@ -185,4 +185,16 @@ Live validation on September 17, 2026 used Jev through the official SDK with the
 
 After removing default grids and generated finish prose, a live “write a for loop in Python and run it” task generated `for i in range(5): print(i)`, printed 0 through 4, and completed in 3 turns, 22 requests, and 9.6 seconds. Generic one-argument range bounds exclude zero; explicitly requested empty or negative ranges remain valid. A more complex number-guessing-game trial exhausted 256 requests without producing a complete AST or writing a file. Complex generation still needs better model guidance and broader grammar coverage; passing syntax checks alone does not establish correctness.
 
+## Eval
+
+```bash
+npm run dev -- eval
+npm run dev -- eval guessing-game
+npm run dev -- eval --eval-out /path/to/records
+```
+
+`eval` runs a fixed ladder of tasks against live Jev: `guessing-game`, `file-io-script`, and `multi-file-package`, each defined in `eval/<task>/task.json` with a prompt, a `stage` tag, and optional limit overrides, plus a `check.ts` that judges the resulting workspace deterministically. The guessing-game checker plays the game adaptively from the program's own feedback lines, so no seed is needed. Every task runs in a fresh temporary workspace that is deleted afterwards; its journal lives inside that workspace. One record per task is written to `.jev/eval/<timestamp>.json` under the current directory or `--eval-out`, with pass or fail, reason, status, turns, requests, input tokens, duration, run id, and the git commit, so two runs can be compared.
+
+`eval` is a development command: task checkers live outside the compiled `src/` tree, so run it with `npm run dev`, not the installed binary. It implies `--yes`: agent Bash executes on this host without confirmation, and checkers execute the generated programs. Run it inside a container or VM when you want isolation. Programs spawned by checkers do not receive `TYPESAFE_API_KEY`. Eval never runs in CI.
+
 API integration follows the [official TypeScript SDK](https://github.com/typesafe-ai/typesafe-sdk-js) and its [typed question builders](https://github.com/typesafe-ai/typesafe-sdk-js/blob/main/src/questions.ts).

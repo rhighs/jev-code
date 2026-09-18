@@ -1,0 +1,5 @@
+{
+  "stage": "baseline",
+  "limits": { "maxTurns": 50, "maxRequests": 3000, "maxGenerationSteps": 1500, "maxRunMs": 1200000 },
+  "prompt": "Write a Python script main.py with two functions. The first function writes the whole numbers 1 to 5 to a file named numbers.txt, one number per line. The second function reads numbers.txt back, converts each line to an int, and returns their sum. The script calls the first function, then prints the result of the second function. Run it with python3 main.py to verify it prints 15."
+}

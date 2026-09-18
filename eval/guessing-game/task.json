@@ -1,0 +1,6 @@
+{
+  "stage": "baseline",
+  "range": { "min": 1, "max": 100 },
+  "limits": { "maxTurns": 50, "maxRequests": 2000, "maxGenerationSteps": 1000, "maxRunMs": 900000 },
+  "prompt": "Write a number-guessing game in Python and save it as main.py. The program picks a random whole number from 1 to 100 using the random module, then repeatedly reads a guess from input() and prints exactly one feedback line per guess: 'Too high' when the guess is above the number, 'Too low' when the guess is below it, and 'Correct' when it matches, then the program ends. Print no other lines. Verify it compiles with python3 -m py_compile main.py."
+}
