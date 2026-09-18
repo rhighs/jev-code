@@ -1,3 +1,4 @@
+import { formatSearchOutcome } from './grid.js';
 import { stripVTControlCharacters } from 'node:util';
 import { highlightCode, paint } from './terminal-style.js';
 import type { HarnessEvent, TextEventData } from './types.js';
@@ -39,8 +40,7 @@ export class GenerationDisplay {
       output += `\nDraft · ${this.action}.${event.data.field} · ${event.data.decoder}\n`;
     }
     if (event.data.decoder === 'search' && event.data.ast) {
-      const { unit, candidate, kept, reason } = event.data.ast;
-      return output + `\nSearch · ${unit ?? event.data.field} · candidate ${candidate} · ${kept ? 'kept' : `dropped (${reason ?? 'scored lower'})`}\n`;
+      return output + `\nSearch · ${formatSearchOutcome(event.data.field, event.data.ast)}\n`;
     }
     if (event.data.field === 'path' && event.data.change && 'replace' in event.data.change) this.path = event.data.change.replace;
     this.current = draft;

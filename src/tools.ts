@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { listWorkspace } from './workspace.js';
-import { manifestPath, parseManifest, validatePythonProject } from './python-ast.js';
+import { sanitizedEnv } from './env.js';
+import { parseManifest, validatePythonProject } from './python-ast.js';
 import type { Tool, ToolContext, ToolResult } from './types.js';
 import { StringDecoder } from 'node:string_decoder';
 
@@ -46,12 +47,12 @@ export async function atomicWrite(path: string, contents: string, signal: AbortS
 
 /** Every file is staged before any is renamed into place, so a failure leaves the tree untouched. */
 export async function atomicWriteAll(entries: Array<[string, string]>, signal: AbortSignal): Promise<void> {
-  const staged: Staged[] = [];
+  const pending: Staged[] = [];
   try {
-    for (const [path, contents] of entries) staged.push(await stage(path, contents, signal));
-    for (const item of staged) await item.commit();
+    for (const [path, contents] of entries) pending.push(await stage(path, contents, signal));
+    while (pending.length) { await pending[0]!.commit(); pending.shift(); }
   } finally {
-    for (const item of staged) await item.discard();
+    for (const item of pending) await item.discard();
   }
 }
 
@@ -64,10 +65,8 @@ export async function runBash(command: string, cwd: string, timeoutMs: number, s
   if (!(await stat(cwd)).isDirectory()) throw new Error('Bash cwd must be a directory.');
   return new Promise((resolve, reject) => {
     // The workspace is a starting directory, not an OS sandbox.
-    const env = { ...process.env };
-    delete env.TYPESAFE_API_KEY;
     const child = spawn('bash', ['-c', command], {
-      cwd, env, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'],
+      cwd, env: sanitizedEnv(), detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'],
     });
     const stdoutChunks: Buffer[] = [], stderrChunks: Buffer[] = [];
     let stdoutRetained = 0, stderrRetained = 0;
@@ -188,10 +187,7 @@ export function builtInTools(): Tool[] {
       async execute(args, context) {
         const files = parseManifest(text(args, 'files'));
         const targets: Array<[string, string]> = [];
-        for (const [path, content] of Object.entries(files)) {
-          if (!manifestPath.test(path)) throw new Error(`Invalid manifest path: ${path}`);
-          targets.push([await context.resolvePath(path), content]);
-        }
+        for (const [path, content] of Object.entries(files)) targets.push([await context.resolvePath(path), content]);
         await validatePythonProject(files, context.signal);
         await atomicWriteAll(targets, context.signal);
         const paths = Object.keys(files);

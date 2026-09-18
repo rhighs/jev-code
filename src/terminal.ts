@@ -1,3 +1,4 @@
+import { formatSearchOutcome } from './grid.js';
 import { createInterface, clearScreenDown, cursorTo, moveCursor, type Interface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 import { stripVTControlCharacters } from 'node:util';
@@ -212,8 +213,7 @@ export class TerminalSession {
         this.activity = `turn ${event.turn} · generating ${event.data.field} · ${event.data.bytes} B`;
         if (!this.tty) this.options.output.write(text);
         else if (event.data.decoder === 'search' && event.data.ast) {
-          const { unit, candidate, kept, reason } = event.data.ast;
-          this.print(`  search · ${unit ?? event.data.field} · candidate ${candidate} · ${kept ? 'kept' : `dropped (${reason ?? 'scored lower'})`}`);
+          this.print(`  search · ${formatSearchOutcome(event.data.field, event.data.ast)}`);
         }
         if (event.data.done) this.finishDraft();
         else if (this.tty && !this.previewTimer) {

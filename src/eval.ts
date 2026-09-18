@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { sanitizedEnv } from './env.js';
 import { DEFAULT_LIMITS, Harness } from './harness.js';
 import { formatDuration } from './timing.js';
 import { builtInTools } from './tools.js';
@@ -51,10 +52,8 @@ export async function loadTasks(tasksDir: string, only?: string): Promise<EvalTa
 }
 
 export function runPython(workspace: string, args: string[], opts: RunPythonOptions): Promise<RunPythonResult> {
-  const env = { ...process.env };
-  delete env.TYPESAFE_API_KEY;
   return new Promise(res => {
-    const child = spawn('python3', ['-u', ...args], { cwd: workspace, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn('python3', ['-u', ...args], { cwd: workspace, env: sanitizedEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '', stderr = '', timedOut = false;
     const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, opts.timeoutMs);
     const write = (text: string): void => { if (!child.stdin.destroyed) child.stdin.write(text); };

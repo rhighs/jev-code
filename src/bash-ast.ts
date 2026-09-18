@@ -3,6 +3,7 @@ import type { Decisions, State } from './decisions.js';
 import type { GenerateOptions } from './generation.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
 import { gridCursor } from './grid.js';
+import { sanitizedEnv } from './env.js';
 import { LimitError } from './types.js';
 import { choice } from '@typesafe-ai/sdk';
 
@@ -21,9 +22,8 @@ export function renderBashAst(tree: BashAst): string {
 }
 export async function validateBashSource(source: string, signal: AbortSignal): Promise<void> {
   signal.throwIfAborted();
-  const env = { ...process.env }; delete env.TYPESAFE_API_KEY;
   await new Promise<void>((resolve, reject) => {
-    const child = spawn('bash', ['-n', '-c', source], { signal, timeout: 5000, env, stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawn('bash', ['-n', '-c', source], { signal, timeout: 5000, env: sanitizedEnv(), stdio: ['ignore', 'ignore', 'pipe'] });
     let error = '';
     child.stderr.on('data', chunk => { error = (error + String(chunk)).slice(-4000); });
     child.on('error', reject);

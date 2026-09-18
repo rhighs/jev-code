@@ -9,6 +9,7 @@ import { RUBRIC, wantsReturn } from './python-search.js';
 import { gridCursor } from './grid.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
 import { buildDecisionContext, PENDING, windowSource } from './decision-context.js';
+import { sanitizedEnv } from './env.js';
 import { LimitError } from './types.js';
 import { choice } from '@typesafe-ai/sdk';
 
@@ -57,10 +58,8 @@ print(json.dumps(source))
 
 async function runPythonJson(input: unknown, signal: AbortSignal, maxBytes: number, script: string, cwd?: string): Promise<string> {
   signal.throwIfAborted();
-  const env = { ...process.env };
-  delete env.TYPESAFE_API_KEY;
   return new Promise((resolve, reject) => {
-    const child = spawn('python3', ['-I', '-c', script], { env, stdio: ['pipe', 'pipe', 'pipe'], signal, timeout: 10_000, ...(cwd === undefined ? {} : { cwd }) });
+    const child = spawn('python3', ['-I', '-c', script], { env: sanitizedEnv(), stdio: ['pipe', 'pipe', 'pipe'], signal, timeout: 10_000, ...(cwd === undefined ? {} : { cwd }) });
     const output: Buffer[] = [];
     let outputBytes = 0, error = '', failed = false;
     const fail = (reason: unknown): void => { if (failed) return; failed = true; child.kill('SIGKILL'); reject(reason); };
@@ -256,7 +255,9 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
     if (!keys.length) throw new Error(`No valid Python AST production for ${slot}.`);
     const preview = await render();
     const instruction = `Choose the next valid Python AST production for ${slot}. The rendered source marks the slot being filled with ${PENDING}. Satisfy the objective with the smallest sufficient program. Complete the current slot only; do not add unrequested behavior.`;
-    const core = { field, phase: 'ast', slot, ...(unit === undefined ? {} : { unit }), ...(candidate === undefined ? {} : { candidate }), ...(peers === undefined || !peers.length ? {} : { peers: peers.map(peer => ({ ...peer })) }), symbols: visible(scope), symbolTable: symbolTable(scope),
+    const symbols = visible(scope);
+    const questions = { selection: choice(instruction, criteria) };
+    const core = { field, phase: 'ast', slot, ...(unit === undefined ? {} : { unit }), ...(candidate === undefined ? {} : { candidate }), ...(peers === undefined || !peers.length ? {} : { peers: peers.map(peer => ({ ...peer })) }), symbols, symbolTable: symbolTable(scope),
       constraints: { depth, maxDepth, inFunction: scope.function, inLoop: scope.loop, remainingSteps: options.maxSteps - budget.step } };
     const assembleState = (values: Record<string, unknown>): State => ({
       task: values.task, ...(values.recent === undefined ? {} : { recent: values.recent }), ...(values.plan === undefined ? {} : { plan: values.plan }),
@@ -268,10 +269,10 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
       { key: 'source', value: preview, shrink: windowSource },
       { key: 'recent', value: context.recent ?? [] },
       ...(typeof context.plan === 'string' && context.plan ? [{ key: 'plan', value: context.plan }] : []),
-    ], parts => Buffer.byteLength(JSON.stringify({ state: assembleState(parts), questions: { selection: choice(instruction, criteria) } })), MAX_GRID_REQUEST_BYTES);
+    ], parts => Buffer.byteLength(JSON.stringify({ state: assembleState(parts), questions })), MAX_GRID_REQUEST_BYTES);
     const state = assembleState(trimmed.length ? { ...values, trimmed } : values);
     const selected = keys.length === 1 ? keys[0]! : await decisions.choose(state, instruction, criteria);
-    await report(preview, { slot, production: selected, symbols: visible(scope) });
+    await report(preview, { slot, production: selected, symbols });
     return selected;
   }
 
@@ -305,7 +306,8 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
   }
 
   async function expression(target: PythonNode, scope: Scope, depth: number, slot = 'expression', numberConstraint?: 'positive' | 'nonzero'): Promise<void> {
-    const namesForValue = visible(scope).filter(id => !['builtin', 'function'].includes(symbolTable(scope)[id]!.kind));
+    const table = symbolTable(scope);
+    const namesForValue = visible(scope).filter(id => !['builtin', 'function'].includes(table[id]!.kind));
     const criteria: Record<string, string> = { string: 'A literal string.', number: 'A numeric literal.', boolean: 'True, False or None.' };
     if (namesForValue.length) criteria.name = 'Reference an already defined variable, parameter or module.';
     if (depth < maxDepth) Object.assign(criteria, { call: 'Call a function, such as print, with arguments.', binary: 'Combine two expressions with arithmetic.', compare: 'Compare two expressions.', list: 'A list of expressions.', attribute: 'Read an attribute from a defined object.', subscript: 'Index a defined object.' });
@@ -339,9 +341,10 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
       } else {
         const id = names[Number(selected.slice(5))]!;
         Object.assign(func, name(id));
-        arity = symbolTable(scope)[id]?.arity;
+        const symbol = table[id];
+        arity = symbol?.arity;
         if (arity !== undefined) counts = [arity];
-        else if (symbolTable(scope)[id]?.kind === 'builtin' && builtinArity[id]) counts = builtinArity[id]!;
+        else if (symbol?.kind === 'builtin' && builtinArity[id]) counts = builtinArity[id]!;
       }
       const count = Number(await pick('argument_count', scope, Object.fromEntries(counts.map(value => [String(value), `${value} positional arguments.`]))));
       for (let i = 0; i < count; i++) {
@@ -455,7 +458,7 @@ async function generate(decisions: Decisions, state: State, field: string, optio
     await fillUnits(units, decisions, (unit, fork, candidate, body) => createBuilder(shared, {
       decisions: fork, unit: unit.name, peers: peersOf(unit, peers), ...(candidate === undefined ? {} : { candidate }),
       render: () => previewOf(node('Module', { body: [defOf(unit, body)], type_ignores: [] })),
-      report: async (_preview, info) => emit(await assembled(), info, unit.name),
+      report: options.onText ? async (_preview, info) => emit(await assembled(), info, unit.name) : async () => {},
     }), parentFor, width > 1 ? {
       width,
       render: (unit, body) => unparsePython(node('Module', { body: [defOf(unit, body)], type_ignores: [] }), decisions.signal, options.maxBytes),

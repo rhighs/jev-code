@@ -1,5 +1,5 @@
 import type { Decisions } from './decisions.js';
-import type { Builder, PythonNode, Scope, Vocab } from './python-ast.js';
+import { functionDef, node, type Builder, type PythonNode, type Scope, type Vocab } from './python-ast.js';
 import { searchUnit, type SearchHooks } from './python-search.js';
 
 export interface Peer { name: string; arity: number; purpose: string; module?: string }
@@ -7,9 +7,6 @@ export interface Unit extends Peer { params: string[]; def: PythonNode; body: Py
 export interface Layout { pkg: string; modules: string[] }
 
 export const ENTRY = 'main';
-const node = (_type: string, fields: Record<string, unknown> = {}): PythonNode => ({ _type, ...fields });
-const functionDef = (id: string, params: string[], body: PythonNode[]): PythonNode =>
-  node('FunctionDef', { name: id, args: node('arguments', { posonlyargs: [], args: params.map(p => node('arg', { arg: p, annotation: null, type_comment: null })), vararg: null, kwonlyargs: [], kw_defaults: [], kwarg: null, defaults: [] }), body, decorator_list: [], returns: null, type_comment: null, type_params: [] });
 const importFrom = (module: string, id: string): PythonNode => node('ImportFrom', { module, names: [node('alias', { name: id, asname: null })], level: 0 });
 const isImport = (stmt: PythonNode): boolean => stmt._type === 'Import' || stmt._type === 'ImportFrom';
 
@@ -34,7 +31,7 @@ export async function decompose(root: Builder, scope: Scope, vocab: Vocab, peers
     const params: string[] = [];
     for (let j = 0; j < arity; j++) { const p = await root.identifier(`unit_${i}_parameter_${j}`, unitScope, params); params.push(p); unitScope.names.set(p, { kind: 'parameter' }); }
     const body: PythonNode[] = [];
-    const unit: Unit = { name, arity, purpose, params, def: functionDef(name, params, body), body };
+    const unit: Unit = { name, arity, purpose, params, def: functionDef(name, params.map(p => node('arg', { arg: p, annotation: null, type_comment: null })), body), body };
     if (layout) {
       const criteria: Record<string, string> = { [ENTRY]: `The entry script ${ENTRY}.py.` };
       layout.modules.forEach((m, k) => { criteria[`module_${k}`] = `Package module ${layout.pkg}/${m}.py.`; });

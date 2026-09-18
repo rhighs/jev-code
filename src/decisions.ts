@@ -42,6 +42,10 @@ export class Decisions {
     if (next) next(); else this.counters.inflight--;
   }
 
+  private assertConfidence(value: unknown): void {
+    if (!Number.isFinite(value) || (value as number) < 0 || (value as number) > 1) throw new DecisionError('Jev returned invalid confidence.');
+  }
+
   assertRequestBudget(count: number): void {
     if (this.requests + count > this.maxRequests) throw new LimitError(`Request budget exhausted (${this.maxRequests}).`);
   }
@@ -83,9 +87,7 @@ export class Decisions {
         throw new DecisionError('Jev returned an invalid choice distribution.');
       }
     }
-    if (!Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1) {
-      throw new DecisionError('Jev returned invalid confidence.');
-    }
+    this.assertConfidence(answer.confidence);
     await this.onDecision({ choice: answer.choice, confidence: answer.confidence, model: response.model });
     return answer.choice;
   }
@@ -109,7 +111,7 @@ export class Decisions {
     const probabilities = levels.map((_, i) => answer.probabilities![String(i)] ?? 0);
     if (probabilities.some(p => !Number.isFinite(p) || p < 0 || p > 1)) throw new DecisionError('Jev returned an invalid score distribution.');
     if (!Number.isFinite(answer.score) || answer.score! < 0 || answer.score! > levels.length - 1) throw new DecisionError('Jev returned an invalid score.');
-    if (!Number.isFinite(answer.confidence) || answer.confidence! < 0 || answer.confidence! > 1) throw new DecisionError('Jev returned invalid confidence.');
+    this.assertConfidence(answer.confidence);
     const expected = probabilities.reduce((sum, p, i) => sum + p * i, 0);
     await this.onDecision({ choice: String(Math.round(expected)), confidence: answer.confidence!, model: response.model });
     return { expected, probabilities };

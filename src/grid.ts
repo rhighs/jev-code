@@ -1,5 +1,7 @@
 export interface GridCursor { row: number; column: number; offset: number }
 export interface GridProgress { rows: number; columns: number; round: number; completed: number; total: number }
+export const formatSearchOutcome = (field: string, ast: NonNullable<TextProgress['ast']>): string =>
+  `${ast.unit ?? field} · candidate ${ast.candidate} · ${ast.kept ? 'kept' : `dropped (${ast.reason ?? 'scored lower'})`}`;
 export interface TextProgress { decoder: 'grid' | 'ast' | 'choice' | 'search'; step: number; cursor: GridCursor; grid?: GridProgress; bytes?: number; ast?: { production: string; slot: string; symbols: string[]; unit?: string; candidate?: number; kept?: boolean; reason?: string } }
 export interface ScoredCell { index: number; row: number; column: number; score: number; value: string; probabilities: Record<string, number> }
 export type TextChange = { replace: string } | { grid: GridProgress & { cells: ScoredCell[] } };
