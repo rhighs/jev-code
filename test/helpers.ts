@@ -1,6 +1,63 @@
 import assert from 'node:assert/strict';
-import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
+import type { EntryType, Question, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import type { DecisionProvider } from '../src/types.js';
+
+export type SlotAnswer = string | { value: string } | { score: number } | { noul: number };
+export interface SlotEntry { phase?: string; slot?: string | RegExp; unit?: string; answer: SlotAnswer; once?: boolean }
+interface SlotState { generation?: { phase?: string; slot?: string; unit?: string } }
+
+const full = (labels: string[], hit: string | number): Record<string, number> => Object.fromEntries(labels.map(label => [label, String(label) === String(hit) ? 1 : 0]));
+
+export class SlotProvider implements DecisionProvider {
+  states: SlotState[] = [];
+  calls = 0;
+  private readonly used = new Set<SlotEntry>();
+  constructor(private readonly script: SlotEntry[]) {}
+
+  private match(state: SlotState, key: string): SlotEntry | undefined {
+    const gen = state.generation;
+    const slot = gen?.slot ?? key;
+    return this.script.find(entry => !this.used.has(entry) &&
+      (entry.phase === undefined || entry.phase === gen?.phase) &&
+      (entry.unit === undefined || entry.unit === gen?.unit) &&
+      (entry.slot === undefined || (typeof entry.slot === 'string' ? entry.slot === slot : entry.slot.test(slot))));
+  }
+
+  private answer(entry: SlotEntry | undefined, question: Question, where: string): unknown {
+    const answer = entry?.answer;
+    if (question.type === 'noul') return { type: 'noul', noul: typeof answer === 'object' && 'noul' in answer ? answer.noul : 1 };
+    if (!entry) throw new Error(`SlotProvider: no entry for ${where}`);
+    if (question.type === 'score') {
+      if (typeof answer !== 'object' || !('score' in answer)) throw new Error(`SlotProvider: ${where} needs a score answer`);
+      const levels = question.criteria.map((_, i) => String(i));
+      if (!levels.includes(String(answer.score))) throw new Error(`SlotProvider: ${where} score ${answer.score} outside rubric`);
+      return { type: 'score', score: answer.score, confidence: 1, probabilities: full(levels, answer.score), legend: Object.fromEntries(question.criteria.map((desc, i) => [String(i), desc])) };
+    }
+    const labels = Object.keys(question.criteria);
+    let selected: string | undefined;
+    if (typeof answer === 'string') selected = answer;
+    else if (typeof answer === 'object' && 'value' in answer) {
+      const { value } = answer;
+      selected = labels.find(label => question.criteria[label] === JSON.stringify(value) || question.criteria[label] === value);
+    }
+    if (selected === undefined || !labels.includes(selected)) throw new Error(`SlotProvider: ${where} answer ${JSON.stringify(answer)} not in criteria [${labels.join(', ')}]`);
+    return { type: 'choice', choice: selected, confidence: 1, probabilities: full(labels, selected) };
+  }
+
+  async decide<Q extends Questions>(input: EntryType, questions: Q, _signal?: AbortSignal): Promise<SystemOneResult<Q>> {
+    const state = (input ?? {}) as SlotState;
+    this.states.push(structuredClone(state));
+    this.calls++;
+    const answers: Record<string, unknown> = {};
+    for (const [key, question] of Object.entries(questions)) {
+      const entry = this.match(state, key);
+      const where = `phase=${state.generation?.phase ?? 'none'} slot=${state.generation?.slot ?? key}${state.generation?.unit ? ` unit=${state.generation.unit}` : ''}`;
+      answers[key] = this.answer(entry, question, where);
+      if (entry?.once) this.used.add(entry);
+    }
+    return { model: 'slot-provider', usage: { input_tokens: 1, output_tokens: 0 }, answers } as unknown as SystemOneResult<Q>;
+  }
+}
 
 export interface Step { action: string; args?: Record<string, string>; verdict?: number; allowInvalidSyntax?: boolean }
 export interface TestState {
