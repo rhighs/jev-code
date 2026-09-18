@@ -1,5 +1,4 @@
 export { Harness, type HarnessOptions } from './harness.js';
-export { TerminalSession, type TerminalOptions } from './terminal.js';
 export { JevProvider } from './provider.js';
 export { builtInTools, runBash, atomicWrite } from './tools.js';
 export { resolveWorkspacePath } from './workspace.js';

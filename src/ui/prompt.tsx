@@ -26,7 +26,7 @@ export function Prompt({ session, snap, frame }: { session: Session; snap: Snaps
   return (
     <Box>
       <Text>{paint(label, snap.running ? 36 : 1, snap.color)}</Text>
-      <TextInput value={value} onChange={setValue} onSubmit={submit} showCursor={snap.color} />
+      <TextInput value={value} onChange={setValue} onSubmit={submit} showCursor={snap.color} focus={!snap.awaiting} />
     </Box>
   );
 }

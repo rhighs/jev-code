@@ -5,13 +5,11 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
-import { promisify, stripVTControlCharacters } from 'node:util';
-import { render } from 'ink-testing-library';
-import type { HarnessOptions } from '../src/harness.js';
+import { promisify } from 'node:util';
+import { isInteractiveTTY } from '../src/terminal-style.js';
 import type { DecisionProvider, HarnessEvent, HarnessEventData } from '../src/types.js';
-import { App } from '../src/ui/app.js';
-import { createSession, isInteractiveTTY, type SessionOptions } from '../src/ui/session.js';
 import { ScriptedProvider } from './helpers.js';
+import { lines, setup } from './ui-helpers.js';
 
 const exec = promisify(execFile);
 const root = resolve(import.meta.dirname, '..');
@@ -38,28 +36,6 @@ const stall = (base: DecisionProvider): DecisionProvider => ({
   },
 });
 
-async function setup(t: test.TestContext, provider: DecisionProvider, extra: Partial<SessionOptions> = {}, harness: Partial<HarnessOptions> = {}) {
-  const workspace = await mkdtemp(join(tmpdir(), 'jev-ui-'));
-  const session = createSession({ harness: { experimentalGrid: true, workspace, provider, journalDirectory: false, ...harness }, model: 'test-jev', yes: true, tty: true, ...extra });
-  const ui = render(<App session={session} />);
-  await new Promise(resolve => setTimeout(resolve, 10));
-  t.after(async () => { session.close(0); await session.closed; ui.unmount(); await rm(workspace, { recursive: true, force: true }); });
-  const frame = (): string => stripVTControlCharacters(ui.lastFrame() ?? '');
-  const wait = (re: RegExp): Promise<string> => new Promise((done, fail) => {
-    const started = Date.now();
-    const check = (): void => {
-      if (re.test(frame())) return done(frame());
-      if (Date.now() - started > 4000) return fail(new Error(`Missing ${re} in frame:\n${frame()}`));
-      setTimeout(check, 10);
-    };
-    check();
-  });
-  const tick = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 5));
-  const type = async (line: string): Promise<void> => { ui.stdin.write(line); await tick(); ui.stdin.write('\r'); await tick(); };
-  return { session, ui, workspace, frame, wait, type };
-}
-
-const lines = (frame: string): string[] => frame.trimEnd().split('\n');
 
 test('a scripted run renders one row per completed item in order and ends with the status line and prompt', async t => {
   const provider = new ScriptedProvider([
@@ -197,6 +173,42 @@ test('session commands answer without a model request and /trace lists decisions
   await wait(/1\. \[completed\] Create hello\.txt\./);
   assert.equal(provider.states.length, requests);
   assert.equal(frame().includes('/trace 2\n'), false);
+});
+
+const decide = (i: number, slot = `slot${i}`): HarnessEvent =>
+  ev('decision', { model: 'm', choice: `win${i}`, confidence: 0.9, options: [{ label: `win${i}`, probability: 0.41 }, { label: `alt${i}`, probability: 0.39 }, { label: 'other', probability: 0.2 }], field: 'content', phase: 'ast', slot });
+
+test('/trace lists the last decisions with winner, probability and alternatives; /trace 1 keeps only the latest (AE2)', async t => {
+  const { session, type, wait, frame } = await setup(t, new ScriptedProvider([]));
+  await type('/trace');
+  await wait(/^trace · no decisions$/m);
+  for (const e of [generating()[0]!, decide(1), decide(2), decide(3)]) session.onEvent(e);
+  await type('/trace');
+  const three = await wait(/trace · 3 decisions/);
+  const rows = lines(three).slice(lines(three).indexOf('trace · 3 decisions') + 1, lines(three).indexOf('trace · 3 decisions') + 4);
+  assert.deepEqual(rows, [1, 2, 3].map(i => `  slot${i} → win${i} · 41% · low confidence · alt alt${i} 39%, other 20%`));
+  await type('/trace 1');
+  const one = await wait(/trace · 1 decision$/m);
+  const after = lines(one).slice(lines(one).lastIndexOf('trace · 1 decision') + 1);
+  assert.equal(after[0], '  slot3 → win3 · 41% · low confidence · alt alt3 39%, other 20%');
+  assert.equal(after[1]?.includes('slot2'), false);
+  assert.equal(frame().includes('› /trace'), false);
+});
+
+test('/trace defaults to 10 decisions and never lists more than 20', async t => {
+  const { session, type, wait } = await setup(t, new ScriptedProvider([]));
+  session.onEvent(generating()[0]!);
+  for (let i = 1; i <= 22; i++) session.onEvent(decide(i));
+  await type('/trace');
+  const ten = await wait(/trace · 10 decisions/);
+  assert.match(ten, /slot13 → win13/);
+  assert.equal(ten.includes('slot12 →'), false);
+  await type('/trace 99');
+  const twenty = await wait(/trace · 20 decisions/);
+  assert.match(twenty, /slot3 → win3/);
+  assert.equal(twenty.includes('slot2 →'), false);
+  await type('/trace 0');
+  await wait(/Use \/trace \[n\]\./);
 });
 
 test('/paste submits one task with exact newlines and Tab completes commands', async t => {

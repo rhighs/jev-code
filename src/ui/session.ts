@@ -3,11 +3,11 @@ import { stripVTControlCharacters } from 'node:util';
 import { createElement } from 'react';
 import { render } from 'ink';
 import { DEFAULT_LIMITS, Harness, type HarnessOptions } from '../harness.js';
-import { highlightCode, terminalColor } from '../terminal-style.js';
+import { highlightCode, isInteractiveTTY, terminalColor } from '../terminal-style.js';
 import { formatDuration } from '../timing.js';
 import { runBash } from '../tools.js';
-import { RING, initialState, reduce, traceItem, type Item, type SessionEvent, type TranscriptState } from '../transcript.js';
-import type { HarnessEvent, RunResult, RunStatus, ToolRecord } from '../types.js';
+import { initialState, reduce, traceItem, type Item, type SessionEvent, type TranscriptState } from '../transcript.js';
+import type { HarnessEvent, RunResult, RunStatus, Tool, ToolRecord } from '../types.js';
 import { resolveWorkspacePath } from '../workspace.js';
 import { App } from './app.js';
 
@@ -28,8 +28,8 @@ const HELP = `Type a task or a follow-up. During a run, new text updates the tas
   !<bash command>        Run your command directly and share its result with Jev
 Ctrl-C cancels current work; at an empty idle prompt it exits. Tab completes commands.`;
 
-type Tty = { isTTY?: boolean | undefined };
-export const isInteractiveTTY = (stdin: Tty, out: Tty): boolean => Boolean(stdin.isTTY && out.isTTY);
+export const TRACE_DEFAULT = 10, TRACE_MAX = 20;
+export const APPROVAL_KEYS = 'y allow · n deny · a always';
 
 export interface SessionOptions {
   harness: Omit<HarnessOptions, 'onEvent' | 'authorize'>;
@@ -45,12 +45,13 @@ export type Tone = 0 | 32 | 33;
 export type Row = { id: number; item: Item } | { id: number; note: string; tone: Tone };
 export interface Snapshot {
   rows: Row[]; state: TranscriptState; color: boolean; running: boolean; started?: number; paste: boolean;
-  mode: 'ask' | 'auto'; closing: boolean; requestLimit: number;
+  mode: 'ask' | 'auto'; closing: boolean; requestLimit: number; awaiting: boolean;
 }
 export interface Session {
   snapshot(): Snapshot;
   subscribe(fn: () => void): () => void;
   submit(line: string): void;
+  answer(key: 'y' | 'n' | 'a'): void;
   /** Returns true when the prompt line should be cleared. */
   interrupt(hasText: boolean): boolean;
   complete(line: string): string[];
@@ -72,6 +73,8 @@ export function createSession(opts: SessionOptions): Session {
   let model = opts.model, plan = '', closing = false;
   let active: { controller: AbortController; kind: 'agent' | 'shell'; started: number } | undefined;
   let paste: string[] | undefined;
+  let pending: { tool: string; settle: (allowed: boolean) => void } | undefined;
+  const allowed = new Set<string>();
   let lastRun: RunResult | undefined;
   let work: Promise<void> | undefined;
   let snap: Snapshot | undefined;
@@ -92,7 +95,30 @@ export function createSession(opts: SessionOptions): Session {
     if (event.type === 'tool_end' && typeof event.data.result.data?.plan === 'string') plan = event.data.result.data.plan;
     if (event.type === 'text') later(); else flush();
   };
-  const harness = new Harness({ ...opts.harness, onEvent: async event => { onEvent(event); await opts.onEvent?.(event); }, authorize: () => true });
+  const authorize = (tool: Tool, args: ToolRecord['args'], signal: AbortSignal): boolean | Promise<boolean> => {
+    if (mode === 'auto' || allowed.has(tool.name) || (tool.effect !== 'shell' && !(opts.confirmWrites && tool.effect === 'write'))) return true;
+    signal.throwIfAborted();
+    return new Promise(resolve => {
+      const settle = (ok: boolean): void => {
+        pending = undefined;
+        signal.removeEventListener('abort', deny);
+        apply({ type: 'permission_result', data: { tool: tool.name, allowed: ok } });
+        flush();
+        resolve(ok);
+      };
+      const deny = (): void => settle(false);
+      pending = { tool: tool.name, settle };
+      signal.addEventListener('abort', deny, { once: true });
+      apply({ type: 'permission', data: { tool: tool.name, args } });
+      flush();
+    });
+  };
+  const answer = (key: 'y' | 'n' | 'a'): void => {
+    if (!pending) return;
+    if (key === 'a') allowed.add(pending.tool);
+    pending.settle(key !== 'n');
+  };
+  const harness = new Harness({ ...opts.harness, onEvent: async event => { onEvent(event); await opts.onEvent?.(event); }, authorize });
 
   const shell = async (command: string, signal: AbortSignal): Promise<Entry['status']> => {
     apply({ type: 'host_command', data: { command } });
@@ -191,9 +217,9 @@ export function createSession(opts: SessionOptions): Session {
         return note(`Permissions: ${mode}.`);
       case '/paste': paste = []; return note('Paste a multiline task. /end submits; /abort discards.');
       case '/trace': {
-        const n = args[0] === undefined ? RING : Number(args[0]);
+        const n = args[0] === undefined ? TRACE_DEFAULT : Number(args[0]);
         if (!Number.isInteger(n) || n < 1) return note('Use /trace [n].', 33);
-        state = traceItem(state, n); sync(); return notify();
+        state = traceItem(state, Math.min(n, TRACE_MAX)); sync(); return notify();
       }
       default: return note(`Unknown command ${cmd}. Use /help.`, 33);
     }
@@ -229,9 +255,10 @@ export function createSession(opts: SessionOptions): Session {
 
   return {
     snapshot: () => snap ??= { rows, state, color, running: active !== undefined, ...(active ? { started: active.started } : {}), paste: paste !== undefined, mode, closing,
-      requestLimit: opts.harness.maxRequests ?? DEFAULT_LIMITS.maxRequests },
+      requestLimit: opts.harness.maxRequests ?? DEFAULT_LIMITS.maxRequests, awaiting: pending !== undefined },
     subscribe: fn => { listeners.add(fn); return () => { listeners.delete(fn); }; },
     submit,
+    answer,
     interrupt: hasText => {
       if (active) { cancel(); return false; }
       if (paste || hasText) { paste = undefined; notify(); return true; }

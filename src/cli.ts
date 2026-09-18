@@ -8,8 +8,8 @@ import { DEFAULT_LIMITS } from './harness.js';
 import { JevProvider } from './provider.js';
 import { runDemo } from './demo.js';
 import { builtInTools } from './tools.js';
-import { TerminalSession } from './terminal.js';
 import { createPrinter, printRun } from './print.js';
+import { isInteractiveTTY } from './terminal-style.js';
 import { formatDuration } from './timing.js';
 import { AstRegistry, loadInstalledAsts, loadAstModule, installAstModule, removeAstAdapter } from './ast-adapters.js';
 import { compareRecords, formatComparison, runEval, type EvalRecord } from './eval.js';
@@ -131,8 +131,9 @@ async function main(): Promise<void> {
   if (values['prompt-file'] && positionals.length) throw new Error('Use a positional task or --prompt-file, not both.');
   if (values.interactive && values.print) throw new Error('Choose --interactive or --print, not both.');
   if (values['prompt-file'] === '-' && values.interactive) throw new Error('Interactive mode needs a terminal; stdin is already used for the prompt.');
-  if (values.interactive && !process.stdin.isTTY) throw new Error('--interactive requires a terminal.');
-  const interactive = values.interactive ?? (Boolean(process.stdin.isTTY) && !values.print && !values['prompt-file'] && !values.json);
+  const tty = isInteractiveTTY(process.stdin, process.stderr);
+  if (values.interactive && !tty) throw new Error('--interactive requires a terminal.');
+  const interactive = values.interactive ?? (tty && !values.print && !values['prompt-file'] && !values.json);
   const prompt = values['prompt-file'] === '-' ? await stdinText()
     : values['prompt-file'] ? await readFile(resolve(values['prompt-file']), 'utf8') : positionals.join(' ');
   if (!prompt && !interactive) throw new Error('Supply a coding task, or start without arguments in a terminal. Use --help for options.');
@@ -160,12 +161,11 @@ async function main(): Promise<void> {
     ...(values['no-journal'] ? { journalDirectory: false as const } : {}),
   };
   if (interactive) {
-    const session = new TerminalSession({ harness: harnessOptions, input: process.stdin, output: process.stderr,
-      model: process.env.TYPESAFE_DEFAULT_MODEL ?? 'jev-latest', initialPrompt: prompt,
+    const { runSession } = await import('./ui/session.js');
+    process.exitCode = await runSession({ harness: harnessOptions, model: process.env.TYPESAFE_DEFAULT_MODEL ?? 'jev-latest', initialPrompt: prompt,
       yes: values.yes ?? false, confirmWrites: values['confirm-writes'] ?? false,
       ...(jsonOut ? { onEvent: createPrinter(process.stderr, jsonOut).onEvent } : {}),
     });
-    process.exitCode = await session.run();
     return;
   }
   const controller = new AbortController();
