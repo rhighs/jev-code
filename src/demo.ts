@@ -5,8 +5,9 @@ import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import { Harness } from './harness.js';
 import type { DecisionProvider, HarnessEvent, RunResult } from './types.js';
 
-/** A scripted driver for the offline demo only. Live runs always use JevProvider. */
-class DemoProvider implements DecisionProvider {
+export const DEMO_PROMPT = 'Create hello.txt containing Hello from a Jev turn loop! followed by a newline, and verify it with Bash.';
+
+export class DemoProvider implements DecisionProvider {
   async decide<Q extends Questions>(input: EntryType, questions: Q): Promise<SystemOneResult<Q>> {
     const state = input as { task: { turn: number }; completionCheck?: boolean; action?: string; field?: string; generation?: { field: string; phase: string; grid?: {
       columns: number; alphabet: Array<{ key: string; value: string }>;
@@ -48,7 +49,7 @@ class DemoProvider implements DecisionProvider {
 export async function runDemo(onEvent?: (event: HarnessEvent) => void | Promise<void>): Promise<{ workspace: string; result: RunResult }> {
   const workspace = await mkdtemp(join(tmpdir(), 'jev-demo-'));
   const harness = new Harness({ experimentalGrid: true, workspace, provider: new DemoProvider(), ...(onEvent ? { onEvent } : {}) });
-  const result = await harness.run('Create hello.txt containing Hello from a Jev turn loop! followed by a newline, and verify it with Bash.');
+  const result = await harness.run(DEMO_PROMPT);
   if (result.status !== 'completed' || await readFile(join(workspace, 'hello.txt'), 'utf8') !== 'Hello from a Jev turn loop!\n') throw new Error('Offline demo failed.');
   return { workspace, result };
 }
