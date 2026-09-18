@@ -71,12 +71,13 @@ class LongProvider implements DecisionProvider {
 
 test('a long partial program keeps every decision request under the cap and generation continues', async () => {
   const literal = 'lorem ipsum '.repeat(45).trim();
-  const lines = 40;
-  const script = ['0' as string | { value: string }].concat(Array.from({ length: lines }, () => ['expr', 'call', { value: 'print' }, '1', 'string', { value: JSON.stringify(literal) }]).flat(), 'finish');
+  const blocks = 3, per = 13, lines = blocks * (per + 1);
+  const chunk = (): Array<string | { value: string }> => ['if', 'boolean', 'true', ...Array.from({ length: per }, () => ['expr', 'call', { value: 'print' }, '1', 'string', { value: JSON.stringify(literal) }]).flat(), 'finish', 'no'];
+  const script = ['0' as string | { value: string }].concat(Array.from({ length: blocks }, chunk).flat(), 'finish');
   const expected = script.length;
   const provider = new LongProvider(script);
   const decisions = new Decisions(provider, 1000, new AbortController().signal);
-  const result = await generatePythonAst(decisions, { task: { prompt: `Python print "${literal}" ${lines} times.` } }, 'content', { maxSteps: 1000, maxBytes: 256_000, allowEmpty: false, fragments: [] });
+  const result = await generatePythonAst(decisions, { task: { prompt: `Python print "${literal}" ${blocks * per} times.` } }, 'content', { maxSteps: 1000, maxBytes: 256_000, allowEmpty: false, fragments: [] });
   assert.equal(result.split('\n').filter(Boolean).length, lines);
   assert.equal(provider.requests.length, expected);
   assert.ok(provider.requests.every(size => size <= MAX_GRID_REQUEST_BYTES), `largest request ${Math.max(...provider.requests)}`);
