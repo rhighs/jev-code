@@ -1,24 +1,6 @@
 import { formatSearchOutcome } from './grid.js';
-import { stripVTControlCharacters } from 'node:util';
-import { highlightCode, paint } from './terminal-style.js';
+import { displayText, fitLine, highlightCode, paint } from './terminal-style.js';
 import type { HarnessEvent, TextEventData } from './types.js';
-
-/** Preserve the exact draft; escape controls only when presenting it to the terminal. */
-const displayText = (text: string): string => stripVTControlCharacters(text.replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g,
-  char => char === '\t' ? '    ' : JSON.stringify(char).slice(1, -1)));
-
-function fitLine(text: string, width: number): string {
-  text = displayText(text).replace(/\n/g, '↵');
-  let result = '', used = 0;
-  for (const char of text) {
-    // Conservatively count non-Latin scalars as wide to keep the pane from wrapping.
-    const size = char.codePointAt(0)! >= 0x1100 ? 2 : 1;
-    if (used + size > width - 1) return result + '…';
-    result += char;
-    used += size;
-  }
-  return result;
-}
 
 export class GenerationDisplay {
   private action = 'text';
@@ -56,9 +38,9 @@ export class GenerationDisplay {
       for (const row of rows) output += `${String(row + 1).padStart(3)} | ${this.gridLine(draft.cells.slice(row * grid.columns, (row + 1) * grid.columns))}\n`;
     } else if (change && 'replace' in change) {
       draft.text = change.replace;
-      output += event.data.ast
-        ? `\nAST · ${event.data.ast.slot} → ${event.data.ast.production}\n${displayText(draft.text)}\n`
-        : `\nDecoded · ${this.action}.${event.data.field}\n${displayText(draft.text)}`;
+      const { ast } = event.data;
+      if (ast) output += `AST · ${ast.unit ? `${ast.unit} · ` : ''}${ast.slot} → ${ast.production}\n`;
+      else if (event.data.done) output += `\nDecoded · ${this.action}.${event.data.field}\n${displayText(draft.text)}`;
     }
     if (event.data.done) { output += '\n[Draft complete]\n'; draft.cells = []; this.drafts.delete(identity); }
     return output;

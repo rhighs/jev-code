@@ -29,7 +29,7 @@ export type Item =
   | { kind: 'turn'; turn: number; files: number; plan: string }
   | { kind: 'update'; text: string }
   | { kind: 'trace'; decisions: Decision[] }
-  | (RunSummary & { kind: 'summary'; turns: number; requests: number; limits?: { turns: number; requests: number }; usage: { inputTokens: number; outputTokens: number }; durationMs: number });
+  | (RunSummary & { kind: 'summary'; runId: string; turns: number; requests: number; limits?: { turns: number; requests: number }; usage: { inputTokens: number; outputTokens: number }; durationMs: number });
 
 export interface Live {
   card: ToolItem; path?: string; field?: string; source?: string; decoder?: string; slot?: string; production?: string; unit?: string; candidate?: number;
@@ -150,7 +150,7 @@ export function reduce(state: TranscriptState, event: HarnessEvent | SessionEven
     case 'end': {
       const { status, summary, turns, requests, usage, durationMs } = event.data;
       const { live: _live, ...rest } = state;
-      const item: Item = { kind: 'summary', ...runSummary(status, summary, state.records), turns, requests, usage, durationMs, ...(state.limits ? { limits: state.limits } : {}) };
+      const item: Item = { kind: 'summary', runId: event.runId, ...runSummary(status, summary, state.records), turns, requests, usage, durationMs, ...(state.limits ? { limits: state.limits } : {}) };
       return { ...rest, items: [...state.items, item] };
     }
   }
@@ -159,8 +159,10 @@ export function reduce(state: TranscriptState, event: HarnessEvent | SessionEven
 function reduceSession(state: TranscriptState, event: SessionEvent): TranscriptState {
   switch (event.type) {
     case 'permission': {
-      const cur = state.live ?? live(state, card(state.turn, event.data.tool, state.elapsedMs));
-      return { ...state, live: { ...cur, card: { ...cur.card, status: 'awaiting', args: event.data.args, target: target(event.data.tool, event.data.args) } } };
+      const { tool, args } = event.data;
+      const cur = state.live ?? live(state, card(state.turn, tool, state.elapsedMs));
+      const preview = ['write_file', 'edit_file'].includes(tool) ? { body: body({ turn: state.turn, tool, args, result: { ok: true, output: '' } }, '') } : {};
+      return { ...state, live: { ...cur, card: { ...cur.card, status: 'awaiting', args, target: target(tool, args), ...preview } } };
     }
     case 'permission_result':
       return state.live ? { ...state, live: { ...state.live, card: { ...state.live.card, status: event.data.allowed ? 'running' : 'denied' } } } : state;

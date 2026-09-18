@@ -2,21 +2,20 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { loadEnvFile } from 'node:process';
-import { createInterface } from 'node:readline/promises';
 import { pathToFileURL } from 'node:url';
-import { parseArgs, stripVTControlCharacters } from 'node:util';
-import { Harness, DEFAULT_LIMITS } from './harness.js';
+import { parseArgs } from 'node:util';
+import { DEFAULT_LIMITS } from './harness.js';
 import { JevProvider } from './provider.js';
 import { runDemo } from './demo.js';
 import { builtInTools } from './tools.js';
 import { TerminalSession } from './terminal.js';
-import { GenerationDisplay } from './draft.js';
+import { createPrinter, printRun } from './print.js';
 import { formatDuration } from './timing.js';
 import { AstRegistry, loadInstalledAsts, loadAstModule, installAstModule, removeAstAdapter } from './ast-adapters.js';
 import { compareRecords, formatComparison, runEval, type EvalRecord } from './eval.js';
 import { runDecide } from './decide.js';
 import type { HarnessOptions } from './harness.js';
-import type { HarnessEvent, Tool } from './types.js';
+import type { Tool } from './types.js';
 
 const HELP = `jev-code [options] ["your coding task"]
 
@@ -121,25 +120,12 @@ async function main(): Promise<void> {
     process.exitCode = records.every(r => r.check.ok) ? 0 : 1;
     return;
   }
-  let streamed = false;
-  const draft = new GenerationDisplay();
-  const onEvent = (event: HarnessEvent): void => {
-    if (values.json) process.stdout.write(JSON.stringify(event) + '\n');
-    else if (event.type === 'text' || event.type === 'action') process.stderr.write(draft.consume(event));
-    else if (event.type === 'turn') process.stderr.write(`Turn ${event.turn}\n`);
-    else if (event.type === 'turn_end') process.stderr.write(`Turn ${event.turn} finished · ${formatDuration(event.data.durationMs)} · ${formatDuration(event.data.elapsedMs)} total elapsed · ${event.data.requests} requests\n`);
-    else if (event.type === 'tool_start') { streamed = false; process.stderr.write(`  → ${String(event.data.tool)}\n`); }
-    else if (event.type === 'tool_output') { streamed = true; process.stderr.write(stripVTControlCharacters(String(event.data.text))); }
-    else if (event.type === 'tool_end') {
-      const result = event.data.result;
-      process.stderr.write(`  ${result.ok ? '✓' : '✗'} ${streamed ? String(event.data.tool) : stripVTControlCharacters(result.output.slice(0, 2000))}\n`);
-      streamed = false;
-    }
-  };
+  const jsonOut = values.json ? process.stdout : undefined;
   if (values.demo) {
     if (!values.json) process.stderr.write('Offline scripted demo (no Jev API calls).\n');
-    const { workspace, result } = await runDemo(onEvent);
-    if (!values.json) process.stdout.write(`${result.summary}\nDemo workspace: ${workspace}\n`);
+    const printer = createPrinter(process.stderr, jsonOut);
+    const { workspace } = await runDemo(printer.onEvent);
+    if (!values.json) process.stdout.write(`${printer.summary().join('\n')}\nDemo workspace: ${workspace}\n`);
     return;
   }
   if (values['prompt-file'] && positionals.length) throw new Error('Use a positional task or --prompt-file, not both.');
@@ -177,36 +163,19 @@ async function main(): Promise<void> {
     const session = new TerminalSession({ harness: harnessOptions, input: process.stdin, output: process.stderr,
       model: process.env.TYPESAFE_DEFAULT_MODEL ?? 'jev-latest', initialPrompt: prompt,
       yes: values.yes ?? false, confirmWrites: values['confirm-writes'] ?? false,
-      ...(values.json ? { onEvent } : {}),
+      ...(jsonOut ? { onEvent: createPrinter(process.stderr, jsonOut).onEvent } : {}),
     });
     process.exitCode = await session.run();
     return;
   }
-  let readline: ReturnType<typeof createInterface> | undefined;
-  let activeController: AbortController | undefined;
-  const cancel = (): void => activeController?.abort(new Error('Cancelled by user.'));
-  const harness = new Harness({ ...harnessOptions, onEvent,
-    authorize: async (tool, args, signal) => {
-      if (values.yes || (tool.effect !== 'shell' && !(values['confirm-writes'] && tool.effect === 'write'))) return true;
-      if (!readline) {
-        process.stderr.write(`Tool ${tool.name} needs confirmation; run with --yes for unattended execution.\n`);
-        return false;
-      }
-      process.stderr.write(`${tool.name}: ${JSON.stringify(args)}\n`);
-      return /^y(?:es)?$/i.test((await readline.question('Execute? [y/N] ', { signal })).trim());
-    },
-  });
-  readline = process.stdin.isTTY ? createInterface({ input: process.stdin, output: process.stderr }) : undefined;
+  const controller = new AbortController();
+  const cancel = (): void => controller.abort(new Error('Cancelled by user.'));
   process.on('SIGINT', cancel);
-  readline?.on('SIGINT', cancel);
   try {
-    activeController = new AbortController();
-    const result = await harness.run(prompt, activeController.signal);
-    activeController = undefined;
-    if (!values.json) process.stdout.write(`[${result.status}] ${result.summary}\n${formatDuration(result.durationMs)} elapsed; ${result.turns} turns, ${result.requests} requests; run ${result.id}\n`);
+    const result = await printRun({ harness: harnessOptions, prompt, stdin: process.stdin, stdout: process.stdout, stderr: process.stderr,
+      yes: values.yes ?? false, confirmWrites: values['confirm-writes'] ?? false, json: values.json ?? false, signal: controller.signal, onInterrupt: cancel });
     process.exitCode = result.status === 'completed' ? 0 : result.status === 'cancelled' ? 130 : 1;
   } finally {
-    readline?.close();
     process.removeListener('SIGINT', cancel);
   }
 }

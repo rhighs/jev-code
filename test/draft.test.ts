@@ -34,6 +34,19 @@ test('unit drafts name the unit being filled and keep the assembled module', () 
   assert.match(plain, /def shout\(name\):/);
 });
 test('non-terminal style never enables ANSI colors', () => { assert.equal(terminalColor(false), false); });
+test('plain consume reports each AST step as one line and prints the source only when done', () => {
+  const display = new GenerationDisplay();
+  display.consume({ ...metadata, type: 'action', data: { tool: 'write_file' } });
+  const partial = 'x = 1\n__jev_pending__\n';
+  const step = display.consume({ ...metadata, type: 'text', data: { field: 'content', decoder: 'ast', step: 1, bytes: partial.length, done: false,
+    change: { replace: partial }, cursor: gridCursor(partial), ast: { slot: 'module_body', production: 'assign', symbols: ['x'], unit: 'main' } } });
+  assert.match(step, /^\nDraft · write_file\.content · ast\nAST · main · module_body → assign\n$/);
+  assert.doesNotMatch(step, /x = 1/);
+  const source = 'x = 1\ny = 2\n';
+  const done = display.consume({ ...metadata, type: 'text', data: { field: 'content', decoder: 'ast', step: 2, bytes: source.length, done: true, change: { replace: source }, cursor: gridCursor(source) } });
+  assert.equal(done.split('x = 1').length - 1, 1);
+  assert.match(done, /\[Draft complete\]/);
+});
 test('search events print kept and dropped candidates without replacing the draft pane', () => {
   const display = new GenerationDisplay();
   display.consume({ ...metadata, type: 'action', data: { tool: 'write_file' } });
