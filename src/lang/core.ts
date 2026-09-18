@@ -8,7 +8,7 @@ import { compactContext, MAX_GRID_REQUEST_BYTES } from '../scored-grid.js';
 import { LimitError } from '../types.js';
 
 export type ValueType = 'string' | 'number' | 'bool' | 'list' | 'unknown';
-export type BinOp = 'add' | 'sub' | 'mul' | 'div' | 'mod';
+export type BinOp = 'add' | 'sub' | 'mul' | 'div' | 'mod' | 'concat';
 export type CmpOp = 'eq' | 'ne' | 'lt' | 'le' | 'gt' | 'ge';
 
 export type Expr =
@@ -78,7 +78,7 @@ export function typeOf(expr: Expr, symbols: Record<string, Symbol>): ValueType {
     case 'bool': return 'bool';
     case 'list': return 'list';
     case 'compare': return 'bool';
-    case 'binary': return typeOf(expr.left, symbols) === 'string' || typeOf(expr.right, symbols) === 'string' ? 'string' : 'number';
+    case 'binary': return expr.op === 'concat' || typeOf(expr.left, symbols) === 'string' || typeOf(expr.right, symbols) === 'string' ? 'string' : 'number';
     case 'name': return symbols[expr.id]?.type ?? 'unknown';
     case 'call': { const r = symbols[expr.callee]?.returns; return r === undefined || r === 'void' ? 'unknown' : r; }
     case 'index': return 'unknown';
@@ -214,8 +214,8 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
       return expr;
     } else if (production === 'binary' || production === 'compare' || production === 'concat') {
       const ops = production === 'binary' ? { add: 'addition +', sub: 'subtraction -', mul: 'multiplication *', div: 'division /', mod: 'remainder %' }
-        : production === 'compare' ? { eq: 'equal', ne: 'not equal', lt: 'less than', le: 'less or equal', gt: 'greater than', ge: 'greater or equal' } : { add: 'join' };
-      const op = Object.keys(ops).length === 1 ? 'add' : await pick('operator', scope, ops);
+        : production === 'compare' ? { eq: 'equal', ne: 'not equal', lt: 'less than', le: 'less or equal', gt: 'greater than', ge: 'greater or equal' } : { concat: 'join' };
+      const op = Object.keys(ops).length === 1 ? 'concat' : await pick('operator', scope, ops);
       const node: Expr = production === 'compare' ? { kind: 'compare', op: op as CmpOp, left: PENDING_EXPR, right: PENDING_EXPR } : { kind: 'binary', op: op as BinOp, left: PENDING_EXPR, right: PENDING_EXPR };
       set(node);
       const operand: ValueType | undefined = production === 'concat' ? 'string' : production === 'binary' ? 'number' : typed ? 'number' : undefined;
@@ -364,7 +364,7 @@ export const adapterFor = (dialect: Dialect): AstAdapter => ({
 
 export const escapeDoubleQuoted = (value: string): string => JSON.stringify(value);
 
-export const BIN: Record<BinOp, string> = { add: '+', sub: '-', mul: '*', div: '/', mod: '%' };
+export const BIN: Record<BinOp, string> = { add: '+', sub: '-', mul: '*', div: '/', mod: '%', concat: '+' };
 export const CMP: Record<CmpOp, string> = { eq: '==', ne: '!=', lt: '<', le: '<=', gt: '>', ge: '>=' };
 
 export const hasHole = (e: Expr): boolean => e.kind === 'hole' || (e.kind === 'binary' || e.kind === 'compare' ? hasHole(e.left) || hasHole(e.right)
