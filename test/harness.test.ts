@@ -72,6 +72,21 @@ test('unchanged bash, read and plan cycles stop after three rejected completion 
   assert.equal(result.records.filter(record => record.tool === 'bash').length, 1);
 });
 
+test('two consecutive writes to the same path without a read or run make write tools unavailable for a turn', async t => {
+  const root = await workspace(t);
+  const provider = new ScriptedProvider([
+    { action: 'write_file', args: { path: 'hello.txt', content: 'hello' } },
+    { action: 'write_file', args: { path: 'hello.txt', content: 'hello again' } },
+    { action: 'bash', args: { command: 'cat hello.txt', cwd: '.', timeout_ms: '' } },
+    { action: 'finish', verdict: 1 },
+  ]);
+  const result = await new Harness({ workspace: root, provider, experimentalGrid: true, journalDirectory: false }).run('Write hello.txt with hello.');
+  assert.equal(result.status, 'completed', result.summary);
+  const third = provider.states.find(state => state.task.turn === 3) as { progressFeedback?: string } | undefined;
+  assert.match(third?.progressFeedback ?? '', /rewrote hello.txt/);
+  assert.ok(!(provider.states.find(state => state.task.turn === 2) as { progressFeedback?: string })?.progressFeedback);
+});
+
 test('explicit strict completion thresholds still reject intermediate probabilities and terminate', async t => {
   const root = await workspace(t);
   const provider = new ScriptedProvider([
