@@ -27,7 +27,7 @@ export const pythonAstAdapter: AstAdapter = {
 
 export class AstRegistry {
   private adapters = new Map<string, AstAdapter>();
-  constructor(adapters: AstAdapter[] = []) { this.register(pythonAstAdapter); for (const adapter of bundledAstAdapters()) this.register(adapter); for (const adapter of adapters) this.register(adapter); }
+  constructor(adapters: AstAdapter[] = [], bundled = true) { this.register(pythonAstAdapter); if (bundled) for (const adapter of bundledAstAdapters()) this.register(adapter); for (const adapter of adapters) this.register(adapter); }
   register(adapter: AstAdapter): void {
     if (!adapter || !/^[a-z][a-z0-9-]{0,63}$/.test(adapter.id)) throw new Error('AST adapter requires a valid id.');
     if (this.adapters.has(adapter.id)) throw new Error(`Duplicate AST adapter: ${adapter.id}`);

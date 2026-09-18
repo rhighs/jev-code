@@ -140,7 +140,7 @@ test('full turn loop writes JS, observes a real failure, edits, verifies, and jo
     if (state.task.turn === 3) assert.equal(state.recent.at(-1)?.result.ok, false);
     if (state.task.turn === 6) assert.equal(state.recent.at(-1)?.result.ok, true);
   });
-  const result = await new Harness({ experimentalGrid: true, workspace: root, provider }).run('Create and verify a JavaScript arithmetic check.');
+  const result = await new Harness({ bundledAsts: false, experimentalGrid: true, workspace: root, provider }).run('Create and verify a JavaScript arithmetic check.');
   assert.equal(result.status, 'completed', result.summary);
   assert.equal(result.turns, 6);
   assert.deepEqual(result.records.map(record => record.result.ok), [true, false, true, true, true]);

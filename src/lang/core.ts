@@ -40,7 +40,7 @@ export type Stmt =
 export interface Program { body: Stmt[] }
 
 export interface Builtin { arity: number[]; returns: ValueType; params?: ValueType[] }
-export interface Symbol { kind: 'variable' | 'parameter' | 'function' | 'builtin'; type: ValueType; arity?: number; returns?: ValueType | 'void' }
+export interface Symbol { kind: 'variable' | 'parameter' | 'function' | 'builtin'; type: ValueType; arity?: number; returns?: ValueType | 'void'; readonly?: boolean }
 export interface Scope { names: Map<string, Symbol>; parent?: Scope; function: boolean; loop: boolean; returnTypes?: Set<ValueType | 'void'> }
 
 export interface Features { functions: boolean; while: boolean; range: boolean; foreach: boolean; list: boolean; index: boolean; compareStrings: boolean; concat: boolean }
@@ -173,9 +173,9 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
 
   const fits = (expect: ValueType | undefined, actual: ValueType): boolean => expect === undefined || expect === 'unknown' || actual === expect || (!typed && actual === 'unknown');
 
-  async function expression(set: (e: Expr) => void, scope: Scope, depth: number, slot = 'expression', expect?: ValueType, calls = 0): Promise<Expr> {
+  async function expression(set: (e: Expr) => void, scope: Scope, depth: number, slot = 'expression', expect?: ValueType, calls = 0, avoid?: string, nonzero = false): Promise<Expr> {
     const symbols = table(scope, builtins);
-    const namesForValue = Object.entries(symbols).filter(([, s]) => s.kind !== 'builtin' && s.kind !== 'function').map(([id]) => id).filter(id => fits(expect, symbols[id]!.type));
+    const namesForValue = Object.entries(symbols).filter(([, s]) => s.kind !== 'builtin' && s.kind !== 'function').map(([id]) => id).filter(id => id !== avoid && fits(expect, symbols[id]!.type));
     const callable = Object.entries(symbols).filter(([, s]) => (s.kind === 'builtin' || s.kind === 'function') && s.returns !== 'void' && fits(expect, s.returns === undefined ? 'unknown' : s.returns)).map(([id]) => id);
     const criteria: Record<string, string> = {};
     if (fits(expect, 'string')) criteria.string = 'A literal string.';
@@ -186,13 +186,13 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
     if (depth < maxDepth && features.concat && fits(expect, 'string')) criteria.concat = 'Join two strings.';
     if (depth < maxDepth && fits(expect, 'bool')) criteria.compare = 'Compare two expressions.';
     if (depth < maxDepth && calls < 2 && callable.length) criteria.call = 'Call a function with arguments.';
-    if (depth < maxDepth && features.list && fits(expect, 'list') && !slot.startsWith('element_') && !slot.startsWith('argument_')) criteria.list = 'A list of expressions.';
+    if (features.list && fits(expect, 'list') && (expect === 'list' || (depth < maxDepth && !slot.startsWith('element_') && !slot.startsWith('argument_')))) criteria.list = 'A list of expressions.';
     if (depth < maxDepth && features.index && !typed) criteria.index = 'Index a defined list.';
     if (!Object.keys(criteria).length) throw new Error(`No ${dialect.name} expression can produce a ${expect ?? 'value'} here.`);
     const production = await pick(slot, scope, criteria, depth);
     let expr: Expr;
     if (production === 'string') expr = { kind: 'string', value: String(await terminal('string', scope, vocab.strings)) };
-    else if (production === 'number') expr = { kind: 'number', value: Number(await terminal('number', scope, vocab.numbers)) };
+    else if (production === 'number') expr = { kind: 'number', value: Number(await terminal('number', scope, nonzero ? vocab.numbers.filter(n => n !== 0) : vocab.numbers)) };
     else if (production === 'boolean') expr = { kind: 'bool', value: await pick('singleton', scope, { true: 'true', false: 'false' }) === 'true' };
     else if (production === 'name') {
       const selected = await pick('reference', scope, Object.fromEntries(namesForValue.map((id, i) => [`name_${i}`, id])));
@@ -221,7 +221,7 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
       const operand: ValueType | undefined = production === 'concat' ? 'string' : production === 'binary' ? 'number' : typed ? 'number' : undefined;
       const left = await expression(e => { node.left = e; }, scope, depth + 1, 'left', operand, calls);
       const rightType = production === 'compare' && !typed ? (features.compareStrings ? typeOf(left, symbols) : 'number') : operand;
-      await expression(e => { node.right = e; }, scope, depth + 1, 'right', rightType === 'unknown' ? undefined : rightType, calls);
+      await expression(e => { node.right = e; }, scope, depth + 1, 'right', rightType === 'unknown' ? undefined : rightType, calls, undefined, op === 'div' || op === 'mod');
       return node;
     } else if (production === 'list') {
       const items: Expr[] = [];
@@ -246,7 +246,7 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
     return expr;
   }
 
-  async function block(body: Stmt[], scope: Scope, depth: number, slot: string): Promise<void> {
+  async function block(body: Stmt[], scope: Scope, depth: number, slot: string): Promise<boolean> {
     while (body.length < maxBlockStatements) {
       const criteria: Record<string, string> = { print: 'Print an expression on its own line.', assign: 'Assign a value to a variable.' };
       const symbols = table(scope, builtins);
@@ -259,10 +259,10 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
         if (features.range) criteria.range = 'Count from a start number up to, but not including, a stop number.';
         if (features.foreach && !typed) criteria.foreach = 'Loop over the items of a list.';
         if (features.while) criteria.while = 'While loop.';
-        if (features.functions && !scope.function) criteria.function = 'Define a named function.';
+        if (features.functions && slot === 'module_body') criteria.function = 'Define a named function.';
       }
       const production = await pick(slot, scope, criteria, depth);
-      if (production === 'finish') return;
+      if (production === 'finish') return false;
       const at = body.length;
       body.push({ kind: 'hole' });
       const put = (s: Stmt): void => { body[at] = s; };
@@ -285,7 +285,7 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
           }
         } else await expression(e => { node.value = e; }, scope, depth + 1, 'printed');
       } else if (production === 'assign') {
-        const existing = Object.entries(symbols).filter(([, s]) => s.kind === 'variable').map(([id]) => id);
+        const existing = Object.entries(symbols).filter(([, s]) => s.kind === 'variable' && !s.readonly).map(([id]) => id);
         const choiceCriteria: Record<string, string> = { new: 'Declare a new variable.' };
         for (const [i, id] of existing.entries()) choiceCriteria[`name_${i}`] = `Reassign ${id}.`;
         const target = existing.length ? await pick('assignment_target', scope, choiceCriteria) : 'new';
@@ -293,7 +293,7 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
         const id = declare ? await identifier('assignment_name', scope, Object.keys(symbols)) : existing[Number(target.slice(5))]!;
         const node: Stmt = { kind: 'assign', id, value: PENDING_EXPR, declare, type: declare ? 'unknown' : symbols[id]!.type };
         put(node);
-        const value = await expression(e => { node.value = e; }, scope, depth + 1, 'value', declare ? undefined : (symbols[id]!.type === 'unknown' ? undefined : symbols[id]!.type));
+        const value = await expression(e => { node.value = e; }, scope, depth + 1, 'value', declare ? undefined : (symbols[id]!.type === 'unknown' ? undefined : symbols[id]!.type), 0, declare ? undefined : id);
         node.type = typeOf(value, symbols);
         if (typed && node.type === 'unknown') throw new Error(`${dialect.name} cannot infer the type of ${id}.`);
         if (declare) scope.names.set(id, { kind: 'variable', type: node.type });
@@ -302,25 +302,26 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
         put(node);
         const value = await expression(e => { node.value = e; }, scope, depth + 1, 'returned', typed ? (scope.returnTypes?.size ? [...scope.returnTypes][0] as ValueType : 'number') : undefined);
         scope.returnTypes?.add(typeOf(value, symbols));
-        return;
-      } else if (production === 'break' || production === 'continue') { put({ kind: production }); return; }
+        return true;
+      } else if (production === 'break' || production === 'continue') { put({ kind: production }); return true; }
       else if (production === 'function') {
         const id = await identifier('function_name', scope, Object.keys(symbols));
         const params: string[] = [], nested: Stmt[] = [];
         const node: Stmt = { kind: 'function', id, params, paramTypes: [], returns: 'void', body: nested };
         put(node);
         const count = Number(await pick('parameter_count', scope, { '0': 'No parameters.', '1': 'One parameter.', '2': 'Two parameters.', '3': 'Three parameters.' }));
-        const child: Scope = { names: new Map(), parent: scope, function: true, loop: false, returnTypes: new Set() };
+        const globals: Scope = { names: new Map([...scope.names].filter(([, s]) => s.kind === 'function')), function: false, loop: false };
+        const child: Scope = { names: new Map(), parent: globals, function: true, loop: false, returnTypes: new Set() };
         for (let i = 0; i < count; i++) {
           const p = await identifier(`parameter_${i}`, child, [...params, ...Object.keys(symbols)]);
           params.push(p);
           node.paramTypes.push(typed ? 'number' : 'unknown');
           child.names.set(p, { kind: 'parameter', type: typed ? 'number' : 'unknown' });
         }
-        scope.names.set(id, { kind: 'function', type: 'unknown', arity: count, returns: typed ? 'number' : 'unknown' });
-        await block(nested, child, depth + 1, 'function_body');
+        const ended = await block(nested, child, depth + 1, 'function_body');
         const returned = [...child.returnTypes!].filter(t => t !== 'void');
         node.returns = returned.length ? returned[0]! : 'void';
+        if (node.returns !== 'void' && !ended) nested.push({ kind: 'return', value: node.returns === 'string' ? { kind: 'string', value: '' } : node.returns === 'bool' ? { kind: 'bool', value: false } : { kind: 'number', value: 0 } });
         scope.names.set(id, { kind: 'function', type: 'unknown', arity: count, returns: node.returns });
       } else if (production === 'range') {
         const id = await identifier('loop_variable', scope, Object.keys(symbols));
@@ -329,14 +330,14 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
         put(node);
         await expression(e => { node.start = e; }, scope, depth + 1, 'start', 'number');
         await expression(e => { node.stop = e; }, scope, depth + 1, 'stop', 'number');
-        await block(nested, { names: new Map([[id, { kind: 'variable', type: 'number' }]]), parent: scope, function: scope.function, loop: true, ...(scope.returnTypes ? { returnTypes: scope.returnTypes } : {}) }, depth + 1, 'loop_body');
+        await block(nested, { names: new Map([[id, { kind: 'variable', type: 'number', readonly: true }]]), parent: scope, function: scope.function, loop: true, ...(scope.returnTypes ? { returnTypes: scope.returnTypes } : {}) }, depth + 1, 'loop_body');
       } else if (production === 'foreach') {
         const id = await identifier('loop_variable', scope, Object.keys(symbols));
         const nested: Stmt[] = [];
         const node: Stmt = { kind: 'foreach', id, iterable: PENDING_EXPR, body: nested, type: 'unknown' };
         put(node);
         await expression(e => { node.iterable = e; }, scope, depth + 1, 'iterable', 'list');
-        await block(nested, { names: new Map([[id, { kind: 'variable', type: 'unknown' }]]), parent: scope, function: scope.function, loop: true, ...(scope.returnTypes ? { returnTypes: scope.returnTypes } : {}) }, depth + 1, 'loop_body');
+        await block(nested, { names: new Map([[id, { kind: 'variable', type: 'unknown', readonly: true }]]), parent: scope, function: scope.function, loop: true, ...(scope.returnTypes ? { returnTypes: scope.returnTypes } : {}) }, depth + 1, 'loop_body');
       } else {
         const nested: Stmt[] = [];
         const orelse: Stmt[] = [];
@@ -344,10 +345,11 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
         put(node);
         await expression(e => { node.test = e; }, scope, depth + 1, 'condition', 'bool');
         const inner = (): Scope => ({ names: new Map(), parent: scope, function: scope.function, loop: production === 'while' || scope.loop, ...(scope.returnTypes ? { returnTypes: scope.returnTypes } : {}) });
-        await block(nested, inner(), depth + 1, production === 'if' ? 'if_body' : 'loop_body');
-        if (production === 'if' && await pick('else_branch', scope, { no: 'No else branch is required.', yes: 'Add an else branch.' }) === 'yes') await block(orelse, inner(), depth + 1, 'else_body');
+        const ended = await block(nested, inner(), depth + 1, production === 'if' ? 'if_body' : 'loop_body');
+        if (production === 'if' && await pick('else_branch', scope, { no: 'No else branch is required.', yes: 'Add an else branch.' }) === 'yes' && await block(orelse, inner(), depth + 1, 'else_body') && ended) return true;
       }
     }
+    return false;
   }
 
   await block(program.body, { names: new Map(), function: false, loop: false }, 0, 'module_body');
@@ -361,6 +363,8 @@ export const adapterFor = (dialect: Dialect): AstAdapter => ({
   generate: (decisions, state, field, options) => generateProgram(dialect, decisions, state, field, options),
   validate: (source, signal) => dialect.validate(source, signal),
 });
+
+export const group = (e: Expr, text: string): string => e.kind === 'binary' || e.kind === 'compare' ? `(${text})` : text;
 
 export const escapeDoubleQuoted = (value: string): string => JSON.stringify(value);
 

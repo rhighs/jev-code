@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { AstRegistry } from '../src/ast-adapters.js';
 import { Decisions } from '../src/decisions.js';
 import { generateText } from '../src/generation.js';
 import type { DecisionProvider } from '../src/types.js';
@@ -148,6 +149,6 @@ test('compiler errors cause a parallel grid repair before ordinary source can fi
     return base.decide(state, questions, signal);
   } };
   assert.equal(await generateText(new Decisions(provider, 100, new AbortController().signal), { ...task, argumentsSoFar: { path: 'sum.ts' } },
-    'content', 'Valid TypeScript.', options), valid);
+    'content', 'Valid TypeScript.', { ...options, astRegistry: new AstRegistry([], false) }), valid);
   assert.equal(repaired, true);
 });

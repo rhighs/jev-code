@@ -17,6 +17,7 @@ export interface HarnessOptions {
   provider: DecisionProvider;
   tools?: Tool[];
   astAdapters?: AstAdapter[];
+  bundledAsts?: boolean;
   experimentalGrid?: boolean;
   maxTurns?: number;
   maxRequests?: number;
@@ -49,7 +50,7 @@ export class Harness {
   private running = false;
 
   constructor(private readonly options: HarnessOptions) {
-    this.astRegistry = new AstRegistry(options.astAdapters);
+    this.astRegistry = new AstRegistry(options.astAdapters, options.bundledAsts ?? true);
     for (const [name, value] of Object.entries({ maxTurns: options.maxTurns ?? DEFAULT_LIMITS.maxTurns, maxRequests: options.maxRequests ?? DEFAULT_LIMITS.maxRequests,
       maxGenerationSteps: options.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, maxRunMs: options.maxRunMs ?? DEFAULT_LIMITS.maxRunMs })) {
       if (!Number.isSafeInteger(value) || value < 1 || value > 2_147_483_647) throw new Error(`${name} must be a positive integer <= 2147483647.`);
