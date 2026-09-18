@@ -72,7 +72,7 @@ export async function generateBashAst(decisions: Decisions, state: State, field:
       const current: Extract<BashAst, { type: 'command' }> = { type: 'command', program: programs[Number(selected.slice(5))]!, args: [], redirects: [] };
       tree = left && operator ? { type: 'binary', operator, left, right: current } : current;
       for (let count = 0; count < 16; count++) {
-        const criteria = Object.fromEntries(argumentsList.map((value, index) => [`word_${index}`, JSON.stringify(value)]));
+        const criteria = Object.fromEntries(argumentsList.flatMap((value, index) => current.args.includes(value) ? [] : [[`word_${index}`, JSON.stringify(value)]]));
         criteria.END = 'No more arguments are needed.';
         const argument = await pick('argument', criteria, argumentsList);
         if (argument === 'END') return current;

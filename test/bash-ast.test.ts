@@ -61,3 +61,8 @@ test('Bash syntax validation never executes source, and AST budget and cancellat
   await assert.rejects(generateBashAst(new Decisions(fixture(['compose']), 5, new AbortController().signal), { task: { prompt: 'Print hello.' } }, 'command', { ...options, maxSteps: 1 }), /production budget/);
   await assert.rejects(generateBashAst(new Decisions(fixture([]), 5, AbortSignal.abort(new Error('Stop'))), {}, 'command', options), /Stop/);
 });
+
+test('Bash AST never offers an argument the command already has', async () => {
+  const provider = fixture([{ label: 'python3' }, { label: JSON.stringify('-m') }, { label: JSON.stringify('py_compile') }, { label: JSON.stringify('main.py') }, { label: JSON.stringify('-m') }]);
+  await assert.rejects(generateBashAst(new Decisions(provider, 30, new AbortController().signal), { task: { prompt: 'Verify it compiles with python3 -m py_compile main.py.' } }, 'command', options), /Unavailable production/);
+});

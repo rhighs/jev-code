@@ -248,3 +248,12 @@ test('lists are not offered inside list elements or call arguments, and file nam
   assert.ok(!Object.hasOwn(element, 'list'));
   assert.ok(Object.hasOwn(nested.criteria[nested.states.findIndex(s => s.generation.slot === 'expression')]!, 'list'));
 });
+
+test('a call nested two levels inside call arguments is not offered a third call', async () => {
+  const provider = new AstProvider(['0', 'expr', 'call', { value: 'print' }, '1', 'call', { value: 'len' }, 'string', { value: JSON.stringify('Hello, world!') }, 'finish']);
+  assert.equal(await generatePythonAst(decisions(provider), state, 'content', options), "print(len('Hello, world!'))\n");
+  const slots = provider.states.map(s => s.generation.slot);
+  const inner = provider.criteria[slots.lastIndexOf('argument_0')]!;
+  assert.ok(!Object.hasOwn(inner, 'call'));
+  assert.ok(Object.hasOwn(provider.criteria[slots.indexOf('argument_0')]!, 'call'));
+});

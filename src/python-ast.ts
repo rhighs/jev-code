@@ -223,7 +223,7 @@ export interface Builder {
   pick(slot: string, scope: Scope, criteria: Record<string, string>, depth?: number): Promise<string>;
   terminal(slot: string, scope: Scope, values: Array<string | number>): Promise<string | number>;
   identifier(slot: string, scope: Scope, exclude?: string[]): Promise<string>;
-  expression(target: PythonNode, scope: Scope, depth: number, slot?: string, numberConstraint?: 'positive' | 'nonzero'): Promise<void>;
+  expression(target: PythonNode, scope: Scope, depth: number, slot?: string, numberConstraint?: 'positive' | 'nonzero', calls?: number): Promise<void>;
   block(body: PythonNode[], scope: Scope, depth: number, slot: string): Promise<void>;
 }
 
@@ -310,12 +310,13 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
     return value;
   }
 
-  async function expression(target: PythonNode, scope: Scope, depth: number, slot = 'expression', numberConstraint?: 'positive' | 'nonzero'): Promise<void> {
+  async function expression(target: PythonNode, scope: Scope, depth: number, slot = 'expression', numberConstraint?: 'positive' | 'nonzero', calls = 0): Promise<void> {
     const table = symbolTable(scope);
     const namesForValue = visible(scope).filter(id => !['builtin', 'function'].includes(table[id]!.kind));
     const criteria: Record<string, string> = { string: 'A literal string.', number: 'A numeric literal.', boolean: 'True, False or None.' };
     if (namesForValue.length) criteria.name = 'Reference an already defined variable, parameter or module.';
-    if (depth < maxDepth) Object.assign(criteria, { call: 'Call a function, such as print, with arguments.', binary: 'Combine two expressions with arithmetic.', compare: 'Compare two expressions.', attribute: 'Read an attribute from a defined object.', subscript: 'Index a defined object.' });
+    if (depth < maxDepth) Object.assign(criteria, { binary: 'Combine two expressions with arithmetic.', compare: 'Compare two expressions.', attribute: 'Read an attribute from a defined object.', subscript: 'Index a defined object.' });
+    if (depth < maxDepth && calls < 2) criteria.call = 'Call a function, such as print, with arguments.';
     if (depth < maxDepth && !slot.startsWith('element_') && !slot.startsWith('argument_')) criteria.list = 'A list of expressions.';
     const production = await pick(slot, scope, criteria, depth);
     if (production === 'string') { Object.assign(target, node('Constant', { value: String(await terminal('string', scope, strings)), kind: null })); }
@@ -358,19 +359,19 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
         const range = func._type === 'Name' && func.id === 'range';
         const explicitRange = /range\s*\(|\b(?:empty|zero iterations|zero times)\b/i.test(objective);
         const constraint = range && i === 2 ? 'nonzero' : range && !explicitRange && count === 1 ? 'positive' : undefined;
-        await expression(arg, scope, depth + 1, `argument_${i}`, constraint);
+        await expression(arg, scope, depth + 1, `argument_${i}`, constraint, calls + 1);
       }
     } else if (production === 'binary' || production === 'compare') {
       const left = node('Hole'), right = node('Hole');
       const operators = production === 'binary' ? { Add: 'addition +', Sub: 'subtraction -', Mult: 'multiplication *', Div: 'division /', FloorDiv: 'integer division //', Mod: 'remainder %', Pow: 'power **' } : { Eq: 'equal ==', NotEq: 'not equal !=', Lt: 'less than <', LtE: 'less or equal <=', Gt: 'greater than >', GtE: 'greater or equal >=', In: 'membership in' };
       const operator = await pick('operator', scope, operators);
       Object.assign(target, production === 'binary' ? node('BinOp', { left, op: node(operator), right }) : node('Compare', { left, ops: [node(operator)], comparators: [right] }));
-      await expression(left, scope, depth + 1, 'left'); await expression(right, scope, depth + 1, 'right');
+      await expression(left, scope, depth + 1, 'left', undefined, calls); await expression(right, scope, depth + 1, 'right', undefined, calls);
     } else if (production === 'list') {
       const elts: PythonNode[] = [];
       Object.assign(target, node('List', { elts, ctx: node('Load') }));
       const count = Number(await pick('element_count', scope, { '0': 'Empty list.', '1': 'One element.', '2': 'Two elements.', '3': 'Three elements.' }));
-      for (let i = 0; i < count; i++) { const value = node('Hole'); elts.push(value); await expression(value, scope, depth + 1, `element_${i}`); }
+      for (let i = 0; i < count; i++) { const value = node('Hole'); elts.push(value); await expression(value, scope, depth + 1, `element_${i}`, undefined, calls); }
     } else {
       const value = node('Hole');
       Object.assign(target, production === 'attribute' ? node('Attribute', { value, attr: await identifier('attribute_name', scope), ctx: node('Load') }) : node('Subscript', { value, slice: node('Hole'), ctx: node('Load') }));
