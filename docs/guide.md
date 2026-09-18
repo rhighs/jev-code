@@ -26,7 +26,13 @@ npm run dev -- --help
 
 In a terminal, launching without a task starts a persistent interactive session. A positional task starts the first run and leaves the session open for follow-ups. `-p`/`--print` runs once and exits. Task files, JSON output, and non-terminal input select one-shot mode unless `--interactive` is explicit.
 
-You can keep typing while Jev is working: new messages update the active task at the next turn. A pending tool is reconsidered before execution if a newer instruction has arrived. `/cancel` or Ctrl-C stops the current run and returns to the session. Ctrl-C at an empty idle prompt exits. Bash output streams while commands run, and the prompt shows the current turn and argument-generation progress. The terminal shows a numbered source preview as the AST develops, syntax colors, a working indicator, and a live elapsed clock. Colors respect `NO_COLOR` and `TERM=dumb`; JSON and non-terminal output remain plain.
+The session renders as a scrolling transcript with a pinned live area at the bottom, built on Ink. Ink renders to stderr and reads stdin, so stdout stays clean; `--json` is unaffected by the UI. The interactive session needs both stdin and stderr to be TTYs; piped input, `--json`, a task file, or a plain redirect fall back to one-shot rendering instead.
+
+Completed tool calls join the transcript as cards. A write card shows the first 8 lines of the file with line numbers and syntax highlighting, a count of remaining lines, and a `/show <path>` hint. An edit card shows the change as a unified diff hunk, removed and added lines marked separately. A run card shows the command, exit code, duration, and the first 6 lines of output with a remaining-line count. A multi-file write lists every path written, clipped past 8 with a count, and is tracked by `/files` like single-file writes. Turn boundaries, task updates, cancellations, and the end-of-run summary are their own rows, not indented prose.
+
+While Jev generates, a live pane pins above the prompt: the file taking shape, sized to the terminal, with the slot currently being filled marked in the source; under 80 columns the pane is hidden and only the decision strip remains (see the degradation notes below). A one-line decision strip under the pane always shows the current slot, the chosen production, its confidence, and the running request count; before the first decision lands it reads `choosing…`. A pick is marked low-confidence when the winner's probability is within 0.1 of the runner-up's, or when Jev's own confidence is under 0.5 — there is no absolute cutoff. A status line above the prompt shows elapsed time, turn, requests used against the budget, and the active phase.
+
+You can keep typing while Jev is working: new messages update the active task at the next turn, and once applied are echoed as their own row; the transcript and live pane stay stable while you type. `/cancel` or Ctrl-C stops the current run and returns to the session. Ctrl-C at an empty idle prompt exits.
 
 | Session command | Behavior |
 | --- | --- |
@@ -36,6 +42,7 @@ You can keep typing while Jev is working: new messages update the active task at
 | `/history` | Show recent tasks, outcomes, and elapsed time. |
 | `/files` | List files written or edited in this session. |
 | `/show <path>` | View an actual file with line numbers without a model request. |
+| `/trace [n]` | List the last `n` decisions (default 10, max 20) with their winning production and rejected alternatives. |
 | `/clear` | Clear conversation and host observations; keep files and journals. |
 | `/cancel` | Cancel active work without exiting. |
 | `/permissions ask` / `/permissions auto` | Change approval of agent tool calls. |
@@ -43,11 +50,15 @@ You can keep typing while Jev is working: new messages update the active task at
 | `/exit` | Cancel active work and quit. |
 | `!<command>` | Execute your Bash command directly; its observed result is available to Jev on the next task. |
 
-Agent shell confirmation accepts `y` or `n`. Session commands remain available while waiting for approval; a task update causes the obsolete tool call to be reconsidered. Direct `!` commands are explicitly requested by you and execute immediately. Only one agent run or direct shell command executes at a time. Conversation lives in memory for this process, with a bounded summary of earlier tasks and recent host-command observations; restarting does not restore it automatically.
+A tool that needs permission renders as the card it would produce — the command or diff is visible before you answer — and resolves on a single keypress: `y` allows this call once, `n` denies it, `a` allows that tool for the rest of the session. While a prompt is awaiting approval the status line reads `y allow · n deny · a always` and typing does not reach the input box; only those three keys register, and Ctrl-C still cancels the run. A denial is recorded as its own card, with the reason returned to Jev, and the run continues; a pending tool is reconsidered before execution if a newer task update has arrived in the meantime. Direct `!` commands are explicitly requested by you and execute immediately. Only one agent run or direct shell command executes at a time. Conversation lives in memory for this process, with a bounded summary of earlier tasks and recent host-command observations; restarting does not restore it automatically.
 
 Shell commands require confirmation by default. `--confirm-writes` also confirms file mutations. `--yes` enables unattended execution. A declined call is returned as feedback; it is never executed. Tasks from stdin need `--prompt-file -`; combine that with `--yes` when Bash execution is needed.
 
 Direct file tools resolve symlinks and reject paths outside the selected workspace. `--allow-outside` explicitly lifts that file boundary. **Bash runs on the host**; its working directory is not an OS sandbox, and its commands can access anything your user account can. Run the harness inside a container or VM when you need shell isolation. Bash children do not inherit `TYPESAFE_API_KEY` from the harness.
+
+**Degradation.** Below 80 columns the live pane is dropped and only the decision strip remains; every line is clipped to the terminal width with a trailing ellipsis, so the terminal's own auto-wrap never splits a word across two screen lines. `NO_COLOR` or `TERM=dumb` turn off color and cursor movement in both the interactive session and `--print`. Under tmux and over SSH, the pinned live area redraws only when its content changes, so scrollback and multiplexer redraws stay legible. A non-TTY stdin or stderr — a pipe, a redirect, `--json`, a task file — falls back to the plain, `--print`-style renderer instead of mounting Ink.
+
+Interactive rendering runs on Ink, React, and `ink-text-input` at runtime; `--print`, `--json`, `decide`, and `replay --plain` never load them. The installer is unaffected: it still runs `npm ci --ignore-scripts` from the source tarball against the committed `package-lock.json`.
 
 ## Tools and turns
 
@@ -74,7 +85,7 @@ objective → decomposition: helper functions (name, arity, purpose) or none
 
 Multi-file projects go through `write_files`. Jev first picks a package name, one to three module names, and for each helper unit the module that holds it (`main` or a package module); units in `main.py` are not offered as peers to package units. Cross-module calls never require Jev to write imports: the assembler inserts `from <pkg>.<module> import <name>` as the first statement of the calling unit's body, or at module level in `main.py`, so mutual calls between package modules resolve at call time. The main block is emitted under `if __name__ == "__main__":`, which keeps every module importable without side effects. Before anything is written, the set is validated statically: each file is compiled and every `import`/`from` target is located on disk or in the standard library with `importlib.util.find_spec`, and a package or module name that shadows an installed module is rejected; no generated module is imported or executed. Manifest paths must be relative identifier paths ending in `.py` and pass the workspace path policy before the validation copy is made.
 
-The Python AST builder, implemented in TypeScript, owns the grammar and tracks defined variables, function parameters, imports, functions, and builtins. Generation starts with a decomposition: Jev picks how many helper functions the program needs (zero to six), and for each a name, arity, one-line purpose, and parameter names. Zero helpers is the plain single-block path. Helper bodies are then generated concurrently, each in its own function scope that sees every helper as a callable with its arity plus a flat `peers` list, and the main block follows with the helpers defined. Each decision includes the rendered source so far with a `__jev_pending__` marker at the slot being filled, the current slot, visible symbols, and depth/function/loop constraints; context is trimmed to the request budget, dropping the plan first, then recent tool output, then windowing the source around the marker. An assignment becomes visible after its right-hand side is built. Function parameters stay in their function scope; defined functions constrain call arity from the symbol table. `return` is offered only inside functions; `break` and `continue` only inside loops, and nested functions reset loop scope. Dependent AST productions within one body run sequentially. Helper bodies and independent tool fields run concurrently, sharing one in-flight request cap (`--concurrency`, default 4, max 16). One failing helper aborts the whole write. The terminal draft shows the assembled module during helper generation and names the helper being filled.
+The Python AST builder, implemented in TypeScript, owns the grammar and tracks defined variables, function parameters, imports, functions, and builtins. Generation starts with a decomposition: Jev picks how many helper functions the program needs (zero to six), and for each a name, arity, one-line purpose, and parameter names. Zero helpers is the plain single-block path. Helper bodies are then generated concurrently, each in its own function scope that sees every helper as a callable with its arity plus a flat `peers` list, and the main block follows with the helpers defined. Each decision includes the rendered source so far with a `__jev_pending__` marker at the slot being filled, the current slot, visible symbols, and depth/function/loop constraints; context is trimmed to the request budget, dropping the plan first, then recent tool output, then windowing the source around the marker. An assignment becomes visible after its right-hand side is built. Function parameters stay in their function scope; defined functions constrain call arity from the symbol table. `return` is offered only inside functions; `break` and `continue` only inside loops, and nested functions reset loop scope. Dependent AST productions within one body run sequentially. Helper bodies and independent tool fields run concurrently, sharing one in-flight request cap (`--concurrency`, default 4, max 16). One failing helper aborts the whole write. The live pane shows the assembled module during helper generation and names the helper being filled.
 
 `--search-width <k>` (default 1, max 8) generates each helper body `k` times from independent forks under the same in-flight cap and request budget. Candidates first pass a static check that never executes anything: the body must compile, reference only defined names, call peers with their declared arity, and contain a `return` when its purpose implies a value (words such as return, compute, get, read, sum, count, check, parse, build, convert). Survivors are each rated once with a Jev `score` question over a fixed four-level rubric from "does not address the purpose" to "correct and minimal"; the highest expected level is kept and ties keep the first. Every candidate outcome is a `text` event with `decoder: "search"` carrying the helper name, candidate index, kept flag, and drop reason, and the terminal prints one `search · helper · candidate i · kept|dropped(reason)` line per candidate. When every candidate is dropped the write fails with the reasons and nothing is written. Width 1 skips search entirely and issues exactly the same requests as before.
 
@@ -96,7 +107,11 @@ Run statuses are `completed`, `blocked`, `limited`, `cancelled`, or `error`. Onl
 
 ## Observe
 
-Every run writes `.jev/runs/<run-id>.jsonl` with decisions, model identities, progress, full tool arguments, outcomes, usage, and final status. Journals are created with owner-only file permissions. They can contain project source and command output. `--no-journal` disables persistence; `--json` emits machine-readable events to stdout, with any confirmation prompts on stderr. Generation events report AST productions and tree previews, exact-plan selections, or grid cell patches with their candidate probabilities. The terminal shows the active draft while generation runs. The completed source is shown before execution; Bash stdout and stderr stream separately. `bytes` counts UTF-8 bytes.
+Every run writes `.jev/runs/<run-id>.jsonl` with decisions, model identities, progress, full tool arguments, outcomes, usage, and final status. Journals are created with owner-only file permissions. They can contain project source and command output. `--no-journal` disables persistence. Generation events report AST productions and tree previews, exact-plan selections, or grid cell patches with their candidate probabilities. The completed source is shown before execution; Bash stdout and stderr stream separately. `bytes` counts UTF-8 bytes.
+
+`--print` renders the same cards as the interactive transcript, in plain text with no cursor movement, spinners, or color unless the target stream is a TTY and `NO_COLOR`/`TERM=dumb` allow it. Cards go to stderr as each tool call completes; the fixed-shape `[status]` summary — the outcome, the facts from tool records, and the budget spent — is written to stdout once, at the end, so `jev-code --print ... | tail -1` keeps working. Non-TTY output never reprints the whole source on each AST production: it prints one short step line per production and the final source once, inside its card, exactly as `--print` does. Any confirmation prompt goes to stderr, never stdout.
+
+`--json` emits one machine-readable event per line to stdout; this UI changed no event shape, only added fields: `schema: 1` on the `start` event, and `options` (the winner plus up to three runners-up), `field`, `phase`, `slot`, `unit`, and `candidate` on `decision` events.
 
 The CLI prints real tool outcomes and an observed completion summary derived from successful tool records. A finish turn only selects the action and checks completion; it generates no prose. The default check is a categorical `complete` / `continue` choice over the current task and observed results; it excludes prior conversations and avoids a fixed probability cutoff. Library hosts can explicitly opt into a strict Noul gate with `completionThreshold`. Rejected completion requires another action before a new finish attempt, and rejected finish records are excluded from verification evidence. Three rejected completion checks without an implementation write stop with `limited`; repeated Bash runs, reads, or plan updates do not reset that guard. Generated blocker explanations are retained as `modelSummary`. For experimental evaluation, inspect generated files and verification results. This version does not automatically resume interrupted runs or replay tool effects; start a new task against the existing workspace to continue work.
 
@@ -112,6 +127,50 @@ Turn 3 finished · 1.1 s · 6.0 s total elapsed · 3 requests
 ```
 
 Every JSONL event has `elapsedMs`. `turn_end` events contain `durationMs`, `elapsedMs`, and `requests`; the final `end` event and library result contain `startedAt`, `endedAt`, and `durationMs`. Library results also include `turnTimings`. `/status` shows elapsed time for current/last work and `/history` shows task durations. A run starts when the harness accepts the prompt and ends when it determines the final status, before delivery of the final event. Updates join the same run clock. The same timing fields are available for failures, limits, and cancellations.
+
+## Decide
+
+`decide` turns stdin into one Jev decision so a shell script can branch on it. It never runs tools, never writes files, and never loads the TUI; it needs `TYPESAFE_API_KEY` like every other live command. It reads all of stdin first, then shrinks it to the request budget if it is oversized, printing `input truncated to N bytes` to stderr when that happens.
+
+Pick exactly one mode:
+
+| Flag | Behavior |
+| --- | --- |
+| `decide "<question>" --choices a,b,c` | Ask one choice question over stdin. Labels must be unique; 2 to 100 of them. Prints `label confidence` on stdout; exits with the 0-based index of the chosen label. |
+| `decide --true "<statement>" [--threshold 0.5]` | Print the probability the statement holds for stdin. Exits 0 at or above `--threshold` (0 to 1, default 0.5), 1 below it. |
+| `decide --score "<criteria>"` | Print the expected level over a fixed four-level rubric ("does not satisfy" to "fully satisfies") for stdin. Exits 0. |
+| `--lines` | With `--true` or `--score`: score each non-blank stdin line separately, one request per line, and print them ranked best first as `value <tab> line`. With `--true` and `--threshold`, only lines meeting the threshold are printed. |
+| `decide --spec <file.json>` | Run several questions from a JSON array — each entry exactly one of `{ question, choices }`, `{ true, threshold? }`, or `{ score }` — over the same stdin; prints one JSON line per answer. |
+| `--json` | Print each answer as a `decision` harness event (the same shape a run emits, with a synthetic `runId`) instead of the plain-text or JSON-per-line output above. |
+
+Exit codes follow one rule: an option's own index for `--choices`, 0 for `--true`/`--score`/`--spec` successes, and 125 for any failure — a missing key, bad arguments, a single choice, more than 100 choices, or a confidence failure from the provider — with the reason on stderr. Choices are capped at 100 so their indices never reach 125.
+
+```bash
+# Gate a commit on a diff verdict
+git diff --cached | jev-code decide "Is this change safe to commit?" --choices yes,no && git commit -m "..."
+
+# Page on-call only above a confidence threshold
+cat error.log | jev-code decide --true "this log shows a crash" --threshold 0.7 && ./page-oncall.sh
+
+# Rank lines by relevance
+printf 'line one\nline two\nline three\n' | jev-code decide --score "relevance to the task" --lines
+
+# Run several questions from a spec file
+cat notes.md | jev-code decide --spec review.json
+
+# Same choice, as a decision event
+echo "some text" | jev-code decide "Is this spam?" --choices yes,no --json
+```
+
+`--lines` and `--spec` cost one Jev request per line or question, so a large `--spec` or a long piped file scales the request count accordingly; stdin itself is trimmed to the same request-size budget generation uses, independent of that count.
+
+## Replay
+
+`jev-code replay <run-id> [--speed x] [--plain]` renders a saved journal through the same transcript model a live run uses — the same cards and live pane, from a file instead of a live harness. It looks for `<run-id>.jsonl` under `.jev/runs/` first, then under `.jev/eval/journals/<task>/`. An unknown run id exits non-zero with a one-line error.
+
+On an interactive terminal it mounts the same Ink session, read-only — no prompt, no approvals. `--plain`, or a non-interactive terminal, renders through the plain renderer instead, identical in shape to `--print` output. Replay is instant by default; `--speed x` paces it by the original events' `elapsedMs` deltas divided by `x`, with any single gap between events capped at 2 seconds so a long pause in the original run does not stall playback. Ctrl-C exits replay immediately, whether paced or instant.
+
+The journal's `start` event carries `schema: 1`. A journal from a newer schema is refused, with a message naming both the journal's version and the version replay supports. A journal missing that field is an older, schema-0 journal; it replays best-effort with a warning.
 
 ## Install AST adapters
 
