@@ -21,6 +21,8 @@ import { runDecide } from './decide.js';
 import { NO_KEY, configPath, promptSecret, readConfig, resolveApiKey, writeConfig } from './config.js';
 import { MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
 import { checkSchema, findJournal, readJournal, replayPlain } from './replay.js';
+import { proposeTools } from './providers/index.js';
+import { pick, providerCommand, wizard } from './providers/setup.js';
 import type { HarnessOptions } from './harness.js';
 import type { Tool } from './types.js';
 
@@ -59,6 +61,7 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
     --json                    Print each decide answer as a decision event; failures exit 125
   login                   Enter your typesafe.ai API key and save it under ~/.config/jev-code
   logout                  Forget the saved API key
+  provider login|logout|list|models|use  Configure the generation provider behind the propose tool
   replay <run-id>         Render a saved .jev/runs or .jev/eval journal through the transcript
     --speed <x>               Pace events at x times real time (default: instant; gaps capped at 2 s)
     --plain                   Print cards as text instead of the Ink view
@@ -147,6 +150,7 @@ async function main(): Promise<void> {
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   if (process.argv[2] === 'login') return login();
   if (process.argv[2] === 'logout') return logout();
+  if (process.argv[2] === 'provider') { process.exitCode = await providerCommand(process.argv.slice(3), { out: process.stdout, stdin: process.stdin }); return; }
   if (process.argv[2] === 'decide') {
     try { await ensureApiKey(false); }
     catch (error) { process.stderr.write(`decide: ${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 125; return; }
@@ -233,11 +237,19 @@ async function main(): Promise<void> {
     return value;
   };
   await ensureApiKey(tty);
+  if (interactive && tty && !(await readConfig()).generation) {
+    const io = { out: process.stderr, stdin: process.stdin };
+    const i = await pick('Configure a generation provider for propose?', ['Yes', 'Not now'], io);
+    if (i === 0) await wizard(io).catch((err: unknown) => process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`));
+    else await writeConfig({ ...await readConfig(), generation: { provider: 'none' } });
+  }
+  const asts = [...await loadInstalledAsts(workspace), ...(await Promise.all((values.asts ?? []).map(module => loadAstModule(workspace, module)))).flat()];
+  const propose = await proposeTools(process.env, new AstRegistry(asts), line => process.stderr.write(`${line}\n`));
   const provider = new JevProvider();
   const harnessOptions: Omit<HarnessOptions, 'onEvent' | 'authorize'> = {
-    workspace, provider, tools: [...builtInTools(), ...extraTools],
+    workspace, provider, tools: [...builtInTools(), ...extraTools, ...propose],
     experimentalGrid: values['experimental-grid'] ?? false,
-    astAdapters: [...await loadInstalledAsts(workspace), ...(await Promise.all((values.asts ?? []).map(module => loadAstModule(workspace, module)))).flat()],
+    astAdapters: asts,
     maxTurns: limit('max-turns', DEFAULT_LIMITS.maxTurns), maxRequests: limit('max-requests', DEFAULT_LIMITS.maxRequests), maxGenerationSteps: limit('max-steps', DEFAULT_LIMITS.maxGenerationSteps),
     maxRunMs: limit('timeout-ms', DEFAULT_LIMITS.maxRunMs), allowOutsideWorkspace: values['allow-outside'] ?? false,
     gridBatchSize: limit('grid-batch-size', 8), concurrency: limit('concurrency', 4), searchWidth: limit('search-width', 1), maxProposals: limit('max-proposals', 20),
