@@ -1,25 +1,24 @@
 import { lstat, readFile } from 'node:fs/promises';
 import type { AstRegistry } from '../ast-adapters.js';
-import { diffLines, formatHunk } from '../diff.js';
-import type { Completion, ProposalProvider, ProposalRequest } from '../providers/types.js';
+import { diffLines, formatHunk, type DiffLine } from '../diff.js';
+import type { Completion, GenerationError, ProposalProvider, ProposalRequest } from '../providers/types.js';
 import { atomicWrite } from '../tools.js';
-import type { Tool, ToolContext, ToolResult } from '../types.js';
+import type { Tool, ToolArgs, ToolContext, ToolResult } from '../types.js';
 import type { Candidate, CandidateSummary } from './types.js';
-import { validateCandidates } from './validate.js';
+import { MAX_CANDIDATE_BYTES, validateCandidates } from './validate.js';
 
-type Args = Record<string, string | number | boolean>;
-const MAX_PREVIEW = 4096, MAX_CRITERION = 80, MAX_HUNK = 120, MAX_FILE = 2_000_000;
+const MAX_PREVIEW = 4096, MAX_CRITERION = 80, MAX_HUNK = 120, MAX_FILE = MAX_CANDIDATE_BYTES * 4;
 const INSTRUCTION = 'Select the candidate that best accomplishes the objective under the constraints, or reject all of them.';
 const REJECT = 'No candidate is acceptable; the objective or constraints need a change.';
 
-const str = (args: Args, key: string): string => typeof args[key] === 'string' ? args[key] : '';
-const num = (args: Args, key: string, fallback: number): number => typeof args[key] === 'number' ? args[key] : fallback;
+const str = (args: ToolArgs, key: string): string => typeof args[key] === 'string' ? args[key] : '';
+const num = (args: ToolArgs, key: string, fallback: number): number => typeof args[key] === 'number' ? args[key] : fallback;
 const msg = (err: unknown): string => err instanceof Error ? err.message : String(err);
 
 const readCurrent = async (target: string): Promise<string | undefined> => {
   const info = await lstat(target).catch((err: NodeJS.ErrnoException) => { if (err.code !== 'ENOENT') throw err; return undefined; });
   if (!info) return undefined;
-  if (!info.isFile() || info.size > MAX_FILE) throw new Error('propose requires a regular file of at most 2MB.');
+  if (!info.isFile() || info.size > MAX_FILE) throw new Error(`propose requires a regular file of at most ${MAX_FILE / 1024}KB; use edit_file for larger files.`);
   return readFile(target, 'utf8');
 };
 
@@ -32,16 +31,15 @@ const distinctLine = (c: Candidate, others: Candidate[]): string => {
   return lines.find(l => seen.every(set => !set.has(l))) ?? lines[0] ?? '';
 };
 
-const criterion = (c: Candidate, valid: Candidate[], cur: string | undefined): string => {
+const criterion = (c: Candidate, valid: Candidate[], hunk: DiffLine[] | undefined): string => {
   const head = distinctLine(c, valid.filter(o => o !== c));
-  if (cur === undefined) return head.slice(0, MAX_CRITERION);
-  const hunk = diffLines(cur, c.text);
+  if (!hunk) return head.slice(0, MAX_CRITERION);
   const added = hunk.filter(l => l.kind === 'add').length, removed = hunk.filter(l => l.kind === 'remove').length;
   return `+${added}/-${removed} ${head}`.slice(0, MAX_CRITERION);
 };
 
-const preview = (c: Candidate, cur: string | undefined): string =>
-  (cur === undefined ? c.text : formatHunk(diffLines(cur, c.text)).join('\n')).slice(0, MAX_PREVIEW);
+const preview = (c: Candidate, hunk: DiffLine[] | undefined): string =>
+  (hunk ? formatHunk(hunk).join('\n') : c.text).slice(0, MAX_PREVIEW);
 
 export const proposeTool = (provider: ProposalProvider, registry: AstRegistry): Tool => ({
   name: 'propose', effect: 'write',
@@ -53,7 +51,7 @@ export const proposeTool = (provider: ProposalProvider, registry: AstRegistry): 
     count: { type: 'number', min: 1, max: 5, default: 3, description: 'Number of candidates to generate. Empty means 3.' },
     path: { type: 'string', allowEmpty: true, description: 'Destination file path for kind=file. Empty for kind=text.' },
   },
-  async execute(args: Args, ctx: ToolContext): Promise<ToolResult> {
+  async execute(args: ToolArgs, ctx: ToolContext): Promise<ToolResult> {
     if (!ctx.select) throw new Error('propose needs a host that can select');
     if (ctx.proposals && ctx.proposals.used >= ctx.proposals.max) return { ok: false, output: 'proposal budget exhausted; use write_file or edit_file' };
     const kind = str(args, 'kind');
@@ -67,19 +65,22 @@ export const proposeTool = (provider: ProposalProvider, registry: AstRegistry): 
       kind, objective: str(args, 'objective'), constraints: str(args, 'constraints'), count,
       ...(kind === 'file' ? { path } : {}), ...(cur === undefined ? {} : { current: cur }),
     };
+    ctx.assertRequests?.(1);
     if (ctx.proposals) ctx.proposals.used++;
-    const completions: Array<Completion | { error: string }> = await provider.generate(req, ctx.signal)
+    const completions: Array<Completion | GenerationError> = await provider.generate(req, ctx.signal)
       .catch((err: unknown) => Array.from({ length: count }, () => ({ error: msg(err) })));
     ctx.signal.throwIfAborted();
     const candidates = await validateCandidates(req, completions, registry, ctx.signal);
+    ctx.signal.throwIfAborted();
     const head = [`provider=${provider.id} model=${provider.model}`, ...candidates.map(line)];
     const data: Record<string, unknown> = { provider: provider.id, model: provider.model, kind, ...(kind === 'file' ? { path } : {}), candidates: candidates.map(summary) };
     const valid = candidates.filter(c => c.valid);
     if (!valid.length) return { ok: false, output: [...head, 'no valid candidate'].join('\n'), data };
-    const criteria = { ...Object.fromEntries(valid.map(c => [c.label, criterion(c, valid, cur)])), reject: REJECT };
+    const hunks = new Map(valid.map(c => [c.label, cur === undefined ? undefined : diffLines(cur, c.text)]));
+    const criteria = { ...Object.fromEntries(valid.map(c => [c.label, criterion(c, valid, hunks.get(c.label))])), reject: REJECT };
     const extra = {
       field: 'candidate', generation: { phase: 'propose', slot: 'select' },
-      candidates: candidates.map(c => ({ ...summary(c), ...(c.valid ? { preview: preview(c, cur) } : {}) })),
+      candidates: candidates.map(c => ({ ...summary(c), ...(c.valid ? { preview: preview(c, hunks.get(c.label)) } : {}) })),
     };
     const { choice, confidence } = await ctx.select(INSTRUCTION, criteria, extra);
     if (choice === 'reject') return { ok: false, output: [...head, 'rejected all'].join('\n'), data };
@@ -89,6 +90,7 @@ export const proposeTool = (provider: ProposalProvider, registry: AstRegistry): 
     const picked = { ...data, selected: chosen.label, confidence };
     if (target === undefined) return { ok: true, output: [...head, selected, '', chosen.text].join('\n'), data: picked };
     await atomicWrite(target, chosen.text, ctx.signal);
-    return { ok: true, output: [...head, selected].join('\n'), data: { ...picked, hunk: diffLines(cur ?? '', chosen.text).slice(0, MAX_HUNK) } };
+    const hunk = hunks.get(chosen.label) ?? diffLines('', chosen.text);
+    return { ok: true, output: [...head, selected].join('\n'), data: { ...picked, hunk: hunk.slice(0, MAX_HUNK) } };
   },
 });

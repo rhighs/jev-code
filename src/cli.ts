@@ -21,6 +21,8 @@ import { runDecide } from './decide.js';
 import { NO_KEY, configPath, promptSecret, readConfig, resolveApiKey, writeConfig } from './config.js';
 import { MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
 import { checkSchema, findJournal, readJournal, replayPlain } from './replay.js';
+import { spawn } from 'node:child_process';
+import { sanitizedEnv } from './env.js';
 import { proposeTools } from './providers/index.js';
 import { pick, providerCommand, wizard } from './providers/setup.js';
 import type { HarnessOptions } from './harness.js';
@@ -44,7 +46,7 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
   --concurrency <n>       In-flight Jev requests shared by parallel units and grids (default: 4, max: 16)
   --search-width <n>      Candidates generated per Python unit; the best survivor is kept (default: 1, max: 8)
   --timeout-ms <n>         Total run time (default: ${DEFAULT_LIMITS.maxRunMs})
-  --max-proposals <n>      Generator proposals per run (default: 20)
+  --max-proposals <n>      Generator proposals per run (default: ${DEFAULT_LIMITS.maxProposals})
   --tools <module>        Load additional tools exported as a tools array
   --asts <module>         Load AST adapters for this session (repeatable)
   --experimental-grid    Opt into character-grid fallback (slow/unreliable)
@@ -123,6 +125,12 @@ async function readStdin(limit: number): Promise<string> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+const openBrowser = (url: string): Promise<void> => new Promise(resolve => {
+  const child = spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [url], { stdio: 'ignore', detached: true, env: sanitizedEnv() });
+  child.on('error', () => resolve());
+  child.on('spawn', () => { child.unref(); resolve(); });
+});
+
 const KEY_PROMPT = 'Paste your typesafe.ai API key (saved to ~/.config/jev-code/config.json): ';
 
 async function ensureApiKey(interactive: boolean): Promise<void> {
@@ -150,7 +158,7 @@ async function main(): Promise<void> {
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   if (process.argv[2] === 'login') return login();
   if (process.argv[2] === 'logout') return logout();
-  if (process.argv[2] === 'provider') { process.exitCode = await providerCommand(process.argv.slice(3), { out: process.stdout, stdin: process.stdin }); return; }
+  if (process.argv[2] === 'provider') { process.exitCode = await providerCommand(process.argv.slice(3), { out: process.stdout, stdin: process.stdin, open: openBrowser }); return; }
   if (process.argv[2] === 'decide') {
     try { await ensureApiKey(false); }
     catch (error) { process.stderr.write(`decide: ${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 125; return; }
@@ -237,11 +245,12 @@ async function main(): Promise<void> {
     return value;
   };
   await ensureApiKey(tty);
-  if (interactive && tty && !(await readConfig()).generation) {
-    const io = { out: process.stderr, stdin: process.stdin };
+  const cfg = interactive && tty ? await readConfig() : undefined;
+  if (cfg && !cfg.generation) {
+    const io = { out: process.stderr, stdin: process.stdin, open: openBrowser };
     const i = await pick('Configure a generation provider for propose?', ['Yes', 'Not now'], io);
     if (i === 0) await wizard(io).catch((err: unknown) => process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`));
-    else await writeConfig({ ...await readConfig(), generation: { provider: 'none' } });
+    else if (i === 1) await writeConfig({ ...cfg, generation: { provider: 'none' } });
   }
   const asts = [...await loadInstalledAsts(workspace), ...(await Promise.all((values.asts ?? []).map(module => loadAstModule(workspace, module)))).flat()];
   const propose = await proposeTools(process.env, new AstRegistry(asts), line => process.stderr.write(`${line}\n`));
@@ -252,7 +261,7 @@ async function main(): Promise<void> {
     astAdapters: asts,
     maxTurns: limit('max-turns', DEFAULT_LIMITS.maxTurns), maxRequests: limit('max-requests', DEFAULT_LIMITS.maxRequests), maxGenerationSteps: limit('max-steps', DEFAULT_LIMITS.maxGenerationSteps),
     maxRunMs: limit('timeout-ms', DEFAULT_LIMITS.maxRunMs), allowOutsideWorkspace: values['allow-outside'] ?? false,
-    gridBatchSize: limit('grid-batch-size', 8), concurrency: limit('concurrency', 4), searchWidth: limit('search-width', 1), maxProposals: limit('max-proposals', 20),
+    gridBatchSize: limit('grid-batch-size', 8), concurrency: limit('concurrency', 4), searchWidth: limit('search-width', 1), maxProposals: limit('max-proposals', DEFAULT_LIMITS.maxProposals),
     ...(values['no-journal'] ? { journalDirectory: false as const } : {}),
   };
   if (interactive) {

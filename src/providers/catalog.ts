@@ -10,7 +10,7 @@ export const PROVIDERS: ProviderSpec[] = [
       tokenUrl: 'https://auth.openai.com/oauth/token',
       clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
       scopes: ['openid', 'profile', 'email', 'offline_access'],
-      redirect: 'loopback', port: 1455, callbackPath: '/auth/callback', state: true, exchange: 'token',
+      redirect: 'loopback', port: 1455, callbackPath: '/auth/callback', state: true, exchange: 'token', tokenBody: 'form',
       wire: 'openai-responses', baseUrl: 'https://chatgpt.com/backend-api/codex', discover: false,
     },
   },

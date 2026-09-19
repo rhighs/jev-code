@@ -3,17 +3,17 @@ import { isInteractiveTTY } from '../terminal-style.js';
 import { PROVIDERS, providerSpec, resolveWire } from './catalog.js';
 import { credentialFor, credentialsPath, readCredentials } from './credentials.js';
 import { authFor } from './oauth.js';
-import type { AuthMethod, Credential, ProviderSpec } from './types.js';
+import type { AuthMethod, Credential, ProviderIo, ProviderSpec } from './types.js';
 import { listModels } from './wire.js';
 
-export interface Io { out: NodeJS.WriteStream; stdin: NodeJS.ReadStream; err?: NodeJS.WriteStream; open?: (url: string) => Promise<void> }
+export interface Io extends ProviderIo { err?: NodeJS.WriteStream }
 
 const AUTH_LABELS: Record<AuthMethod, string> = {
   oauth: 'Sign in with OAuth (vendor terms apply)',
   api_key: 'Use API key',
   none: 'No authentication',
 };
-const USAGE = 'Use provider login [id], provider logout [id], provider list, provider models [id], or provider use <id|none>.';
+const USAGE = 'Use provider login [id], provider logout [id], provider list, provider models [id], or provider use <id|none> [--model <id>] [--base-url <url>].';
 const noCredential = (id: string): string => `No credential for ${id}. Run jev-code provider login ${id}.`;
 
 export function pick(title: string, options: string[], io: Io): Promise<number | undefined> {
@@ -103,29 +103,45 @@ const list = async (cfg: Config, env: NodeJS.ProcessEnv, io: Io): Promise<number
 
 const models = async (cfg: Config, id: string, env: NodeJS.ProcessEnv, io: Io): Promise<number> => {
   const spec = withBase(providerSpec(id), cfg.generation?.provider === id ? cfg.generation.baseUrl : null);
-  const cred = await credentialFor(id, env) ?? anonymous(spec);
+  const cred = await credentialFor(id, env, configured(cfg) === id) ?? anonymous(spec);
   if (!cred) throw new Error(noCredential(id));
   for (const m of await modelIds(spec, cred, io)) io.out.write(`${m}\n`);
   return 0;
 };
 
-const use = async (cfg: Config, id: string, env: NodeJS.ProcessEnv, io: Io): Promise<number> => {
+interface UseFlags { model?: string; baseUrl?: string }
+
+const useFlags = (args: string[]): UseFlags => {
+  const flags: UseFlags = {};
+  for (let i = 0; i < args.length; i += 2) {
+    const [k, v] = [args[i], args[i + 1]];
+    if (!v) throw new Error(USAGE);
+    if (k === '--model') flags.model = v;
+    else if (k === '--base-url') flags.baseUrl = v;
+    else throw new Error(USAGE);
+  }
+  return flags;
+};
+
+const use = async (cfg: Config, id: string, flags: UseFlags, env: NodeJS.ProcessEnv, io: Io): Promise<number> => {
   if (id === 'none') {
     await writeConfig({ ...cfg, generation: { provider: 'none' } }, env);
     io.out.write('Generation provider set to none; propose is disabled.\n');
     return 0;
   }
   const spec = providerSpec(id);
-  const cred = await credentialFor(id, env) ?? anonymous(spec);
+  const cred = await credentialFor(id, env, configured(cfg) === id) ?? anonymous(spec);
   if (!cred) throw new Error(noCredential(id));
   const prev = cfg.generation;
   const same = prev?.provider === id;
   const keep = same || spec.models.some(m => m.id === prev?.model);
-  const generation: Generation = { provider: id, auth: cred.type, baseUrl: same ? prev.baseUrl ?? null : null };
-  if (keep && prev?.model) generation.model = prev.model;
+  const generation: Generation = { provider: id, auth: cred.type, baseUrl: flags.baseUrl ?? (same ? prev.baseUrl ?? null : null) };
+  const model = flags.model ?? (keep ? prev?.model : undefined);
+  if (model) generation.model = model;
   await writeConfig({ ...cfg, generation }, env);
   io.out.write(`Generation provider set to ${id}.\n`);
-  if (!generation.model) io.out.write(`Model cleared; run jev-code provider login ${id} to choose one.\n`);
+  if (!generation.model) io.out.write(`Model cleared; run jev-code provider login ${id} or provider use ${id} --model <id> to choose one.\n`);
+  if (!spec.baseUrl && !generation.baseUrl) io.out.write(`No base URL; run jev-code provider use ${id} --base-url <url>.\n`);
   return 0;
 };
 
@@ -141,7 +157,7 @@ export async function providerCommand(args: string[], io: Io, env: NodeJS.Proces
   const err = io.err ?? process.stderr;
   const [cmd, id, ...extra] = args;
   try {
-    if (extra.length) throw new Error(USAGE);
+    if (extra.length && cmd !== 'use') throw new Error(USAGE);
     const cfg = await readConfig(env);
     if (cmd === 'login') { await wizard(io, env, id); return 0; }
     if (cmd === 'logout') return await logout(cfg, id, env, io);
@@ -151,7 +167,7 @@ export async function providerCommand(args: string[], io: Io, env: NodeJS.Proces
       if (!target) throw new Error('No provider configured. Use provider models <id>.');
       return await models(cfg, target, env, io);
     }
-    if (cmd === 'use' && id !== undefined) return await use(cfg, id, env, io);
+    if (cmd === 'use' && id !== undefined) return await use(cfg, id, useFlags(extra), env, io);
     throw new Error(USAGE);
   } catch (e) {
     err.write(`${e instanceof Error ? e.message : String(e)}\n`);

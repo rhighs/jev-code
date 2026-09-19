@@ -31,7 +31,9 @@ const serve = async (t: test.TestContext, handler: Handler): Promise<{ url: stri
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
     req.on('end', () => {
-      const rec = { method: req.method ?? '', url: req.url ?? '', body: JSON.parse(Buffer.concat(chunks).toString() || '{}') as Record<string, unknown> };
+      const raw = Buffer.concat(chunks).toString();
+      const form = req.headers['content-type']?.startsWith('application/x-www-form-urlencoded') ?? false;
+      const rec = { method: req.method ?? '', url: req.url ?? '', body: (form ? Object.fromEntries(new URLSearchParams(raw)) : JSON.parse(raw || '{}')) as Record<string, unknown> };
       reqs.push(rec);
       handler(rec, res);
     });
@@ -161,13 +163,30 @@ test('loopback times out', async () => {
   await assert.rejects(done, /OAuth login timed out/);
 });
 
-test('loopback reports a port in use and points at the paste path', async t => {
+test('loopback falls back to pasting the redirect URL when the port is in use', async t => {
   const blocker = createServer();
   await new Promise<void>(resolve => blocker.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise<void>(resolve => blocker.close(() => resolve())));
   const { port } = blocker.address() as AddressInfo;
   const fake = fakeIo();
-  await assert.rejects(authorize({ ...openaiDesc, port }, { io: fake.io }), new RegExp(`Port ${port} is in use; run login again and paste the redirect URL when prompted`));
+  const done = authorize({ ...openaiDesc, port }, { io: fake.io });
+  const text = await waitFor(fake.text, 'Paste the authorization code');
+  assert.match(text, new RegExp(`Port ${port} is in use; paste the redirect URL`));
+  const url = new URL(text.split('\n').find(l => l.startsWith('https://'))!);
+  assert.equal(url.searchParams.get('redirect_uri'), `http://localhost:${port}/auth/callback`);
+  fake.stdin.write(`http://localhost:${port}/auth/callback?code=abc&state=${url.searchParams.get('state')}\n`);
+  const res = await done;
+  assert.equal(res.code, 'abc');
+  assert.equal(res.redirectUri, `http://localhost:${port}/auth/callback`);
+});
+
+test('loopback ignores an error callback that lacks the state', async () => {
+  const { done, addr, url } = await startLoopback(openaiDesc);
+  const res = await fetch(`http://127.0.0.1:${addr.port}/auth/callback?error=access_denied`);
+  assert.equal(res.status, 400);
+  const ok = await fetch(`http://127.0.0.1:${addr.port}/auth/callback?code=abc&state=${url.searchParams.get('state')}`);
+  assert.equal(ok.status, 200);
+  assert.equal((await done).code, 'abc');
 });
 
 const paste = async (input: (state: string) => string): Promise<{ done: Promise<{ code: string }>; url: URL; fake: FakeIo }> => {

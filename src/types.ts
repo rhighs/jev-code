@@ -28,7 +28,10 @@ export interface ToolContext {
   onOutput?: (stream: 'stdout' | 'stderr', text: string) => Promise<void>;
   select?(instruction: string, criteria: Record<string, string>, extra: Record<string, unknown>): Promise<{ choice: string; confidence: number }>;
   proposals?: { used: number; max: number };
+  assertRequests?(count: number): void;
 }
+
+export type ToolArgs = Record<string, string | number | boolean>;
 
 export interface Tool {
   name: string;
@@ -36,13 +39,13 @@ export interface Tool {
   fields: Record<string, Field>;
   /** Mutations and shell execution can be confirmed by the host. */
   effect: 'read' | 'write' | 'shell';
-  execute(args: Record<string, string | number | boolean>, context: ToolContext): Promise<ToolResult>;
+  execute(args: ToolArgs, context: ToolContext): Promise<ToolResult>;
 }
 
 export interface ToolRecord extends Record<string, unknown> {
   turn: number;
   tool: string;
-  args: Record<string, string | number | boolean>;
+  args: ToolArgs;
   result: ToolResult;
 }
 

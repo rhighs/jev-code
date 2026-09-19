@@ -17,6 +17,7 @@ test('stripFences removes a fenced wrapper and leaves plain text alone', () => {
   assert.equal(stripFences('a\n```\nb\n```\n'), 'a\n```\nb\n```\n');
   assert.equal(stripFences('```python\nprint(1)\nprint(2)'), 'print(1)\nprint(2)\n');
   assert.equal(stripFences('```python\nprint(1)\n```\nThis prints one.\n'), 'print(1)\n');
+  assert.equal(stripFences('```markdown\n# Doc\n\n```bash\nls\n```\n\nDone.\n```\n'), '# Doc\n\n```bash\nls\n```\n\nDone.\n');
 });
 
 test('normalize unifies line endings, trailing whitespace and the final newline', () => {

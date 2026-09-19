@@ -130,13 +130,13 @@ test('AE2: rejecting every candidate writes nothing and the run carries on', asy
   assert.equal(r.result.turns, 2);
 });
 
-test('AE3: a 500 that echoes the request headers never surfaces the key', async t => {
+test('AE3: a 500 that echoes the request headers fails one candidate and never surfaces the key', async t => {
   const r = await run(t, [step('C'), finish], { failAt: 1 });
   assert.notEqual(r.result.status, 'error', r.result.summary);
   const end = proposeEnd(r.events);
-  assert.equal(end.data.result.ok, false);
-  assert.match(end.data.result.output, /generation failed/);
-  assert.match(end.data.result.output, /500/);
+  assert.equal(end.data.result.ok, true);
+  assert.match(end.data.result.output, /B invalid: generation failed: .*500/);
+  assert.match(end.data.result.output, /selected C/);
   noLeak(r);
 });
 

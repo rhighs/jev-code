@@ -39,10 +39,11 @@ test('deleteCredential removes only the named id and ignores absent ones', async
 
 test('JEV_GENERATION_API_KEY wins without reading the credentials file', async t => {
   const env = await dir(t);
-  const cred = await credentialFor('openai', { ...env, JEV_GENERATION_API_KEY: 'k' });
+  const cred = await credentialFor('openai', { ...env, JEV_GENERATION_API_KEY: 'k' }, true);
   assert.deepEqual(cred, { type: 'api_key', key: 'k' });
   await assert.rejects(stat(env.JEV_CODE_CONFIG_DIR!), { code: 'ENOENT' });
-  assert.equal(await credentialFor('openai', env), undefined);
+  assert.equal(await credentialFor('openai', { ...env, JEV_GENERATION_API_KEY: 'k' }), undefined);
+  assert.equal(await credentialFor('openai', env, true), undefined);
 });
 
 test('a malformed credentials file reads as empty', async t => {

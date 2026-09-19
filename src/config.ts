@@ -1,4 +1,5 @@
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { AuthMethod } from './providers/types.js';
@@ -28,12 +29,17 @@ export async function readConfig(env: NodeJS.ProcessEnv = process.env): Promise<
   }
 }
 
-export async function writeConfig(cfg: Config, env: NodeJS.ProcessEnv = process.env): Promise<string> {
-  const path = configPath(env);
+export async function writeSecretJson(path: string, val: unknown, env: NodeJS.ProcessEnv = process.env): Promise<string> {
   await mkdir(configDir(env), { recursive: true, mode: 0o700 });
-  await writeFile(path, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
-  await chmod(path, 0o600);
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  await writeFile(tmp, JSON.stringify(val, null, 2) + '\n', { mode: 0o600 });
+  await chmod(tmp, 0o600);
+  await rename(tmp, path);
   return path;
+}
+
+export async function writeConfig(cfg: Config, env: NodeJS.ProcessEnv = process.env): Promise<string> {
+  return writeSecretJson(configPath(env), cfg, env);
 }
 
 type Tty = { isTTY?: boolean };

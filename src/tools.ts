@@ -5,10 +5,10 @@ import { dirname } from 'node:path';
 import { listWorkspace } from './workspace.js';
 import { sanitizedEnv } from './env.js';
 import { parseManifest, validatePythonProject } from './python-ast.js';
-import type { Tool, ToolContext, ToolResult } from './types.js';
+import type { Tool, ToolArgs, ToolContext, ToolResult } from './types.js';
 import { StringDecoder } from 'node:string_decoder';
 
-type Args = Record<string, string | number | boolean>;
+type Args = ToolArgs;
 const text = (args: Args, key: string): string => {
   if (typeof args[key] !== 'string') throw new Error(`${key} must be a string.`);
   return args[key];

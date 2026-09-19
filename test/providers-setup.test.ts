@@ -160,7 +160,7 @@ test('providerFromConfig generate issues count completion requests with the KTD9
   const msgs = reqs[0]!.body.messages as Array<{ role: string; content: string }>;
   assert.equal(msgs[0]!.content, 'You produce candidate content only. Output exactly the requested content with no explanation and no code fences. Output the complete source code of the file calc.py; the output must be valid code for that file type, not prose.');
   assert.equal(msgs[1]!.content, 'Objective: add f\nConstraints: no imports\nPath: calc.py\nCurrent content:\nx = 1\n');
-  assert.equal(reqs[0]!.body.temperature, 0.7);
+  assert.equal(reqs[0]!.body.temperature, undefined);
 });
 
 test('proposeTools is empty without a provider and holds propose with one', async t => {
@@ -192,7 +192,7 @@ test('provider use rejects unknown ids, writes the none sentinel, and requires a
   const ok = fakeIo();
   assert.equal(await providerCommand(['use', 'anthropic'], ok.io, env), 0);
   assert.deepEqual((await readConfig(env)).generation, { provider: 'anthropic', auth: 'api_key', baseUrl: null });
-  assert.match(ok.text(), /Model cleared; run jev-code provider login anthropic to choose one\./);
+  assert.match(ok.text(), /Model cleared; run jev-code provider login anthropic or provider use anthropic --model <id> to choose one\./);
 
   const usage = fakeIo();
   assert.equal(await providerCommand(['bogus'], usage.io, env), 1);
@@ -231,4 +231,44 @@ test('provider models lists bundled then discovered ids and needs a credential',
   const ok = fakeIo();
   assert.equal(await providerCommand(['models'], ok.io, env), 0);
   assert.equal(ok.text(), 'alpha\nzeta\n');
+});
+
+test('generate keeps the good candidates when one request fails and refreshes nothing for an api key', async t => {
+  const env = await dir(t);
+  let n = 0;
+  const { baseUrl, reqs } = await serve(t, (req, res) => {
+    if (n++ === 1) return json(res, 500, { error: 'boom', headers: { authorization: `Bearer ${KEY}` } });
+    compat(req, res);
+  });
+  await writeConfig({ generation: { provider: 'openai-compatible', model: 'tiny', auth: 'api_key', baseUrl } }, env);
+  await writeCredential('openai-compatible', { type: 'api_key', key: KEY }, env);
+  const provider = (await providerFromConfig(env))!;
+  const out = await provider.generate({ kind: 'text', objective: 'say hi', constraints: '', count: 3 }, never);
+  assert.equal(out.length, 3);
+  assert.equal(out.filter(c => 'error' in c).length, 1);
+  const failed = out.find(c => 'error' in c) as { error: string };
+  assert.match(failed.error, /500/);
+  assert.ok(!failed.error.includes(KEY));
+  assert.equal(reqs.length, 3);
+});
+
+test('provider login <id> skips the provider pick and use accepts --model and --base-url', async t => {
+  const env = await dir(t);
+  const { baseUrl } = await serve(t, compat);
+  const fake = fakeIo();
+  const done = providerCommand(['login', 'openai-compatible'], fake.io, env);
+  await waitFor(fake.text, 'Base URL: ');
+  assert.ok(!fake.text().includes('Select generation provider'));
+  fake.stdin.write(`${baseUrl}\r`);
+  await waitFor(fake.text, 'API key: ');
+  fake.stdin.write(`${KEY}\r`);
+  await waitFor(fake.text, 'zeta');
+  fake.stdin.write('\r');
+  assert.equal(await done, 0);
+  assert.equal((await readConfig(env)).generation?.provider, 'openai-compatible');
+  const quiet = fakeIo();
+  assert.equal(await providerCommand(['use', 'openai-compatible', '--model', 'omega', '--base-url', 'http://127.0.0.1:1/v1'], quiet.io, env), 0);
+  assert.deepEqual((await readConfig(env)).generation, { provider: 'openai-compatible', auth: 'api_key', baseUrl: 'http://127.0.0.1:1/v1', model: 'omega' });
+  assert.equal(await providerCommand(['use', 'openai-compatible', '--model'], quiet.io, env), 1);
+  assert.equal(await providerCommand(['use', 'openai-compatible', '--bogus', 'x'], quiet.io, env), 1);
 });

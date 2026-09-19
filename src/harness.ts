@@ -10,7 +10,7 @@ import { AstRegistry, type AstAdapter } from './ast-adapters.js';
 import { gridCursor, type TextProgress, type TextChange } from './grid.js';
 import { DecisionError, LimitError, type DecisionProvider, type HarnessEvent, type HarnessEventData, type RunResult, type RunStatus, type Tool, type ToolRecord } from './types.js';
 
-export const DEFAULT_LIMITS = { maxTurns: 50, maxRequests: 512, maxGenerationSteps: 256, maxRunMs: 300_000 } as const;
+export const DEFAULT_LIMITS = { maxTurns: 50, maxRequests: 512, maxGenerationSteps: 256, maxRunMs: 300_000, maxProposals: 20 } as const;
 
 export interface HarnessOptions {
   workspace: string;
@@ -53,7 +53,7 @@ export class Harness {
   constructor(private readonly options: HarnessOptions) {
     this.astRegistry = new AstRegistry(options.astAdapters, options.bundledAsts ?? true);
     for (const [name, value] of Object.entries({ maxTurns: options.maxTurns ?? DEFAULT_LIMITS.maxTurns, maxRequests: options.maxRequests ?? DEFAULT_LIMITS.maxRequests,
-      maxGenerationSteps: options.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, maxRunMs: options.maxRunMs ?? DEFAULT_LIMITS.maxRunMs, maxProposals: options.maxProposals ?? 20 })) {
+      maxGenerationSteps: options.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, maxRunMs: options.maxRunMs ?? DEFAULT_LIMITS.maxRunMs, maxProposals: options.maxProposals ?? DEFAULT_LIMITS.maxProposals })) {
       if (!Number.isSafeInteger(value) || value < 1 || value > 2_147_483_647) throw new Error(`${name} must be a positive integer <= 2147483647.`);
     }
     const threshold = options.completionThreshold ?? 0.85;
@@ -152,7 +152,8 @@ export class Harness {
       await emit('start', { schema: 1, prompt, workspace, decoder: 'dynamic', limits: { turns: this.options.maxTurns ?? DEFAULT_LIMITS.maxTurns, requests: this.options.maxRequests ?? DEFAULT_LIMITS.maxRequests }, journal: journal ?? null });
       const context = toolContext(workspace, signal, path => resolveWorkspacePath(workspace, path, this.options.allowOutsideWorkspace ?? false));
       context.onOutput = async (stream, text) => emit('tool_output', { stream, text });
-      context.proposals = { used: 0, max: this.options.maxProposals ?? 20 };
+      context.proposals = { used: 0, max: this.options.maxProposals ?? DEFAULT_LIMITS.maxProposals };
+      context.assertRequests = count => decisions.assertRequestBudget(count);
       for (turn = 1; turn <= (this.options.maxTurns ?? DEFAULT_LIMITS.maxTurns); turn++) {
         const turnStarted = performance.now();
         const turnRequests = decisions.requests;

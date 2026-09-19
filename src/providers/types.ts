@@ -18,6 +18,7 @@ export interface OAuthDescriptor {
   callbackPath: string;
   state: boolean;
   exchange: 'token' | 'key';
+  tokenBody?: 'json' | 'form';
   wire?: Wire;
   baseUrl?: string;
   discover?: boolean;
@@ -35,6 +36,7 @@ export interface ProviderSpec {
 }
 
 export interface Completion { text: string; truncated: boolean }
+export interface GenerationError { error: string }
 
 export interface ProposalRequest {
   kind: 'file' | 'text';
@@ -45,11 +47,10 @@ export interface ProposalRequest {
   current?: string;
 }
 
-/** generate rejects only with already-scrubbed messages; callers may surface them as-is. */
 export interface ProposalProvider {
   id: string;
   model: string;
-  generate(req: ProposalRequest, signal: AbortSignal): Promise<Completion[]>;
+  generate(req: ProposalRequest, signal: AbortSignal): Promise<Array<Completion | GenerationError>>;
 }
 
 export interface ProviderIo {

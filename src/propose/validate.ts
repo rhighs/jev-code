@@ -1,5 +1,5 @@
 import type { AstAdapter, AstRegistry } from '../ast-adapters.js';
-import type { Completion, ProposalRequest } from '../providers/types.js';
+import type { Completion, GenerationError, ProposalRequest } from '../providers/types.js';
 import type { Candidate } from './types.js';
 
 export const MAX_CANDIDATE_BYTES = 16_384;
@@ -10,8 +10,9 @@ export const stripFences = (text: string): string => {
   const m = OPEN.exec(text);
   if (!m) return text;
   const rest = text.slice(m[0].length);
-  const close = rest.search(/\n```[ \t]*(?:\n|$)|^```[ \t]*(?:\n|$)/m);
-  const body = close < 0 ? rest : rest.slice(0, close);
+  const closes = [...rest.matchAll(/(?:^|\n)```[ \t]*(?=\n|$)/g)];
+  const last = closes.at(-1);
+  const body = last?.index === undefined ? rest : rest.slice(0, last.index);
   return `${body.replace(/\n*$/, '')}\n`;
 };
 
@@ -29,20 +30,18 @@ const reasonFor = async (c: Completion, text: string, bytes: number, cur: string
   if (bytes > MAX_CANDIDATE_BYTES) return 'too large';
   if (cur !== undefined && normalize(text) === cur) return 'unchanged';
   if (!adapter) return undefined;
-  return adapter.validate(text, signal).then(() => undefined, errLine);
+  return adapter.validate(text, signal).then(() => undefined, (err: unknown) => { signal.throwIfAborted(); return errLine(err); });
 };
 
-export async function validateCandidates(req: ProposalRequest, completions: Array<Completion | { error: string }>, registry: AstRegistry, signal: AbortSignal): Promise<Candidate[]> {
+export async function validateCandidates(req: ProposalRequest, completions: Array<Completion | GenerationError>, registry: AstRegistry, signal: AbortSignal): Promise<Candidate[]> {
   const adapter = req.kind === 'file' ? registry.resolve({ argumentsSoFar: { path: req.path } }) : undefined;
   const cur = req.current === undefined ? undefined : normalize(req.current);
-  const out: Candidate[] = [];
-  for (const [idx, c] of completions.entries()) {
+  return Promise.all(completions.map(async (c, idx): Promise<Candidate> => {
     const label = String.fromCharCode(65 + idx);
-    if ('error' in c) { out.push({ label, text: '', valid: false, reason: `generation failed: ${c.error}`, bytes: 0 }); continue; }
+    if ('error' in c) return { label, text: '', valid: false, reason: `generation failed: ${c.error}`, bytes: 0 };
     const text = stripFences(c.text);
     const bytes = Buffer.byteLength(text);
     const reason = await reasonFor(c, text, bytes, cur, adapter, signal);
-    out.push(reason === undefined ? { label, text, valid: true, bytes } : { label, text, valid: false, reason, bytes });
-  }
-  return out;
+    return reason === undefined ? { label, text, valid: true, bytes } : { label, text, valid: false, reason, bytes };
+  }));
 }

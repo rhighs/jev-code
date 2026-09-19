@@ -17,7 +17,7 @@ jev-code decide --score "criteria" [--lines]
 jev-code decide --spec file.json
 jev-code replay run-id [--speed x] [--plain]
 jev-code login | logout
-jev-code provider login [id] | logout [id] | list | models [id] | use id|none
+jev-code provider login [id] | logout [id] | list | models [id] | use id|none [--model id] [--base-url url]
 jev-code ast install module | ast list | ast remove id
 ```
 
@@ -86,7 +86,7 @@ jev-code
 | `jev-code provider logout [id]` | Remove the stored credential of a provider. |
 | `jev-code provider list` | List the providers, their authentication methods, the active one, and which are signed in. |
 | `jev-code provider models [id]` | List the bundled and discovered models of a provider. |
-| `jev-code provider use <id\|none>` | Select the active provider. `none` turns `propose` off. |
+| `jev-code provider use <id\|none> [--model <id>] [--base-url <url>]` | Select the active provider without a prompt. `none` turns `propose` off. |
 | `jev-code ast install <module>` | Install an AST adapter module from a local path or an npm package. |
 | `jev-code ast list` | List the installed AST adapters. |
 | `jev-code ast remove <id>` | Remove an installed AST adapter. |
@@ -199,7 +199,7 @@ The journal record of that call:
  "selected":"A","confidence":0.81}
 ```
 
-Limits: `--max-proposals <n>` caps generator calls per run (default 20). Each generator request times out after 60 s. `propose` counts as a write for `--confirm-writes`; the approval covers the request, and the content is shown in the diff card after the write. The current file and the objective are sent to the configured provider.
+One failed request drops only its own candidate; the others still reach Jev. Limits: `--max-proposals <n>` caps generator calls per run (default 20). Each generator request times out after 60 s. `propose` counts as a write for `--confirm-writes`; the approval covers the request, and the content is shown in the diff card after the write. The current file and the objective are sent to the configured provider.
 
 ## DECIDE
 
