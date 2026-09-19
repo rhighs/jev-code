@@ -17,6 +17,7 @@ jev-code decide --score "criteria" [--lines]
 jev-code decide --spec file.json
 jev-code replay run-id [--speed x] [--plain]
 jev-code login | logout
+jev-code provider login [id] | logout [id] | list | models [id] | use id|none
 jev-code ast install module | ast list | ast remove id
 ```
 
@@ -57,6 +58,8 @@ The interactive session is a transcript of cards. Each tool call is one card: a 
 
 `decide` uses the same model on standard input. A shell script can branch on the exit code without parsing.
 
+jev-code is a hybrid. Jev is the only policy. A small generative model can be attached as a candidate generator behind one tool, `propose`. Jev selects `propose`, states the objective, and later selects one candidate or rejects all of them. TypeScript validators filter the candidates in between. The generator never selects tools, never plans, and never ends a run. See PROVIDERS.
+
 ## FIRST RUN
 
 The first interactive run asks for your typesafe.ai API key. jev-code saves the key in `~/.config/jev-code/config.json` with mode 600.
@@ -79,6 +82,11 @@ jev-code
 | `jev-code replay <run-id>` | Render a saved journal through the same transcript. |
 | `jev-code login` | Enter the API key and save it. |
 | `jev-code logout` | Remove the saved API key. |
+| `jev-code provider login [id]` | Configure the generation provider: provider, authentication, model. Without `id` a picker opens. |
+| `jev-code provider logout [id]` | Remove the stored credential of a provider. |
+| `jev-code provider list` | List the providers, their authentication methods, the active one, and which are signed in. |
+| `jev-code provider models [id]` | List the bundled and discovered models of a provider. |
+| `jev-code provider use <id\|none>` | Select the active provider. `none` turns `propose` off. |
 | `jev-code ast install <module>` | Install an AST adapter module from a local path or an npm package. |
 | `jev-code ast list` | List the installed AST adapters. |
 | `jev-code ast remove <id>` | Remove an installed AST adapter. |
@@ -122,6 +130,76 @@ Every language below is built in. jev-code selects the grammar from the file ext
 | Other | any | Install an adapter module. Files without an adapter use bounded text choices. | adapter |
 
 A validator must be on `PATH` before Jev writes a file in that language. A missing validator stops the write with a message that names the tool. Each rendered program of the shared core is checked by its real toolchain: a fuzz suite in `test/lang-fuzz.test.ts` drives every dialect with random productions and compiles the result.
+
+## PROVIDERS
+
+`propose` needs a generation provider. The first interactive run asks whether to configure one. `Not now` records the choice and does not ask again. `jev-code provider login` opens the same setup at any time:
+
+```text
+Select generation provider:
+> OpenAI
+  Anthropic
+  Google
+  OpenRouter
+  OpenAI-compatible
+  Local
+
+Authentication:
+> Sign in with OAuth (vendor terms apply)
+  Use API key
+
+Model:
+> gpt-5-nano
+  gpt-5-mini
+  gpt-4.1-nano
+```
+
+| Provider | Authentication | Wire | Models |
+| --- | --- | --- | --- |
+| `openai` | OAuth (browser, port 1455) or API key | Chat completions with a key; Responses on the ChatGPT backend with OAuth | `gpt-5-nano`, `gpt-5-mini`, `gpt-4.1-nano`, live list with a key |
+| `anthropic` | OAuth (paste the code) or API key | Messages | `claude-haiku-4-5`, `claude-3-5-haiku` |
+| `google` | API key | OpenAI-compatible endpoint | `gemini-2.5-flash-lite`, `gemini-2.5-flash`, live list |
+| `openrouter` | OAuth (browser) or API key | Chat completions | small models from several vendors, live list |
+| `openai-compatible` | API key | Chat completions at the base URL you enter | live list |
+| `local` | none | Chat completions at `http://localhost:11434/v1` | live list from the server |
+
+Use small, cheap, fast models. The generator only writes candidates; Jev does the judging. API keys are the supported path. OAuth with a consumer subscription is a convenience the vendor can withdraw; jev-code shows that in the picker label. Google OAuth is not implemented.
+
+How one `propose` call runs:
+
+1. Jev fills the request: `kind` (`file` or `text`), `objective`, `constraints`, `count` (1 to 5), `path`.
+2. The provider returns `count` candidates. One refresh of an expired OAuth token covers the whole batch.
+3. Validators drop candidates that are truncated, empty, too large, unchanged, or fail the language validator of the file type.
+4. Jev selects one label or `reject`. The selection is one decision with `field=candidate`.
+5. A `file` candidate is written atomically. A `text` candidate is returned as the output.
+
+A run recorded with a local Ollama model (`qwen2.5-coder:1.5b`) and a scripted Jev stand-in:
+
+```text
+✓ propose haiku.py · 1.1 s · 61 req
+  │ +# haiku.py
+  │ +
+  │ +print("waves whisper")
+  │ +print("ocean breathes")
+  │ +print("calmness in sight")
+── turn 2 · 1 file
+  │ waves whisper
+  │ ocean breathes
+  │ calmness in sight
+✓ bash 'python3' 'haiku.py' · exit 0 · 15 ms · 5 req
+```
+
+The journal record of that call:
+
+```json
+{"provider":"local","model":"qwen2.5-coder:1.5b",
+ "candidates":[{"label":"A","valid":true,"bytes":86},
+               {"label":"B","valid":false,"bytes":77,"reason":"SyntaxError: invalid syntax"},
+               {"label":"C","valid":true,"bytes":93}],
+ "selected":"A","confidence":0.81}
+```
+
+Limits: `--max-proposals <n>` caps generator calls per run (default 20). Each generator request times out after 60 s. `propose` counts as a write for `--confirm-writes`; the approval covers the request, and the content is shown in the diff card after the write. The current file and the objective are sent to the configured provider.
 
 ## DECIDE
 
@@ -248,8 +326,9 @@ git diff | jev-code decide --true "safe to commit" && git commit -am wip
 
 | Path | Content |
 | --- | --- |
-| `~/.config/jev-code/config.json` | The saved API key. Mode 600. `XDG_CONFIG_HOME` and `JEV_CODE_CONFIG_DIR` change the directory. |
-| `.env` | Optional. `TYPESAFE_API_KEY=...` in the current directory. Loaded before the saved key. |
+| `~/.config/jev-code/config.json` | The saved typesafe.ai API key and the `generation` settings (provider, model, auth, base URL). Mode 600. `XDG_CONFIG_HOME` and `JEV_CODE_CONFIG_DIR` change the directory. |
+| `~/.config/jev-code/credentials.json` | Generation provider secrets: API keys, OAuth access and refresh tokens, keyed by provider id. Mode 600. Never copied into events, journals, or child processes. |
+| `.env` | Optional. `TYPESAFE_API_KEY=...` in the current directory. Loaded before the saved key. `JEV_GENERATION_API_KEY=...` overrides the stored generation credential. |
 | `.jev/runs/<run-id>.jsonl` | One journal per run: every event as one JSON line. Input for `replay`. |
 | `.jev/eval/` | Eval records and journals from `npm run dev -- eval`. |
 

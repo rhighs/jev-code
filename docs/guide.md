@@ -71,6 +71,7 @@ Interactive rendering runs on Ink, React, and `ink-text-input` at runtime; `--pr
 | `edit_file` | Replace one unambiguous exact match; fail without mutation otherwise. |
 | `bash` | Execute an arbitrary Bash command with bounded output and an explicit exit status. |
 | `set_plan` | Record/revise the active plan and progress. |
+| `propose` | Ask the configured generation model for candidates, filter them, let Jev select one or reject all, then write the file or return the text. Registered only when a provider is configured. See Propose. |
 | `finish` | End the run, gated by a separate task-scoped Jev completion choice. |
 | `blocked` | Explain a missing prerequisite or user decision. |
 
@@ -104,6 +105,28 @@ Numeric arguments use choices over valid values and documented defaults, with te
 Limits are explicit: 50 action turns, 512 Jev requests, 256 AST productions or experimental grid cells per field, and five minutes per run by default. Python AST nesting is capped at eight levels, a single Python block stops after 16 statements, and decision payloads are bounded. Override run budgets with `--max-turns`, `--max-requests`, `--max-steps`, and `--timeout-ms`. Bash AST composition also has a 96-production limit. Bash execution has a generated timeout of up to 10 minutes, defaulting to 30 seconds; the run deadline still applies. Ctrl-C aborts model requests and terminates the current Bash process group. Background daemons intentionally detached by a command are outside that cancellation guarantee.
 
 Run statuses are `completed`, `blocked`, `limited`, `cancelled`, or `error`. Only `completed` exits with code 0; cancellation exits with 130, other failures with 1. Interactive mode carries a bounded conversation summary and inspects the current workspace on each run. New API-side instructions can be queued during a run and are applied at the next turn boundary.
+
+## Propose
+
+Jev cannot write open-ended text. `propose` gives it a bounded way to get some: a small autoregressive model produces candidates, TypeScript filters them, and Jev selects. The generator is not an agent. It does not see the tool list, the plan, or the history. It receives one objective, optional constraints, the path, and the current file content. It returns text.
+
+The request fields are filled by Jev through the normal argument generator: `kind` (`file` or `text`), `objective`, `constraints` (may be empty), `count` (1 to 5, default 3), `path` (required for `file`). The provider returns `count` completions from `count` parallel single-completion requests. Validators run in a fixed order and stop at the first failure: `generation failed` (the request itself failed), `truncated` (the model hit its output limit), `empty`, `too large` (over 16 KB), `unchanged` (equal to the current file after whitespace normalization), then the language validator of the matching adapter (`python3` compile, the TypeScript compiler, `gcc`, `rustc`, `go vet`, `luac`, `ruby -c`). Code fences are stripped first, including an unterminated fence or trailing prose after the closing fence.
+
+Jev then answers one `choice` question. The options are the valid labels (`A` to `E`) and `reject`. Each label's text is the first line where that candidate differs from every other valid one, with `+n/-m` line counts against the current file. The state carries a bounded diff or head per candidate, never the full texts, so the request stays inside the usual budget. The decision event carries `field: "candidate"` and `phase: "propose"`, so `/trace` and `--json` show it like any other decision. `reject` returns `ok: false` with the candidate table so Jev can change the constraints or take another action. A `file` selection is written with the same atomic write as `write_file`; a `text` selection is the tool output.
+
+The tool output lists the provider, the model, one line per candidate with its verdict, and the selection with its confidence. The `tool_end` record carries the same data plus a diff hunk of at most 120 lines. The session card shows the diff. Two consecutive `propose` writes to the same path without a run leave only shell tools for the next turn, as for `write_file`. `--max-proposals <n>` (default 20) caps generator calls per run; when exhausted, the tool returns `ok: false` and names `write_file` and `edit_file`.
+
+`propose` has `effect: write`. With `--confirm-writes` the host approves the request (path, objective, constraints) before any candidate exists; the content is visible in the diff card afterwards. The current file content and the objective leave the machine and reach the configured provider; do not point `propose` at files that hold secrets.
+
+## Providers
+
+The provider layer lives in `src/providers/` and does not import the harness. A provider is one row in `catalog.ts`: id, base URL, wire protocol, authentication methods, bundled lightweight models, and an OAuth descriptor when the vendor offers one. Three wire protocols cover the six providers: OpenAI chat completions (`openai` with a key, `google`, `openrouter`, `openai-compatible`, `local`), Anthropic messages (`anthropic`), and OpenAI Responses over SSE on the ChatGPT backend (`openai` with OAuth). Adding a provider is one catalog row and, at most, one wire function.
+
+Configuration is split. `~/.config/jev-code/config.json` holds `generation: { provider, model, auth, baseUrl }`. `~/.config/jev-code/credentials.json` holds the secrets keyed by provider id, mode 600, written like the config file. `JEV_GENERATION_API_KEY` in the environment overrides the stored credential for the active provider, and `sanitizedEnv()` strips it, like `TYPESAFE_API_KEY`, from every child process. Errors from the wire client are scrubbed of bearer tokens, key-shaped strings, and every header value that was sent before they reach a tool result, an event, or a journal.
+
+OAuth uses authorization code with PKCE. `openai` opens the browser and listens on `127.0.0.1:1455`; `anthropic` opens the browser and asks you to paste the code (or the whole redirect URL); `openrouter` opens the browser, listens on an ephemeral loopback port, and exchanges the code for an API key. `state` is checked where the vendor sends it. Tokens are refreshed once per `generate` call when expired and once more on a 401; concurrent calls share one refresh. A failed refresh leaves the stored credential untouched and reports `run jev-code provider login <id>`. `provider logout` deletes the local credential; it does not revoke the grant at the vendor. Consumer-subscription OAuth (ChatGPT, Claude) is meant for the vendors' own clients and can stop working; API keys are the supported path. Google OAuth is not implemented.
+
+Commands: `provider login [id]` runs the picker (provider, authentication, model; live model lists come from `/models` when the provider has one); `provider logout [id]`; `provider list`; `provider models [id]`; `provider use <id|none>`. On the first interactive run without a `generation` section, the session asks once whether to configure a provider. Non-interactive runs never ask; without a usable provider, `propose` is not registered and nothing else changes.
 
 ## Observe
 
