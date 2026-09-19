@@ -76,6 +76,20 @@ test('multi-file card lists paths with the remaining count', () => {
   assert.deepEqual(renderItem(card, off), ['✓ write_files 3 files · 12 ms · 1 req', '  │ main.py', '  │ pkg/__init__.py', '  │ … 1 more file']);
 });
 
+test('propose card renders the provider line and the selection', () => {
+  const args = { kind: 'text', path: '', objective: 'name it', constraints: '', count: 3 };
+  const output = 'provider=fake model=tiny\nA valid 5 bytes\nB invalid: fenced\nselected A 0.90\n\nhello';
+  const state = [start(), ev('action', { tool: 'propose' }), ev('tool_start', { tool: 'propose', args }),
+    ev('tool_end', record('propose', args, true, output, { provider: 'fake', model: 'tiny', kind: 'text', selected: 'A', confidence: 0.9 }))].reduce(reduce, initialState());
+  const card = state.items.find((item): item is ToolItem => item.kind === 'tool')!;
+  const lines = renderItem(card, off);
+  assert.match(lines[0]!, /^✓ propose text/);
+  assert.ok(lines.some(line => line.includes('provider=fake model=tiny')));
+  assert.ok(lines.some(line => line.includes('selected A 0.90')));
+  const file = tool({ tool: 'propose', target: 'x.py', body: { kind: 'diff', path: 'x.py', hunk: [{ kind: 'remove', text: '  return 1' }, { kind: 'add', text: '  return 2' }] } });
+  assert.deepEqual(renderItem(file, off), ['✓ propose x.py · 12 ms · 1 req', '  │ -  return 1', '  │ +  return 2']);
+});
+
 test('trace card lists choices with probabilities and alternatives (AE2)', () => {
   const decisions: Decision[] = [
     { turn: 1, choice: 'Expr', confidence: 0.9, options: [{ label: 'Expr', probability: 0.41 }, { label: 'Assign', probability: 0.39 }, { label: 'Return', probability: 0.2 }], lowConfidence: true, field: 'content', slot: 'stmt' },

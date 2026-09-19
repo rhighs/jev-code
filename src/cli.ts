@@ -42,6 +42,7 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
   --concurrency <n>       In-flight Jev requests shared by parallel units and grids (default: 4, max: 16)
   --search-width <n>      Candidates generated per Python unit; the best survivor is kept (default: 1, max: 8)
   --timeout-ms <n>         Total run time (default: ${DEFAULT_LIMITS.maxRunMs})
+  --max-proposals <n>      Generator proposals per run (default: 20)
   --tools <module>        Load additional tools exported as a tools array
   --asts <module>         Load AST adapters for this session (repeatable)
   --experimental-grid    Opt into character-grid fallback (slow/unreliable)
@@ -162,7 +163,7 @@ async function main(): Promise<void> {
     print: { type: 'boolean', short: 'p' },
     yes: { type: 'boolean' }, 'confirm-writes': { type: 'boolean' }, 'allow-outside': { type: 'boolean' },
     'max-turns': { type: 'string' }, 'max-requests': { type: 'string' }, 'max-steps': { type: 'string' },
-    'timeout-ms': { type: 'string' }, 'grid-batch-size': { type: 'string' }, concurrency: { type: 'string' }, 'search-width': { type: 'string' }, tools: { type: 'string' }, json: { type: 'boolean' },
+    'timeout-ms': { type: 'string' }, 'grid-batch-size': { type: 'string' }, concurrency: { type: 'string' }, 'search-width': { type: 'string' }, 'max-proposals': { type: 'string' }, tools: { type: 'string' }, json: { type: 'boolean' },
     'experimental-grid': { type: 'boolean' }, asts: { type: 'string', multiple: true }, 'no-journal': { type: 'boolean' }, demo: { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
     'eval-out': { type: 'string' },
   } });
@@ -224,7 +225,7 @@ async function main(): Promise<void> {
     if (!Array.isArray(module.tools)) throw new Error('Tool module must export a tools array.');
     extraTools.push(...module.tools);
   }
-  const limit = (name: 'max-turns' | 'max-requests' | 'max-steps' | 'timeout-ms' | 'grid-batch-size' | 'concurrency' | 'search-width', fallback: number): number => {
+  const limit = (name: 'max-turns' | 'max-requests' | 'max-steps' | 'timeout-ms' | 'grid-batch-size' | 'concurrency' | 'search-width' | 'max-proposals', fallback: number): number => {
     const raw = values[name];
     if (raw !== undefined && !/^\d+$/.test(raw)) throw new Error(`--${name} must be a positive integer.`);
     const value = raw === undefined ? fallback : Number(raw);
@@ -239,7 +240,7 @@ async function main(): Promise<void> {
     astAdapters: [...await loadInstalledAsts(workspace), ...(await Promise.all((values.asts ?? []).map(module => loadAstModule(workspace, module)))).flat()],
     maxTurns: limit('max-turns', DEFAULT_LIMITS.maxTurns), maxRequests: limit('max-requests', DEFAULT_LIMITS.maxRequests), maxGenerationSteps: limit('max-steps', DEFAULT_LIMITS.maxGenerationSteps),
     maxRunMs: limit('timeout-ms', DEFAULT_LIMITS.maxRunMs), allowOutsideWorkspace: values['allow-outside'] ?? false,
-    gridBatchSize: limit('grid-batch-size', 8), concurrency: limit('concurrency', 4), searchWidth: limit('search-width', 1),
+    gridBatchSize: limit('grid-batch-size', 8), concurrency: limit('concurrency', 4), searchWidth: limit('search-width', 1), maxProposals: limit('max-proposals', 20),
     ...(values['no-journal'] ? { journalDirectory: false as const } : {}),
   };
   if (interactive) {

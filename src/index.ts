@@ -11,5 +11,7 @@ export { runDecide, type DecideResult, type SpecEntry } from './decide.js';
 export { javascriptAstAdapter, typescriptAstAdapter } from './lang/javascript.js';
 export { adapterFor, generateProgram, type Dialect, type Expr, type Stmt, type Program, type ValueType } from './lang/core.js';
 export { generateBashAst, renderBashAst, validateBashSource, type BashAst } from './bash-ast.js';
+export { proposeTool } from './propose/tool.js';
+export type { ProposalProvider, ProposalRequest, Completion, Credential, ProviderSpec } from './providers/types.js';
 export type { CharacterSymbol, GridCursor, GridProgress, ScoredCell, TextChange, TextProgress } from './grid.js';
 export type { DecisionProvider, Field, HarnessEvent, RunResult, RunStatus, Tool, ToolContext, ToolResult } from './types.js';
