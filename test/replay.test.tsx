@@ -144,16 +144,16 @@ test('cli replay --plain renders a journal in a temp workspace, and rejects unkn
   await writeFile(join(cwd, '.jev', 'runs', 'good.jsonl'), jsonl(all));
   await writeFile(join(cwd, '.jev', 'runs', 'future.jsonl'), jsonl(withSchema(all, 2)));
   const cli = resolve('src/cli.ts');
-  const ok = await exec('npx', ['tsx', cli, 'replay', 'good', '--plain'], { cwd, env, timeout: 60_000 });
+  const ok = await exec(process.execPath, ['--import', import.meta.resolve('tsx'), cli, 'replay', 'good', '--plain'], { cwd, env, timeout: 60_000 });
   assert.match(ok.stderr, /✓ write_file hello.txt/);
   assert.match(ok.stdout, /\[completed\]/);
-  await assert.rejects(exec('npx', ['tsx', cli, 'replay', 'nope', '--plain'], { cwd, env, timeout: 60_000 }), (err: Error & { code: number; stderr: string }) => {
+  await assert.rejects(exec(process.execPath, ['--import', import.meta.resolve('tsx'), cli, 'replay', 'nope', '--plain'], { cwd, env, timeout: 60_000 }), (err: Error & { code: number; stderr: string }) => {
     assert.equal(err.code, 1);
-    assert.equal(err.stderr.trim().split('\n').length, 1);
+    assert.equal(err.stderr.trim().split('\n').length, 1, err.stderr);
     assert.match(err.stderr, /nope/);
     return true;
   });
-  await assert.rejects(exec('npx', ['tsx', cli, 'replay', 'future', '--plain'], { cwd, env, timeout: 60_000 }), (err: Error & { code: number; stderr: string }) => {
+  await assert.rejects(exec(process.execPath, ['--import', import.meta.resolve('tsx'), cli, 'replay', 'future', '--plain'], { cwd, env, timeout: 60_000 }), (err: Error & { code: number; stderr: string }) => {
     assert.equal(err.code, 1);
     assert.match(err.stderr, /2/);
     assert.match(err.stderr, /1/);
