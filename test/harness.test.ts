@@ -455,3 +455,26 @@ test('aborting while the provider generates cancels the run without a propose to
   assert.ok(!events.some(e => e.type === 'tool_end' && e.data.tool === 'propose'));
   assert.deepEqual(await readdir(root), []);
 });
+
+test('an identical call that failed twice removes its tool until another action is taken', async t => {
+  const root = await workspace(t);
+  const scripted = new ScriptedProvider([
+    { action: 'read_file', args: { path: 'missing.py', offset: '', limit: '' } },
+    { action: 'list_files', args: { path: '.' } },
+    { action: 'read_file', args: { path: 'missing.py', offset: '', limit: '' } },
+    { action: 'finish', args: { summary: 'missing.py does not exist.' } },
+  ]);
+  const feedback: string[] = [];
+  const provider: DecisionProvider = { decide: async (input, questions, signal) => {
+    const state = input as unknown as { task: { turn: number }; generation?: unknown; progressFeedback?: string };
+    if (state.task.turn === 4 && !state.generation && questions.selection?.type === 'choice' && Object.hasOwn(questions.selection.criteria, 'finish')) {
+      assert.ok(!Object.hasOwn(questions.selection.criteria, 'read_file'));
+      assert.ok(Object.hasOwn(questions.selection.criteria, 'list_files'));
+      if (state.progressFeedback) feedback.push(state.progressFeedback);
+    }
+    return scripted.decide(input, questions, signal);
+  } };
+  const result = await new Harness({ experimentalGrid: true, workspace: root, provider, journalDirectory: false }).run('What is in missing.py?');
+  assert.equal(result.status, 'completed');
+  assert.match(feedback[0] ?? '', /read_file .*failed 2 times/);
+});

@@ -68,7 +68,8 @@ export async function generateText(decisions: Decisions, state: State, field: st
     await options.onText?.(field, source, true, { replace: source }, { decoder: 'ast', step: 0, cursor: gridCursor(source), bytes: Buffer.byteLength(source) });
     return source;
   }
-  const plan = await planText(decisions, compactContext(state), field);
+  const ws = state.workspace as { files?: string[] } | undefined;
+  const plan = await planText(decisions, compactContext(state), field, Array.isArray(ws?.files) ? ws.files : []);
   if (plan !== undefined && (!syntaxFeedback(state, field, plan).length)) {
     if ((!plan && !options.allowEmpty) || Buffer.byteLength(plan) > options.maxBytes) throw new LimitError(`${field} selected text violates its size constraints.`);
     await options.onText?.(field, plan, true, { replace: plan }, { decoder: 'choice', step: 1, cursor: gridCursor(plan), bytes: Buffer.byteLength(plan) });

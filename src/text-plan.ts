@@ -3,7 +3,7 @@ import { completionSummary } from './summary.js';
 import type { ToolRecord } from './types.js';
 
 /** A shared intent keeps independent positions from inventing different programs. */
-export async function planText(decisions: Decisions, state: State, field: string): Promise<string | undefined> {
+export async function planText(decisions: Decisions, state: State, field: string, files: string[] = []): Promise<string | undefined> {
   const task = state.task as { prompt?: string; updates?: string[] } | undefined;
   if (!task?.prompt) return undefined;
   const prompt = [task.prompt, ...(task.updates ?? [])].join('\n');
@@ -22,6 +22,11 @@ export async function planText(decisions: Decisions, state: State, field: string
   if (field === 'cwd') return select(['.'], 'Choose the Bash working directory; . means the selected workspace.');
   if (field === 'path') {
     const candidates = [...taskFiles];
+    if (state.action !== 'write_file' && state.action !== 'propose') {
+      if (state.action === 'list_files') candidates.push('.');
+      candidates.push(...files);
+      return select(candidates, 'Choose an existing path named by the task or listed in the workspace.');
+    }
     if (!candidates.length && language) {
       const extension = language === 'python' ? 'py' : /typescript/i.test(prompt) ? 'ts' : 'js';
       candidates.push(`main.${extension}`, `script.${extension}`);

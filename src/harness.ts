@@ -198,6 +198,14 @@ export class Harness {
           delete criteria[previous.tool];
           state.progressFeedback = 'The last two reads returned the same unchanged result. Choose another action that advances the task; the repeated read tool is unavailable for this turn.';
         }
+        const failures = new Map<string, number>();
+        const failKey = (record: ToolRecord): string => `${record.tool}\0${JSON.stringify(record.args)}`;
+        for (const record of records) if (!record.result.ok && this.registry.has(record.tool)) failures.set(failKey(record), (failures.get(failKey(record)) ?? 0) + 1);
+        if (previous && !previous.result.ok && (failures.get(failKey(previous)) ?? 0) >= 2) {
+          const repeated = [...new Set(records.filter(record => (failures.get(failKey(record)) ?? 0) >= 2).map(record => record.tool))];
+          for (const tool of repeated) delete criteria[tool];
+          state.progressFeedback = `${previous.tool} ${JSON.stringify(previous.args)} failed ${failures.get(failKey(previous))} times: ${trim(previous.result.output, 200)}. The same call will fail again; ${repeated.join(', ')} unavailable for this turn. Use the workspace listing, another action, or finish with what is known.`;
+        }
         if (previous && earlier && previous.tool === 'propose' && earlier.tool === 'propose' && !previous.result.ok && !earlier.result.ok &&
             JSON.stringify(previous.args) === JSON.stringify(earlier.args)) {
           delete criteria.propose;

@@ -49,7 +49,7 @@ export const proposeTool = (provider: ProposalProvider, registry: AstRegistry): 
     objective: { type: 'string', description: 'What the content must accomplish.' },
     constraints: { type: 'string', allowEmpty: true, description: 'Hard requirements on the content: interfaces, names, style, forbidden constructs. Empty means none.' },
     count: { type: 'number', min: 1, max: 5, default: 3, description: 'Number of candidates to generate. Empty means 3.' },
-    path: { type: 'string', allowEmpty: true, description: 'Destination file path for kind=file. Empty for kind=text.' },
+    path: { type: 'string', allowEmpty: true, description: 'Destination file path for kind=file; an existing file given as context for kind=text. Empty for none.' },
   },
   async execute(args: ToolArgs, ctx: ToolContext): Promise<ToolResult> {
     if (!ctx.select) throw new Error('propose needs a host that can select');
@@ -58,12 +58,12 @@ export const proposeTool = (provider: ProposalProvider, registry: AstRegistry): 
     if (kind !== 'file' && kind !== 'text') throw new Error('kind must be file or text.');
     const path = str(args, 'path');
     if (kind === 'file' && !path) throw new Error('path is required for file candidates');
-    const target = kind === 'file' ? await ctx.resolvePath(path) : undefined;
+    const target = path ? await ctx.resolvePath(path) : undefined;
     const cur = target === undefined ? undefined : await readCurrent(target);
     const count = num(args, 'count', 3);
     const req: ProposalRequest = {
       kind, objective: str(args, 'objective'), constraints: str(args, 'constraints'), count,
-      ...(kind === 'file' ? { path } : {}), ...(cur === undefined ? {} : { current: cur }),
+      ...(path ? { path } : {}), ...(cur === undefined ? {} : { current: cur }),
     };
     ctx.assertRequests?.(1);
     if (ctx.proposals) ctx.proposals.used++;
@@ -76,7 +76,7 @@ export const proposeTool = (provider: ProposalProvider, registry: AstRegistry): 
     const data: Record<string, unknown> = { provider: provider.id, model: provider.model, kind, ...(kind === 'file' ? { path } : {}), candidates: candidates.map(summary) };
     const valid = candidates.filter(c => c.valid);
     if (!valid.length) return { ok: false, output: [...head, 'no valid candidate'].join('\n'), data };
-    const hunks = new Map(valid.map(c => [c.label, cur === undefined ? undefined : diffLines(cur, c.text)]));
+    const hunks = new Map(valid.map(c => [c.label, kind === 'file' && cur !== undefined ? diffLines(cur, c.text) : undefined]));
     const criteria = { ...Object.fromEntries(valid.map(c => [c.label, criterion(c, valid, hunks.get(c.label))])), reject: REJECT };
     const extra = {
       field: 'candidate', generation: { phase: 'propose', slot: 'select' },
@@ -88,8 +88,8 @@ export const proposeTool = (provider: ProposalProvider, registry: AstRegistry): 
     if (!chosen) throw new Error(`select returned an unknown candidate: ${choice}`);
     const selected = `selected ${chosen.label} ${confidence.toFixed(2)}`;
     const picked = { ...data, selected: chosen.label, confidence };
-    if (target === undefined) return { ok: true, output: [...head, selected, '', chosen.text].join('\n'), data: picked };
-    await atomicWrite(target, chosen.text, ctx.signal);
+    if (kind === 'text') return { ok: true, output: [...head, selected, '', chosen.text].join('\n'), data: picked };
+    await atomicWrite(target!, chosen.text, ctx.signal);
     const hunk = hunks.get(chosen.label) ?? diffLines('', chosen.text);
     return { ok: true, output: [...head, selected, `Wrote ${chosen.bytes} bytes to ${path}:`, '', chosen.text].join('\n'), data: { ...picked, hunk: hunk.slice(0, MAX_HUNK) } };
   },

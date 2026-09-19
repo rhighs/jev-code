@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { AstRegistry } from '../src/ast-adapters.js';
 import { proposeTool } from '../src/propose/tool.js';
+import { completionSummary } from '../src/summary.js';
 import type { Completion, ProposalProvider, ProposalRequest } from '../src/providers/types.js';
 import { autoApproved } from '../src/tools.js';
 import type { ToolContext } from '../src/types.js';
@@ -196,4 +197,31 @@ test('propose stops after generation when the run is aborted', async t => {
   await assert.rejects(proposeTool(provider, registry).execute({ kind: 'file', objective: 'o', constraints: '', count: 3, path: 'x.py' }, ctx), (err: Error) => err.name === 'AbortError');
   assert.equal(seen.length, 0);
   await assert.rejects(readFile(join(ws, 'x.py')), { code: 'ENOENT' });
+});
+
+test('propose text with a path reads the file as context and leaves it unchanged', async t => {
+  const { ws, ctx, seen } = await setup(t, 'A', 0.9);
+  await writeFile(join(ws, 'x.py'), 'def f():\n  return 0\n');
+  const provider = fake(['It defines f, which returns 0.\n']);
+  const res = await proposeTool(provider, registry).execute({ kind: 'text', objective: 'what does x.py do?', constraints: '', count: 1, path: 'x.py' }, ctx);
+  assert.equal(res.ok, true);
+  assert.equal(provider.calls[0]!.path, 'x.py');
+  assert.equal(provider.calls[0]!.current, 'def f():\n  return 0\n');
+  assert.equal(await readFile(join(ws, 'x.py'), 'utf8'), 'def f():\n  return 0\n');
+  assert.ok(res.output.endsWith('selected A 0.90\n\nIt defines f, which returns 0.\n'));
+  assert.equal(res.data?.hunk, undefined);
+  const entries = seen[0]!.extra.candidates as Array<{ preview: string }>;
+  assert.equal(entries[0]!.preview, 'It defines f, which returns 0.\n');
+});
+
+test('the completion summary quotes a text proposal and names a written file', async t => {
+  const { ws, ctx } = await setup(t, 'A', 0.9);
+  await writeFile(join(ws, 'x.py'), 'def f():\n  return 0\n');
+  const tool = proposeTool(fake(['It defines f.\n']), registry);
+  const text = await tool.execute({ kind: 'text', objective: 'what does x.py do?', constraints: '', count: 1, path: 'x.py' }, ctx);
+  const file = await proposeTool(fake(['def f():\n  return 1\n']), registry).execute({ kind: 'file', objective: 'return one', constraints: '', count: 1, path: 'x.py' }, ctx);
+  assert.equal(completionSummary([
+    { turn: 1, tool: 'propose', args: { kind: 'text', path: 'x.py' }, result: text },
+    { turn: 2, tool: 'propose', args: { kind: 'file', path: 'x.py' }, result: file },
+  ]), 'It defines f.\nWrote x.py from proposal A.');
 });

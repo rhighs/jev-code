@@ -59,7 +59,7 @@ const reasonFor = async (c: Completion, text: string, bytes: number, cur: string
 
 export async function validateCandidates(req: ProposalRequest, completions: Array<Completion | GenerationError>, registry: AstRegistry, signal: AbortSignal): Promise<Candidate[]> {
   const adapter = req.kind === 'file' ? registry.resolve({ argumentsSoFar: { path: req.path } }) : undefined;
-  const cur = req.current === undefined ? undefined : normalize(req.current);
+  const cur = req.kind === 'file' && req.current !== undefined ? normalize(req.current) : undefined;
   const out = await Promise.all(completions.map(async (c, idx): Promise<Candidate> => {
     const label = String.fromCharCode(65 + idx);
     if ('error' in c) return { label, text: '', valid: false, reason: `generation failed: ${c.error}`, bytes: 0 };

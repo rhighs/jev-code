@@ -71,3 +71,19 @@ test('a path plan offers conventional filenames when the task names no file or l
   assert.equal(actual, 'main.ts');
   assert.ok(offered.includes(JSON.stringify('main.py')));
 });
+
+test('a read path plan offers workspace files instead of default program names', async () => {
+  let offered: string[] = [];
+  const provider: DecisionProvider = { decide: async (_input, questions) => {
+    const q = questions.selection;
+    if (!q || q.type !== 'choice') throw new Error('Expected a choice question.');
+    offered = Object.values(q.criteria);
+    return { model: 't', usage: { input_tokens: 0, output_tokens: 0 }, answers: { selection: { type: 'choice', choice: 'plan_1', confidence: 1, probabilities: {} } } } as never;
+  } };
+  const actual = await generateText(new Decisions(provider, 100, new AbortController().signal), {
+    task: { turn: 1, prompt: 'what happened exactly?', updates: [] }, action: 'read_file', workspace: { root: '/w', files: ['notes.md', 'main.ts'] },
+  }, 'path', 'File path to read.', { fragments: [], maxSteps: 32, maxBytes: 256, allowEmpty: false });
+  assert.equal(actual, 'main.ts');
+  assert.ok(!offered.includes(JSON.stringify('main.py')));
+  assert.ok(offered.includes(JSON.stringify('notes.md')));
+});
