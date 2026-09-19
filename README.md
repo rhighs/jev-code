@@ -84,8 +84,8 @@ jev-code
 | `jev-code logout` | Remove the saved API key. |
 | `jev-code provider login [id]` | Configure the generation provider: provider, authentication, model. Without `id` a picker opens. |
 | `jev-code provider logout [id]` | Remove the stored credential of a provider. |
-| `jev-code provider list` | List the providers, their authentication methods, the active one, and which are signed in. |
-| `jev-code provider models [id]` | List the bundled and discovered models of a provider. |
+| `jev-code provider list [--json]` | List the providers, their authentication methods, the active one, and which are signed in. |
+| `jev-code provider models [id] [--json]` | List the bundled and discovered models of a provider. |
 | `jev-code provider use <id\|none> [--model <id>] [--base-url <url>]` | Select the active provider without a prompt. `none` turns `propose` off. |
 | `jev-code ast install <module>` | Install an AST adapter module from a local path or an npm package. |
 | `jev-code ast list` | List the installed AST adapters. |
@@ -169,7 +169,7 @@ How one `propose` call runs:
 
 1. Jev fills the request: `kind` (`file` or `text`), `objective`, `constraints`, `count` (1 to 5), `path`.
 2. The provider returns `count` candidates. One refresh of an expired OAuth token covers the whole batch.
-3. Validators drop candidates that are truncated, empty, too large, unchanged, or fail the language validator of the file type.
+3. Validators drop candidates that are truncated, empty, too large, unchanged, duplicates of an earlier candidate, or fail the language validator of the file type.
 4. Jev selects one label or `reject`. The selection is one decision with `field=candidate`.
 5. A `file` candidate is written atomically. A `text` candidate is returned as the output.
 

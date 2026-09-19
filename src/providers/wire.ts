@@ -51,14 +51,22 @@ const requestFor = (wire: Wire, baseUrl: string, model: ModelRow, prompt: Prompt
   return { url: `${baseUrl}/responses`, body: { model: model.id, instructions: prompt.system, input: prompt.user, store: false, stream: true } };
 };
 
+const MAX_BODY = 4 * 1024 * 1024;
+
+const bounded = async (res: Response): Promise<string> => {
+  const text = await res.text();
+  if (Buffer.byteLength(text) > MAX_BODY) throw new Error('response body exceeds 4MB');
+  return text;
+};
+
 const parseChat = async (res: Response): Promise<Completion> => {
-  const data = await res.json() as ChatRes;
+  const data = JSON.parse(await bounded(res)) as ChatRes;
   const first = data.choices?.[0];
   return { text: first?.message?.content ?? '', truncated: first?.finish_reason === 'length' };
 };
 
 const parseMessages = async (res: Response): Promise<Completion> => {
-  const data = await res.json() as MessagesRes;
+  const data = JSON.parse(await bounded(res)) as MessagesRes;
   return { text: (data.content ?? []).map(c => c.text ?? '').join(''), truncated: data.stop_reason === 'max_tokens' };
 };
 
@@ -75,9 +83,12 @@ const parseResponses = async (res: Response): Promise<Completion> => {
   const decoder = new TextDecoder();
   let buf = '';
   let text = '';
+  let bytes = 0;
   for (;;) {
     const { value, done } = await reader.read();
     if (done) return { text, truncated: true };
+    bytes += value.byteLength;
+    if (bytes > MAX_BODY) { void reader.cancel().catch(() => {}); throw new Error('response body exceeds 4MB'); }
     buf += decoder.decode(value, { stream: true });
     const lines = buf.split('\n');
     buf = lines.pop() ?? '';

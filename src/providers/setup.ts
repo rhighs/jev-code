@@ -13,7 +13,7 @@ const AUTH_LABELS: Record<AuthMethod, string> = {
   api_key: 'Use API key',
   none: 'No authentication',
 };
-const USAGE = 'Use provider login [id], provider logout [id], provider list, provider models [id], or provider use <id|none> [--model <id>] [--base-url <url>].';
+const USAGE = 'Use provider login [id], provider logout [id], provider list [--json], provider models [id] [--json], or provider use <id|none> [--model <id>] [--base-url <url>].';
 const noCredential = (id: string): string => `No credential for ${id}. Run jev-code provider login ${id}.`;
 
 export function pick(title: string, options: string[], io: Io): Promise<number | undefined> {
@@ -92,8 +92,12 @@ export async function wizard(io: Io, env: NodeJS.ProcessEnv = process.env, prese
 
 const configured = (cfg: Config): string | undefined => cfg.generation && cfg.generation.provider !== 'none' ? cfg.generation.provider : undefined;
 
-const list = async (cfg: Config, env: NodeJS.ProcessEnv, io: Io): Promise<number> => {
+const list = async (cfg: Config, env: NodeJS.ProcessEnv, io: Io, asJson: boolean): Promise<number> => {
   const creds = await readCredentials(env);
+  if (asJson) {
+    io.out.write(JSON.stringify(PROVIDERS.map(p => ({ id: p.id, name: p.name, auth: p.auth, active: configured(cfg) === p.id, signedIn: p.id in creds, model: configured(cfg) === p.id ? cfg.generation?.model ?? null : null }))) + '\n');
+    return 0;
+  }
   for (const p of PROVIDERS) {
     const mark = configured(cfg) === p.id ? '*' : ' ';
     io.out.write(`${mark} ${p.id}\t${p.name}\t${p.auth.join('/')}\t${p.id in creds ? 'signed in' : ''}\n`);
@@ -101,11 +105,13 @@ const list = async (cfg: Config, env: NodeJS.ProcessEnv, io: Io): Promise<number
   return 0;
 };
 
-const models = async (cfg: Config, id: string, env: NodeJS.ProcessEnv, io: Io): Promise<number> => {
+const models = async (cfg: Config, id: string, env: NodeJS.ProcessEnv, io: Io, asJson: boolean): Promise<number> => {
   const spec = withBase(providerSpec(id), cfg.generation?.provider === id ? cfg.generation.baseUrl : null);
   const cred = await credentialFor(id, env, configured(cfg) === id) ?? anonymous(spec);
   if (!cred) throw new Error(noCredential(id));
-  for (const m of await modelIds(spec, cred, io)) io.out.write(`${m}\n`);
+  const ids = await modelIds(spec, cred, io);
+  if (asJson) { io.out.write(JSON.stringify(ids) + '\n'); return 0; }
+  for (const m of ids) io.out.write(`${m}\n`);
   return 0;
 };
 
@@ -155,17 +161,19 @@ const logout = async (cfg: Config, id: string | undefined, env: NodeJS.ProcessEn
 
 export async function providerCommand(args: string[], io: Io, env: NodeJS.ProcessEnv = process.env): Promise<number> {
   const err = io.err ?? process.stderr;
-  const [cmd, id, ...extra] = args;
+  const asJson = args.includes('--json');
+  const [cmd, id, ...extra] = args.filter(a => a !== '--json');
   try {
+    if (asJson && cmd !== 'list' && cmd !== 'models') throw new Error(USAGE);
     if (extra.length && cmd !== 'use') throw new Error(USAGE);
     const cfg = await readConfig(env);
     if (cmd === 'login') { await wizard(io, env, id); return 0; }
     if (cmd === 'logout') return await logout(cfg, id, env, io);
-    if (cmd === 'list' && id === undefined) return await list(cfg, env, io);
+    if (cmd === 'list' && id === undefined) return await list(cfg, env, io, asJson);
     if (cmd === 'models') {
       const target = id ?? configured(cfg);
       if (!target) throw new Error('No provider configured. Use provider models <id>.');
-      return await models(cfg, target, env, io);
+      return await models(cfg, target, env, io, asJson);
     }
     if (cmd === 'use' && id !== undefined) return await use(cfg, id, useFlags(extra), env, io);
     throw new Error(USAGE);

@@ -416,6 +416,16 @@ test('two consecutive file proposes to the same path trigger the rewrite guard',
   assert.match(third?.progressFeedback ?? '', /rewrote x\.py without running it/);
 });
 
+test('two consecutive rejected proposes with the same request remove propose for a turn', async t => {
+  const root = await workspace(t);
+  const provider = new ScriptedProvider([proposeStep('reject'), proposeStep('reject'), { action: 'finish', verdict: 1 }]);
+  const result = await new Harness({ workspace: root, provider, tools: withPropose(fakeProvider()), journalDirectory: false }).run('Make f return 2.');
+  assert.equal(result.status, 'completed', result.summary);
+  assert.ok(!provider.actions.find(a => a.turn === 3)?.offered.includes('propose'));
+  const third = provider.states.find(state => state.task.turn === 3 && !state.generation && !state.field) as { progressFeedback?: string } | undefined;
+  assert.match(third?.progressFeedback ?? '', /propose is unavailable for this turn/);
+});
+
 test('maxProposals bounds the run and the second propose fails without calling the provider', async t => {
   const root = await workspace(t);
   const fake = fakeProvider();

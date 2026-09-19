@@ -199,3 +199,9 @@ test('listModels uses /v1/models for anthropic and returns undefined on failure 
   assert.equal(await listModels(responsesSpec(baseUrl), oauth, never), undefined);
   assert.equal(reqs.length, 1);
 });
+
+test('a response body over 4MB is rejected before parsing', async t => {
+  const big = 'x'.repeat(4 * 1024 * 1024 + 1);
+  const { baseUrl } = await serve(t, (_req, res) => json(res, 200, { choices: [{ message: { content: big }, finish_reason: 'stop' }] }));
+  await assert.rejects(complete(chatSpec(baseUrl), apiKey, row, prompt, never), /exceeds 4MB/);
+});

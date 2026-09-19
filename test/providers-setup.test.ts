@@ -272,3 +272,19 @@ test('provider login <id> skips the provider pick and use accepts --model and --
   assert.equal(await providerCommand(['use', 'openai-compatible', '--model'], quiet.io, env), 1);
   assert.equal(await providerCommand(['use', 'openai-compatible', '--bogus', 'x'], quiet.io, env), 1);
 });
+
+test('provider list --json and models --json emit machine-readable output', async t => {
+  const env = await dir(t);
+  const { baseUrl } = await serve(t, compat);
+  await writeConfig({ generation: { provider: 'openai-compatible', model: 'zeta', auth: 'api_key', baseUrl } }, env);
+  await writeCredential('openai-compatible', { type: 'api_key', key: KEY }, env);
+  const fake = fakeIo();
+  assert.equal(await providerCommand(['list', '--json'], fake.io, env), 0);
+  const rows = JSON.parse(fake.text()) as Array<{ id: string; active: boolean; signedIn: boolean; model: string | null }>;
+  assert.equal(rows.length, 6);
+  assert.deepEqual(rows.find(r => r.id === 'openai-compatible'), { id: 'openai-compatible', name: 'OpenAI-compatible', auth: ['api_key'], active: true, signedIn: true, model: 'zeta' });
+  const more = fakeIo();
+  assert.equal(await providerCommand(['models', '--json'], more.io, env), 0);
+  assert.deepEqual(JSON.parse(more.text()), ['alpha', 'zeta']);
+  assert.equal(await providerCommand(['use', 'none', '--json'], more.io, env), 1);
+});

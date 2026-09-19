@@ -36,7 +36,7 @@ const reasonFor = async (c: Completion, text: string, bytes: number, cur: string
 export async function validateCandidates(req: ProposalRequest, completions: Array<Completion | GenerationError>, registry: AstRegistry, signal: AbortSignal): Promise<Candidate[]> {
   const adapter = req.kind === 'file' ? registry.resolve({ argumentsSoFar: { path: req.path } }) : undefined;
   const cur = req.current === undefined ? undefined : normalize(req.current);
-  return Promise.all(completions.map(async (c, idx): Promise<Candidate> => {
+  const out = await Promise.all(completions.map(async (c, idx): Promise<Candidate> => {
     const label = String.fromCharCode(65 + idx);
     if ('error' in c) return { label, text: '', valid: false, reason: `generation failed: ${c.error}`, bytes: 0 };
     const text = stripFences(c.text);
@@ -44,4 +44,13 @@ export async function validateCandidates(req: ProposalRequest, completions: Arra
     const reason = await reasonFor(c, text, bytes, cur, adapter, signal);
     return reason === undefined ? { label, text, valid: true, bytes } : { label, text, valid: false, reason, bytes };
   }));
+  const seen = new Map<string, string>();
+  return out.map(c => {
+    if (!c.valid) return c;
+    const key = normalize(c.text);
+    const first = seen.get(key);
+    if (first) return { ...c, valid: false, reason: `duplicate of ${first}` };
+    seen.set(key, c.label);
+    return c;
+  });
 }

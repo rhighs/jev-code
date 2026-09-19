@@ -197,6 +197,11 @@ export class Harness {
           delete criteria[previous.tool];
           state.progressFeedback = 'The last two reads returned the same unchanged result. Choose another action that advances the task; the repeated read tool is unavailable for this turn.';
         }
+        if (previous && earlier && previous.tool === 'propose' && earlier.tool === 'propose' && !previous.result.ok && !earlier.result.ok &&
+            JSON.stringify(previous.args) === JSON.stringify(earlier.args)) {
+          delete criteria.propose;
+          state.progressFeedback = 'The last two propose calls with the same request produced no accepted candidate. Change the objective or constraints next time, or use another tool; propose is unavailable for this turn.';
+        }
         const writtenPath = (record: ToolRecord | undefined): string | undefined => {
           if (!record?.result.ok) return undefined;
           if (record.tool === 'write_file' && typeof record.args.path === 'string') return record.args.path;

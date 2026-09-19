@@ -62,3 +62,9 @@ test('validateCandidates skips the adapter for paths without one and for text ki
   const text = await validateCandidates({ kind: 'text', objective: 'o', constraints: '', count: 1 }, [done('def f(:\n')], registry, signal);
   assert.equal(text[0]!.valid, true);
 });
+
+test('validateCandidates marks later identical candidates as duplicates', async () => {
+  const out = await validateCandidates(fileReq('x.txt', 'old\n'), [done('new\n'), done('new  \r\n'), done('other\n')], registry, signal);
+  assert.deepEqual(out.map(c => c.valid), [true, false, true]);
+  assert.equal(out[1]!.reason, 'duplicate of A');
+});
