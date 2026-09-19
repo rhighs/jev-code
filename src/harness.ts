@@ -1,3 +1,4 @@
+import type { ProposalProvider } from './providers/types.js';
 import { randomUUID } from 'node:crypto';
 import { mkdir, open, realpath, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -15,6 +16,7 @@ export const DEFAULT_LIMITS = { maxTurns: 50, maxRequests: 512, maxGenerationSte
 export interface HarnessOptions {
   workspace: string;
   provider: DecisionProvider;
+  generationProvider?: ProposalProvider;
   tools?: Tool[];
   astAdapters?: AstAdapter[];
   bundledAsts?: boolean;
@@ -181,7 +183,7 @@ export class Harness {
             'Choose a concrete next action. Read tool outcomes and repair failures. Update the plan when useful.',
             'Only finish after the requested work and its applicable verification have succeeded. Never invent tool results.',
             'Use blocked only when missing information or an external prerequisite prevents further progress.',
-            ...(this.registry.has('propose') ? ['propose is available: use it for source files that need logic. Use write_file only for exact content known in advance.'] : []),
+            ...(this.options.generationProvider ? ['Use write_file for supported source languages. The generation model maps the task into meaningful program steps; you approve the map, choose implementations, and review the program. Use propose for explanations or file types without an AST adapter.'] : []),
           ],
         };
         context.select = async (instruction, criteria, extra) => {
@@ -237,6 +239,7 @@ export class Harness {
         const generationOptions = {
           maxSteps: this.options.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, fragments,
           astRegistry: this.astRegistry,
+          ...(this.options.generationProvider ? { mapper: { provider: this.options.generationProvider, budget: context.proposals! } } : {}),
           experimentalGrid: this.options.experimentalGrid ?? false,
           gridBatchSize: this.options.gridBatchSize ?? 8, concurrency: this.options.concurrency ?? 4, searchWidth: this.options.searchWidth ?? 1,
           // Patch events preserve the scored cells without duplicating the draft per batch.

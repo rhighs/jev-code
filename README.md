@@ -58,7 +58,7 @@ The interactive session is a transcript of cards. Each tool call is one card: a 
 
 `decide` uses the same model on standard input. A shell script can branch on the exit code without parsing.
 
-jev-code is a hybrid. Jev is the only policy. A small generative model can be attached as a candidate generator behind one tool, `propose`. Jev selects `propose`, states the objective, and later selects one candidate or rejects all of them. TypeScript validators filter the candidates in between. The generator never selects tools, never plans, and never ends a run. See PROVIDERS.
+jev-code is a hybrid. Jev is the only policy. With a generation provider configured, `write_file` asks the LLM to map a source task into meaningful subproblems and compatible code options. Jev approves the map, chooses implementations, and reviews the assembled program. Language validators check it before writing; the harness then runs applicable verification. The LLM proposes structure and code but cannot approve a plan, choose tools, write files, or end a run. `propose` remains available for explanations and other file formats. See PROVIDERS.
 
 ## FIRST RUN
 
@@ -86,7 +86,7 @@ jev-code
 | `jev-code provider logout [id]` | Remove the stored credential of a provider. |
 | `jev-code provider list [--json]` | List the providers, their authentication methods, the active one, and which are signed in. |
 | `jev-code provider models [id] [--json]` | List the bundled and discovered models of a provider. |
-| `jev-code provider use [id\|none] [--model <id>] [--base-url <url>]` | Select the active provider. Without `id` a picker opens; missing model or base URL are asked for on a terminal. Flags skip the prompts. `none` turns `propose` off. |
+| `jev-code provider use [id\|none] [--model <id>] [--base-url <url>]` | Select the active provider. Without `id` a picker opens; missing model or base URL are asked for on a terminal. Flags skip the prompts. `none` turns mapping and `propose` off. |
 | `jev-code ast install <module>` | Install an AST adapter module from a local path or an npm package. |
 | `jev-code ast list` | List the installed AST adapters. |
 | `jev-code ast remove <id>` | Remove an installed AST adapter. |
@@ -133,7 +133,7 @@ A validator must be on `PATH` before Jev writes a file in that language. A missi
 
 ## PROVIDERS
 
-`propose` needs a generation provider. The first interactive run asks whether to configure one. `Not now` records the choice and does not ask again. `jev-code provider login` opens the same setup at any time:
+Program mapping and `propose` use the same generation provider. The first interactive run asks whether to configure one. `Not now` records the choice and does not ask again. `jev-code provider login` opens the same setup at any time:
 
 ```text
 Select generation provider:
@@ -164,6 +164,10 @@ Model:
 | `local` | none | Chat completions at `http://localhost:11434/v1` | live list from the server |
 
 Use small, cheap, fast models. The generator only writes candidates; Jev does the judging. API keys are the supported path. OAuth with a consumer subscription is a convenience the vendor can withdraw; jev-code shows that in the picker label. Google OAuth is not implemented.
+
+For a source file with a registered language adapter, `write_file` uses a program map: at most eight steps, each with one to three code options explained in task terms. For Fibonacci, the decisions concern the starting pair, advancing the sequence, and printing the requested count—not choosing AST nodes. Jev can reject the map or any piece, triggering a bounded remap. Each piece is at most 2 KB, and every candidate combination considered by Jev passes the language adapter's source check. Without a provider, the existing grammar builder remains available. `write_files` still uses its existing project builder.
+
+The Python prompt “a simple python fibonaci program writing the first 10” completed in a live run on September 19, 2026: 3 turns, 13 Jev requests, about 20 seconds, and output `0 1 1 2 3 5 8 13 21 34`. This is a smoke test, not a general benchmark.
 
 How one `propose` call runs:
 

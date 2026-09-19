@@ -43,7 +43,7 @@ const preview = (c: Candidate, hunk: DiffLine[] | undefined): string =>
 
 export const proposeTool = (provider: ProposalProvider, registry: AstRegistry): Tool => ({
   name: 'propose', effect: 'write',
-  description: 'Create or rewrite a source file that needs program logic, or produce free text. The generation model drafts candidates, deterministic checks filter them, and you select one or reject all. Prefer this over write_file for any program beyond a few literal lines.',
+  description: 'Produce free text or a file with no AST adapter. Use write_file for supported source languages: The model maps the task into meaningful steps, and Jev chooses their implementations and reviews the program.',
   fields: {
     kind: { type: 'enum', choices: { file: 'Complete file content written to path.', text: 'Free text returned as output.' }, description: 'What the candidates are.' },
     objective: { type: 'string', description: 'What the content must accomplish.' },

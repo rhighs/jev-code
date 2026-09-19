@@ -23,7 +23,8 @@ import { MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
 import { checkSchema, findJournal, readJournal, replayPlain } from './replay.js';
 import { spawn } from 'node:child_process';
 import { sanitizedEnv } from './env.js';
-import { proposeTools } from './providers/index.js';
+import { providerFromConfig } from './providers/index.js';
+import { proposeTool } from './propose/tool.js';
 import { pick, providerCommand, wizard } from './providers/setup.js';
 import type { HarnessOptions } from './harness.js';
 import type { Tool } from './types.js';
@@ -253,9 +254,11 @@ async function main(): Promise<void> {
     else if (i === 1) await writeConfig({ ...cfg, generation: { provider: 'none' } });
   }
   const asts = [...await loadInstalledAsts(workspace), ...(await Promise.all((values.asts ?? []).map(module => loadAstModule(workspace, module)))).flat()];
-  const propose = await proposeTools(process.env, new AstRegistry(asts), line => process.stderr.write(`${line}\n`));
+  const generator = await providerFromConfig(process.env, line => process.stderr.write(`${line}\n`));
+  const propose = generator ? [proposeTool(generator, new AstRegistry(asts))] : [];
   const provider = new JevProvider();
   const harnessOptions: Omit<HarnessOptions, 'onEvent' | 'authorize'> = {
+    ...(generator ? { generationProvider: generator } : {}),
     workspace, provider, tools: [...builtInTools(), ...extraTools, ...propose],
     experimentalGrid: values['experimental-grid'] ?? false,
     astAdapters: asts,

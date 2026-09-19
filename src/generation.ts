@@ -1,3 +1,4 @@
+import { generateMappedProgram, type Mapper } from './program-map.js';
 import type { Decisions, State } from './decisions.js';
 import type { Field } from './types.js';
 import type { TextProgress, TextChange } from './grid.js';
@@ -19,6 +20,7 @@ export function fragmentsFrom(texts: string[]): string[] {
 }
 
 export interface GenerateOptions {
+  mapper?: Mapper;
   maxSteps: number;
   maxBytes: number;
   allowEmpty: boolean;
@@ -58,7 +60,9 @@ export async function generateText(decisions: Decisions, state: State, field: st
   }
   const adapter = field === 'content' ? (options.astRegistry ?? defaultAsts).resolve(state) : undefined;
   if (adapter) {
-    const source = await adapter.generate(decisions, state, field, { ...options,
+    const generate = (d: Decisions, s: State, f: string, o: GenerateOptions) => options.mapper
+      ? generateMappedProgram(adapter, d, s, f, o) : adapter.generate(d, s, f, o);
+    const source = await generate(decisions, state, field, { ...options,
       ...(options.onText ? { onText: async (name: string, value: string, done: boolean, change?: TextChange, progress?: TextProgress) => { if (!done) await options.onText!(name, value, false, change, progress); } } : {}),
     });
     decisions.signal.throwIfAborted();
@@ -79,9 +83,14 @@ export async function generateText(decisions: Decisions, state: State, field: st
     : generateStructuredText(decisions, state, field, description, options);
 }
 
-/** Sibling fields share the task/schema and run concurrently, never a sequential text prefix. */
 export async function generateArguments(decisions: Decisions, state: State, fields: Record<string, Field>,
   options: Omit<GenerateOptions, 'allowEmpty' | 'maxBytes'>): Promise<Record<string, string | number | boolean>> {
+  if (options.mapper && fields.path?.type === 'string' && fields.content?.type === 'string') {
+    const path = await generateText(decisions, { ...state, argumentFields: fields, field: 'path' }, 'path', fields.path.description,
+      { ...options, maxBytes: fields.path.maxBytes ?? 4096, allowEmpty: fields.path.allowEmpty ?? false });
+    const { path: _, ...rest } = fields;
+    return { path, ...await generateArguments(decisions, { ...state, argumentsSoFar: { ...(state.argumentsSoFar as Record<string, unknown> ?? {}), path } }, rest, options) };
+  }
   const controller = new AbortController();
   const scoped = decisions.fork(controller.signal);
   const rawNumbers = JSON.stringify(state).match(/-?\d+(?:\.\d+)?/g) ?? [];

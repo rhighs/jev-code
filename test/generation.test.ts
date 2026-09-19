@@ -62,7 +62,7 @@ test('a path plan offers conventional filenames when the task names no file or l
   const provider: DecisionProvider = { decide: async (_input, questions) => {
     const q = questions.selection;
     if (!q || q.type !== 'choice') throw new Error('Expected a choice question.');
-    offered = Object.values(q.criteria);
+    offered = Object.values(q.criteria).filter((v): v is string => typeof v === 'string');
     return { model: 't', usage: { input_tokens: 0, output_tokens: 0 }, answers: { selection: { type: 'choice', choice: 'plan_1', confidence: 1, probabilities: {} } } } as never;
   } };
   const actual = await generateText(new Decisions(provider, 100, new AbortController().signal), {
@@ -77,7 +77,7 @@ test('a read path plan offers workspace files instead of default program names',
   const provider: DecisionProvider = { decide: async (_input, questions) => {
     const q = questions.selection;
     if (!q || q.type !== 'choice') throw new Error('Expected a choice question.');
-    offered = Object.values(q.criteria);
+    offered = Object.values(q.criteria).filter((v): v is string => typeof v === 'string');
     return { model: 't', usage: { input_tokens: 0, output_tokens: 0 }, answers: { selection: { type: 'choice', choice: 'plan_1', confidence: 1, probabilities: {} } } } as never;
   } };
   const actual = await generateText(new Decisions(provider, 100, new AbortController().signal), {
