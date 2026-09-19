@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -39,4 +39,13 @@ test('resolveApiKey prefers the environment, then the saved key, then asks once 
   const empty = await dir(t);
   assert.equal(await resolveApiKey(async () => undefined, empty), undefined);
   assert.deepEqual(await readConfig(empty), {});
+});
+
+test('readConfig returns generation alongside apiKey and drops a generation without a string provider', async t => {
+  const env = await dir(t);
+  const generation = { provider: 'openai', model: 'gpt-5-nano', auth: 'api_key' as const, baseUrl: null };
+  await writeConfig({ apiKey: 'k1', generation }, env);
+  assert.deepEqual(await readConfig(env), { apiKey: 'k1', generation });
+  await writeFile(configPath(env), JSON.stringify({ apiKey: 'k1', generation: { provider: 7 } }));
+  assert.deepEqual(await readConfig(env), { apiKey: 'k1' });
 });

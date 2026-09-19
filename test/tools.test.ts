@@ -110,6 +110,16 @@ test('Bash cancellation returns a cancelled result promptly', async t => {
   assert.equal(result.data?.cancelled, true);
 });
 
+test('the bash tool never exposes JEV_GENERATION_API_KEY to the child', async t => {
+  const { context, tools } = await setup(t);
+  const prev = process.env.JEV_GENERATION_API_KEY;
+  process.env.JEV_GENERATION_API_KEY = 'sk-x';
+  t.after(() => { if (prev === undefined) delete process.env.JEV_GENERATION_API_KEY; else process.env.JEV_GENERATION_API_KEY = prev; });
+  const result = await tools.get('bash')!.execute({ command: 'printf %s "${JEV_GENERATION_API_KEY:-absent}"', cwd: '.' }, context);
+  assert.equal(result.ok, true);
+  assert.equal(result.output, 'absent');
+});
+
 test('Bash streaming callback errors fail the command and release its resources', async t => {
   const { root, signal } = await setup(t);
   await assert.rejects(runBash('printf "output\\n"; sleep 30', root, 1000, signal, 100,
