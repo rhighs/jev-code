@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import type { Dialect } from '../src/lang/core.js';
 import { cAstAdapter, cDialect } from '../src/lang/c.js';
+import { typescriptDialect } from '../src/lang/javascript.js';
 import { run, type Script } from './lang-helpers.js';
 
 const hasCompiler = ['gcc', 'clang'].some(bin => spawnSync(bin, ['--version'], { stdio: 'ignore' }).error === undefined);
@@ -112,4 +113,18 @@ test('the adapter exposes the dialect identity', () => {
   assert.equal(cAstAdapter.id, 'c');
   assert.deepEqual(cAstAdapter.extensions, ['.c']);
   assert.deepEqual(cAstAdapter.languages, ['c']);
+});
+
+test('a block drops a statement identical to the previous one and finishes after two repeats', async () => {
+  const src = await run(typescriptDialect, 'write a program', ({ slot, criteria }) => {
+    switch (slot) {
+      case 'module_body': return 'assign';
+      case 'assignment_target': return criteria.includes('name_0') ? 'name_0' : 'new';
+      case 'assignment_name': return 'i';
+      case 'value': return 'number';
+      case 'number': return '0';
+      default: return criteria[0]!;
+    }
+  });
+  assert.equal(src.split('\n').filter(Boolean).length, 2);
 });

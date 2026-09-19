@@ -197,7 +197,7 @@ test('blocks cannot repeat pass, are capped in length, identifiers never spell, 
   assert.ok(after > 0);
   assert.ok(!Object.keys(loop.criteria[after]!).includes('pass'));
   const script: Array<string | { value: string }> = ['0'];
-  for (let i = 0; i < 16; i++) script.push('expr', 'call', { value: 'print' }, '0');
+  for (let i = 0; i < 16; i++) script.push('expr', 'call', { value: 'print' }, ...(i % 2 ? ['1', 'number', { value: '1' }] : ['0']));
   const capped = new AstProvider(script);
   const source = await generatePythonAst(decisions(capped), state, 'content', options);
   assert.equal(source.split('\n').filter(Boolean).length, 16);

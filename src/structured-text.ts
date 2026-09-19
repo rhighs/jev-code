@@ -22,7 +22,7 @@ export async function generateStructuredText(decisions: Decisions, state: State,
   const maxTokens = Math.min(options.maxSteps, field === 'path' || field === 'cwd' ? 32 : field === 'command' ? 96 : 128);
   let text = '';
   for (let step = 1; step <= maxTokens; step++) {
-    const criteria: Record<string, string> = Object.fromEntries(tokens.map(token => [token.key, JSON.stringify(token.value)]));
+    const criteria: Record<string, string> = Object.fromEntries(tokens.filter(token => token.value.length === 1 || !text.endsWith(token.value)).map(token => [token.key, JSON.stringify(token.value)]));
     if (text || options.allowEmpty) criteria.END = 'The complete field satisfies the task. Finish it now.';
     const input = { ...context, generation: { field, phase: 'tokens', draft: text, remainingTokens: maxTokens - step } };
     const instruction = `Construct the exact ${field}: ${description}. Choose the longest useful next span. Prefer existing paths, task literals and conventional filenames. Do not repeat text. END only when the complete value satisfies the objective. Current value: ${JSON.stringify(text)}.`;

@@ -181,6 +181,7 @@ export class Harness {
             'Choose a concrete next action. Read tool outcomes and repair failures. Update the plan when useful.',
             'Only finish after the requested work and its applicable verification have succeeded. Never invent tool results.',
             'Use blocked only when missing information or an external prerequisite prevents further progress.',
+            ...(this.registry.has('propose') ? ['propose is available: use it for source files that need logic. Use write_file only for exact content known in advance.'] : []),
           ],
         };
         context.select = async (instruction, criteria, extra) => {

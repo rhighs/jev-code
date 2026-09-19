@@ -43,7 +43,7 @@ const preview = (c: Candidate, hunk: DiffLine[] | undefined): string =>
 
 export const proposeTool = (provider: ProposalProvider, registry: AstRegistry): Tool => ({
   name: 'propose', effect: 'write',
-  description: 'Ask the generation model for candidate content, filter it, then select one candidate or reject all. Use for open-ended synthesis a bounded grammar cannot produce.',
+  description: 'Create or rewrite a source file that needs program logic, or produce free text. The generation model drafts candidates, deterministic checks filter them, and you select one or reject all. Prefer this over write_file for any program beyond a few literal lines.',
   fields: {
     kind: { type: 'enum', choices: { file: 'Complete file content written to path.', text: 'Free text returned as output.' }, description: 'What the candidates are.' },
     objective: { type: 'string', description: 'What the content must accomplish.' },
@@ -91,6 +91,6 @@ export const proposeTool = (provider: ProposalProvider, registry: AstRegistry): 
     if (target === undefined) return { ok: true, output: [...head, selected, '', chosen.text].join('\n'), data: picked };
     await atomicWrite(target, chosen.text, ctx.signal);
     const hunk = hunks.get(chosen.label) ?? diffLines('', chosen.text);
-    return { ok: true, output: [...head, selected].join('\n'), data: { ...picked, hunk: hunk.slice(0, MAX_HUNK) } };
+    return { ok: true, output: [...head, selected, `Wrote ${chosen.bytes} bytes to ${path}:`, '', chosen.text].join('\n'), data: { ...picked, hunk: hunk.slice(0, MAX_HUNK) } };
   },
 });

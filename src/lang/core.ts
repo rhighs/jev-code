@@ -247,6 +247,7 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
   }
 
   async function block(body: Stmt[], scope: Scope, depth: number, slot: string): Promise<boolean> {
+    let dups = 0;
     while (body.length < maxBlockStatements) {
       const criteria: Record<string, string> = { print: 'Print an expression on its own line.', assign: 'Assign a value to a variable.' };
       const symbols = table(scope, builtins);
@@ -347,6 +348,10 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
         const inner = (): Scope => ({ names: new Map(), parent: scope, function: scope.function, loop: production === 'while' || scope.loop, ...(scope.returnTypes ? { returnTypes: scope.returnTypes } : {}) });
         const ended = await block(nested, inner(), depth + 1, production === 'if' ? 'if_body' : 'loop_body');
         if (production === 'if' && await pick('else_branch', scope, { no: 'No else branch is required.', yes: 'Add an else branch.' }) === 'yes' && await block(orelse, inner(), depth + 1, 'else_body') && ended) return true;
+      }
+      if (at > 0 && JSON.stringify(body[at]) === JSON.stringify(body[at - 1])) {
+        body.splice(at, 1);
+        if (++dups >= 2) return false;
       }
     }
     return false;

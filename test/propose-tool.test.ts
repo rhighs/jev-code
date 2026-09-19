@@ -63,6 +63,8 @@ test('propose writes the selected file candidate and reports every candidate', a
   assert.match(lines[2]!, /^B invalid: .*SyntaxError/);
   assert.equal(lines[3], 'C valid 20 bytes');
   assert.equal(lines[4], 'selected C 0.81');
+  assert.equal(lines[5], 'Wrote 20 bytes to x.py:');
+  assert.ok(res.output.endsWith(`\n\n${AE1[2]}`));
   assert.equal(res.data?.selected, 'C');
   assert.equal(res.data?.confidence, 0.81);
   assert.equal(res.data?.provider, 'fake');

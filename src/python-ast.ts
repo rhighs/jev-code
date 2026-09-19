@@ -381,6 +381,7 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
   }
 
   async function block(body: PythonNode[], scope: Scope, depth: number, slot: string): Promise<void> {
+    let dups = 0;
     while (body.length < maxBlockStatements) {
       const criteria: Record<string, string> = { expr: 'Evaluate an expression, usually a function call such as print.', assign: 'Assign a value to a variable.' };
       if (!body.length) criteria.pass = 'An explicit empty statement (pass), for a required empty block.';
@@ -430,6 +431,11 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
           await block(nestedBody, { names: new Map(), parent: scope, function: scope.function, loop: production === 'while' || scope.loop }, depth + 1, production === 'if' ? 'if_body' : 'loop_body');
           if (production === 'if' && await pick('else_branch', scope, { no: 'No else branch is required.', yes: 'Add an else branch.' }) === 'yes') await block(statement.orelse as PythonNode[], { names: new Map(), parent: scope, function: scope.function, loop: scope.loop }, depth + 1, 'else_body');
         }
+      }
+      const at = body.length - 1;
+      if (at > 0 && JSON.stringify(body[at]) === JSON.stringify(body[at - 1])) {
+        body.pop();
+        if (++dups >= 2) return;
       }
     }
   }

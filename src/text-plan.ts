@@ -26,6 +26,7 @@ export async function planText(decisions: Decisions, state: State, field: string
       const extension = language === 'python' ? 'py' : /typescript/i.test(prompt) ? 'ts' : 'js';
       candidates.push(`main.${extension}`, `script.${extension}`);
     }
+    if (!candidates.length) candidates.push('main.py', 'main.ts', 'main.js', 'main.sh');
     return select(candidates, 'Choose a destination path explicitly requested by the user, or a conventional filename for a new standalone program.');
   }
   if (field === 'content') {

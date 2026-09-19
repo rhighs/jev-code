@@ -42,3 +42,32 @@ test('unavailable model choices fail instead of silently decoding arbitrary outp
     answers: { selection: { type: 'choice', choice: 'not-an-option', confidence: 1, probabilities: {} } } } as never) };
   await assert.rejects(new Decisions(provider, 20, new AbortController().signal).choose({}, 'Choose.', { a: 'A.', b: 'B.' }), /unavailable choice/);
 });
+
+test('structured path tokens never repeat the span just appended', async () => {
+  const provider: DecisionProvider = { decide: async (_input, questions) => {
+    const q = questions.selection;
+    if (!q || q.type !== 'choice') throw new Error('Expected a choice question.');
+    const span = Object.entries(q.criteria).find(([, v]) => v === JSON.stringify('main.py'))?.[0];
+    const choice = span ?? (Object.hasOwn(q.criteria, 'plan_0') ? 'free' : 'END');
+    return { model: 't', usage: { input_tokens: 0, output_tokens: 0 }, answers: { selection: { type: 'choice', choice, confidence: 1, probabilities: {} } } } as never;
+  } };
+  const actual = await generateText(new Decisions(provider, 100, new AbortController().signal), {
+    task: { turn: 1, prompt: 'write a program that prints numbers from 1 to 10', updates: [] }, action: 'write_file',
+  }, 'path', 'Destination file path.', { fragments: [], maxSteps: 32, maxBytes: 256, allowEmpty: false });
+  assert.equal(actual, 'main.py');
+});
+
+test('a path plan offers conventional filenames when the task names no file or language', async () => {
+  let offered: string[] = [];
+  const provider: DecisionProvider = { decide: async (_input, questions) => {
+    const q = questions.selection;
+    if (!q || q.type !== 'choice') throw new Error('Expected a choice question.');
+    offered = Object.values(q.criteria);
+    return { model: 't', usage: { input_tokens: 0, output_tokens: 0 }, answers: { selection: { type: 'choice', choice: 'plan_1', confidence: 1, probabilities: {} } } } as never;
+  } };
+  const actual = await generateText(new Decisions(provider, 100, new AbortController().signal), {
+    task: { turn: 1, prompt: 'write a program that prints numbers from 1 to 10', updates: [] }, action: 'write_file',
+  }, 'path', 'Destination file path.', { fragments: [], maxSteps: 32, maxBytes: 256, allowEmpty: false });
+  assert.equal(actual, 'main.ts');
+  assert.ok(offered.includes(JSON.stringify('main.py')));
+});
