@@ -24,11 +24,19 @@ const errLine = (err: unknown): string => {
   return lines.find(l => /Error:/.test(l)) ?? lines[0] ?? 'invalid';
 };
 
-const reasonFor = async (c: Completion, text: string, bytes: number, cur: string | undefined, adapter: AstAdapter | undefined, signal: AbortSignal): Promise<string | undefined> => {
+const jsonWrapper = (text: string, path: string | undefined): boolean => {
+  if (path?.toLowerCase().endsWith('.json')) return false;
+  const t = text.trim();
+  if (!(t.startsWith('{') || t.startsWith('['))) return false;
+  try { return typeof JSON.parse(t) === 'object'; } catch { return false; }
+};
+
+const reasonFor = async (c: Completion, text: string, bytes: number, cur: string | undefined, path: string | undefined, adapter: AstAdapter | undefined, signal: AbortSignal): Promise<string | undefined> => {
   if (c.truncated) return 'truncated';
   if (text.trim() === '') return 'empty';
   if (bytes > MAX_CANDIDATE_BYTES) return 'too large';
   if (cur !== undefined && normalize(text) === cur) return 'unchanged';
+  if (jsonWrapper(text, path)) return 'json wrapper';
   if (!adapter) return undefined;
   return adapter.validate(text, signal).then(() => undefined, (err: unknown) => { signal.throwIfAborted(); return errLine(err); });
 };
@@ -41,7 +49,7 @@ export async function validateCandidates(req: ProposalRequest, completions: Arra
     if ('error' in c) return { label, text: '', valid: false, reason: `generation failed: ${c.error}`, bytes: 0 };
     const text = stripFences(c.text);
     const bytes = Buffer.byteLength(text);
-    const reason = await reasonFor(c, text, bytes, cur, adapter, signal);
+    const reason = await reasonFor(c, text, bytes, cur, req.kind === 'file' ? req.path : undefined, adapter, signal);
     return reason === undefined ? { label, text, valid: true, bytes } : { label, text, valid: false, reason, bytes };
   }));
   const seen = new Map<string, string>();

@@ -10,7 +10,7 @@ import { complete, type Prompt } from './wire.js';
 
 type Warn = (line: string) => void;
 
-const SYSTEM = 'You produce candidate content only. Output exactly the requested content with no explanation and no code fences.';
+const SYSTEM = 'You produce candidate content only. Output exactly the requested content with no explanation, no code fences, and no JSON or shell wrapper around it.';
 
 const prompt = (req: ProposalRequest): Prompt => {
   const lines = [`Objective: ${req.objective}`];

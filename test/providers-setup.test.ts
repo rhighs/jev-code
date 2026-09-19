@@ -158,7 +158,7 @@ test('providerFromConfig generate issues count completion requests with the KTD9
   assert.equal(reqs.length, 3);
   assert.ok(reqs.every(r => r.url.endsWith('/chat/completions') && r.body.model === 'tiny'));
   const msgs = reqs[0]!.body.messages as Array<{ role: string; content: string }>;
-  assert.equal(msgs[0]!.content, 'You produce candidate content only. Output exactly the requested content with no explanation and no code fences. Output the complete source code of the file calc.py; the output must be valid code for that file type, not prose.');
+  assert.equal(msgs[0]!.content, 'You produce candidate content only. Output exactly the requested content with no explanation, no code fences, and no JSON or shell wrapper around it. Output the complete source code of the file calc.py; the output must be valid code for that file type, not prose.');
   assert.equal(msgs[1]!.content, 'Objective: add f\nConstraints: no imports\nPath: calc.py\nCurrent content:\nx = 1\n');
   assert.equal(reqs[0]!.body.temperature, undefined);
 });
@@ -189,10 +189,27 @@ test('provider use rejects unknown ids, writes the none sentinel, and requires a
   assert.equal(noCred.errText(), 'No credential for anthropic. Run jev-code provider login anthropic.\n');
 
   await writeCredential('anthropic', { type: 'api_key', key: KEY }, env);
-  const ok = fakeIo();
-  assert.equal(await providerCommand(['use', 'anthropic'], ok.io, env), 0);
+  const quiet = fakeIo(false);
+  assert.equal(await providerCommand(['use', 'anthropic'], quiet.io, env), 0);
   assert.deepEqual((await readConfig(env)).generation, { provider: 'anthropic', auth: 'api_key', baseUrl: null });
-  assert.match(ok.text(), /Model cleared; run jev-code provider login anthropic or provider use anthropic --model <id> to choose one\./);
+  assert.match(quiet.text(), /No model set; run jev-code provider use anthropic --model <id>\./);
+  assert.equal(await providerCommand(['use'], quiet.io, env), 1);
+
+  const ok = fakeIo();
+  const picked = providerCommand(['use', 'anthropic'], ok.io, env);
+  await waitFor(ok.text, 'claude-3-5-haiku-latest');
+  ok.stdin.write('2');
+  assert.equal(await picked, 0);
+  assert.equal((await readConfig(env)).generation?.model, 'claude-3-5-haiku-latest');
+  assert.match(ok.text(), /Generation provider set to anthropic \(claude-3-5-haiku-latest\)\./);
+
+  const chooser = fakeIo();
+  const chosen = providerCommand(['use'], chooser.io, env);
+  await waitFor(chooser.text, 'Generation provider');
+  assert.ok(!chooser.text().includes('OpenAI (openai)'));
+  chooser.stdin.write('1');
+  assert.equal(await chosen, 0);
+  assert.equal((await readConfig(env)).generation?.provider, 'anthropic');
 
   const usage = fakeIo();
   assert.equal(await providerCommand(['bogus'], usage.io, env), 1);

@@ -17,7 +17,7 @@ jev-code decide --score "criteria" [--lines]
 jev-code decide --spec file.json
 jev-code replay run-id [--speed x] [--plain]
 jev-code login | logout
-jev-code provider login [id] | logout [id] | list | models [id] | use id|none [--model id] [--base-url url]
+jev-code provider login [id] | logout [id] | list [--json] | models [id] [--json] | use [id|none] [--model id] [--base-url url]
 jev-code ast install module | ast list | ast remove id
 ```
 
@@ -86,7 +86,7 @@ jev-code
 | `jev-code provider logout [id]` | Remove the stored credential of a provider. |
 | `jev-code provider list [--json]` | List the providers, their authentication methods, the active one, and which are signed in. |
 | `jev-code provider models [id] [--json]` | List the bundled and discovered models of a provider. |
-| `jev-code provider use <id\|none> [--model <id>] [--base-url <url>]` | Select the active provider without a prompt. `none` turns `propose` off. |
+| `jev-code provider use [id\|none] [--model <id>] [--base-url <url>]` | Select the active provider. Without `id` a picker opens; missing model or base URL are asked for on a terminal. Flags skip the prompts. `none` turns `propose` off. |
 | `jev-code ast install <module>` | Install an AST adapter module from a local path or an npm package. |
 | `jev-code ast list` | List the installed AST adapters. |
 | `jev-code ast remove <id>` | Remove an installed AST adapter. |
@@ -169,33 +169,31 @@ How one `propose` call runs:
 
 1. Jev fills the request: `kind` (`file` or `text`), `objective`, `constraints`, `count` (1 to 5), `path`.
 2. The provider returns `count` candidates. One refresh of an expired OAuth token covers the whole batch.
-3. Validators drop candidates that are truncated, empty, too large, unchanged, duplicates of an earlier candidate, or fail the language validator of the file type.
+3. Validators drop candidates that are truncated, empty, too large, unchanged, duplicates of an earlier candidate, a JSON wrapper around the content, or fail the language validator of the file type.
 4. Jev selects one label or `reject`. The selection is one decision with `field=candidate`.
 5. A `file` candidate is written atomically. A `text` candidate is returned as the output.
 
-A run recorded with a local Ollama model (`qwen2.5-coder:1.5b`) and a scripted Jev stand-in:
+A run recorded against an OpenAI-compatible gateway (`gpt-5.5` behind LiteLLM) with a scripted Jev stand-in:
 
 ```text
-✓ propose haiku.py · 1.1 s · 61 req
-  │ +# haiku.py
-  │ +
-  │ +print("waves whisper")
-  │ +print("ocean breathes")
-  │ +print("calmness in sight")
+✓ propose haiku.py · 6.0 s · 61 req
+  │ +print("Moon pulls the tide in")
+  │ +print("Salt wind combs the sleeping waves")
+  │ +print("Dawn shells gleam softly")
 ── turn 2 · 1 file
-  │ waves whisper
-  │ ocean breathes
-  │ calmness in sight
-✓ bash 'python3' 'haiku.py' · exit 0 · 15 ms · 5 req
+  │ Moon pulls the tide in
+  │ Salt wind combs the sleeping waves
+  │ Dawn shells gleam softly
+✓ bash 'python3' 'haiku.py' · exit 0 · 18 ms · 5 req
 ```
 
 The journal record of that call:
 
 ```json
-{"provider":"local","model":"qwen2.5-coder:1.5b",
- "candidates":[{"label":"A","valid":true,"bytes":86},
-               {"label":"B","valid":false,"bytes":77,"reason":"SyntaxError: invalid syntax"},
-               {"label":"C","valid":true,"bytes":93}],
+{"provider":"openai-compatible","model":"gpt-5.5",
+ "candidates":[{"label":"A","valid":true,"bytes":109},
+               {"label":"B","valid":true,"bytes":109},
+               {"label":"C","valid":true,"bytes":112}],
  "selected":"A","confidence":0.81}
 ```
 

@@ -13,7 +13,7 @@ const AUTH_LABELS: Record<AuthMethod, string> = {
   api_key: 'Use API key',
   none: 'No authentication',
 };
-const USAGE = 'Use provider login [id], provider logout [id], provider list [--json], provider models [id] [--json], or provider use <id|none> [--model <id>] [--base-url <url>].';
+const USAGE = 'Use provider login [id], provider logout [id], provider list [--json], provider models [id] [--json], or provider use [id|none] [--model <id>] [--base-url <url>].';
 const noCredential = (id: string): string => `No credential for ${id}. Run jev-code provider login ${id}.`;
 
 export function pick(title: string, options: string[], io: Io): Promise<number | undefined> {
@@ -72,18 +72,29 @@ const modelIds = async (spec: ProviderSpec, cred: Credential, io: Io): Promise<s
   return spec.models.map(m => m.id);
 };
 
+const pickProvider = async (io: Io, only?: string[]): Promise<ProviderSpec> => {
+  const rows = only ? PROVIDERS.filter(p => only.includes(p.id)) : PROVIDERS;
+  if (!rows.length) throw new Error('No signed-in provider. Run jev-code provider login.');
+  return rows[await pick('Generation provider', rows.map(p => `${p.name} (${p.id})`), io) ?? cancelled()]!;
+};
+
+const askBaseUrl = async (io: Io): Promise<string> => (await promptSecret('Base URL: ', io.stdin, io.out) ?? cancelled()).replace(/\/+$/, '');
+
+const pickModel = async (spec: ProviderSpec, cred: Credential, io: Io): Promise<string> => {
+  const ids = await modelIds(spec, cred, io);
+  return ids.length ? ids[await pick('Model', ids, io) ?? cancelled()]! : await promptSecret('Model id: ', io.stdin, io.out) ?? cancelled();
+};
+
 export async function wizard(io: Io, env: NodeJS.ProcessEnv = process.env, presetId?: string): Promise<void> {
-  const pidx = presetId === undefined ? await pick('Generation provider', PROVIDERS.map(p => `${p.name} (${p.id})`), io) ?? cancelled() : undefined;
-  const base = presetId === undefined ? PROVIDERS[pidx!]! : providerSpec(presetId);
+  const base = presetId === undefined ? await pickProvider(io) : providerSpec(presetId);
   const aidx = base.auth.length === 1 ? 0 : await pick('Authentication', base.auth.map(m => AUTH_LABELS[m]), io) ?? cancelled();
   const method = base.auth[aidx]!;
-  const baseUrl = base.id === 'openai-compatible' ? (await promptSecret('Base URL: ', io.stdin, io.out) ?? cancelled()).replace(/\/+$/, '') : null;
+  const baseUrl = base.id === 'openai-compatible' ? await askBaseUrl(io) : null;
   const spec = withBase(base, baseUrl);
   const auth = authFor(spec, env, method);
   await auth.login(io);
   const cred = await auth.credential() ?? cancelled();
-  const ids = await modelIds(spec, cred, io);
-  const model = ids.length ? ids[await pick('Model', ids, io) ?? cancelled()]! : await promptSecret('Model id: ', io.stdin, io.out) ?? cancelled();
+  const model = await pickModel(spec, cred, io);
   const cfg = await readConfig(env);
   const generation: Generation = { provider: spec.id, model, auth: method, baseUrl };
   await writeConfig({ ...cfg, generation }, env);
@@ -129,25 +140,32 @@ const useFlags = (args: string[]): UseFlags => {
   return flags;
 };
 
-const use = async (cfg: Config, id: string, flags: UseFlags, env: NodeJS.ProcessEnv, io: Io): Promise<number> => {
-  if (id === 'none') {
+const use = async (cfg: Config, given: string | undefined, flags: UseFlags, env: NodeJS.ProcessEnv, io: Io): Promise<number> => {
+  if (given === 'none') {
     await writeConfig({ ...cfg, generation: { provider: 'none' } }, env);
     io.out.write('Generation provider set to none; propose is disabled.\n');
     return 0;
   }
-  const spec = providerSpec(id);
-  const cred = await credentialFor(id, env, configured(cfg) === id) ?? anonymous(spec);
+  const tty = isInteractiveTTY(io.stdin, io.out);
+  if (given === undefined && !tty) throw new Error(USAGE);
+  const creds = await readCredentials(env);
+  const id = given ?? (await pickProvider(io, PROVIDERS.filter(p => p.id in creds || p.auth.includes('none')).map(p => p.id))).id;
+  const base = providerSpec(id);
+  const cred = await credentialFor(id, env, true) ?? anonymous(base);
   if (!cred) throw new Error(noCredential(id));
   const prev = cfg.generation;
   const same = prev?.provider === id;
+  const kept = flags.baseUrl ?? (same ? prev.baseUrl ?? null : null);
+  const baseUrl = kept ?? (!base.baseUrl && tty ? await askBaseUrl(io) : null);
+  const spec = withBase(base, baseUrl);
   const keep = same || spec.models.some(m => m.id === prev?.model);
-  const generation: Generation = { provider: id, auth: cred.type, baseUrl: flags.baseUrl ?? (same ? prev.baseUrl ?? null : null) };
-  const model = flags.model ?? (keep ? prev?.model : undefined);
+  const model = flags.model ?? (keep ? prev?.model : undefined) ?? (tty ? await pickModel(spec, cred, io) : undefined);
+  const generation: Generation = { provider: id, auth: cred.type, baseUrl };
   if (model) generation.model = model;
   await writeConfig({ ...cfg, generation }, env);
-  io.out.write(`Generation provider set to ${id}.\n`);
-  if (!generation.model) io.out.write(`Model cleared; run jev-code provider login ${id} or provider use ${id} --model <id> to choose one.\n`);
-  if (!spec.baseUrl && !generation.baseUrl) io.out.write(`No base URL; run jev-code provider use ${id} --base-url <url>.\n`);
+  io.out.write(`Generation provider set to ${id}${model ? ` (${model})` : ''}.\n`);
+  if (!generation.model) io.out.write(`No model set; run jev-code provider use ${id} --model <id>.\n`);
+  if (!spec.baseUrl) io.out.write(`No base URL; run jev-code provider use ${id} --base-url <url>.\n`);
   return 0;
 };
 
@@ -175,7 +193,7 @@ export async function providerCommand(args: string[], io: Io, env: NodeJS.Proces
       if (!target) throw new Error('No provider configured. Use provider models <id>.');
       return await models(cfg, target, env, io, asJson);
     }
-    if (cmd === 'use' && id !== undefined) return await use(cfg, id, useFlags(extra), env, io);
+    if (cmd === 'use') return await use(cfg, id, useFlags(extra), env, io);
     throw new Error(USAGE);
   } catch (e) {
     err.write(`${e instanceof Error ? e.message : String(e)}\n`);
