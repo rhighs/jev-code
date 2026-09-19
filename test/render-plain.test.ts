@@ -1,11 +1,9 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
-import { promisify } from 'node:util';
 import { createPrinter, printRun } from '../src/print.js';
 import { renderItem, renderLive, renderSummary } from '../src/render-plain.js';
 import { initialState, reduce, type Decision, type Item, type ToolItem } from '../src/transcript.js';
@@ -190,16 +188,6 @@ test('the one-shot approval prompt renders the awaiting card before asking', asy
   assert.ok(card >= 0 && ask > card, err());
   assert.match(err(), /✓ bash cat hello\.txt · exit 0/);
   assert.match(out(), /^\[completed\]\n  Wrote hello\.txt\.\n  Bash exited with code 0\.\n/);
-});
-
-test('the real cli --demo writes cards to stderr and the summary to stdout without escape codes', async () => {
-  const { stdout, stderr } = await promisify(execFile)('npx', ['tsx', resolve('src/cli.ts'), '--demo'], { cwd: resolve('.'), env: { ...process.env, NO_COLOR: '1' } });
-  assert.doesNotMatch(stdout, /\x1b\[/);
-  assert.doesNotMatch(stderr, /\x1b\[/);
-  assert.equal(count(stderr, '✓ write_file hello.txt'), 1);
-  assert.match(stderr, /  │   1  Hello from a Jev turn loop!\n/);
-  assert.match(stderr, /✓ bash test .* · exit 0/);
-  assert.match(stdout, /^\[completed\]\n  Wrote hello\.txt\.\n  Bash exited with code 0\.\n.* · run [0-9a-f-]{36}\nDemo workspace: /);
 });
 
 test('a running command shows its last output lines in the live area, and a narrow pane keeps only the strip', () => {

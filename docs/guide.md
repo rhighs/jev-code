@@ -275,10 +275,10 @@ For direct library use, export the API key before constructing `JevProvider`; `.
 ```bash
 npm run typecheck
 npm test
-npm run demo
+npm run build
 ```
 
-The offline demo uses a clearly labeled scripted provider and real tools in a temporary workspace. Integration tests exercise creation, failed command feedback, targeted edits, a successful rerun, rejected completion, cancellation, budgets, Unicode generation, path policy, custom tools, interactive follow-ups, live task updates, permissions, streamed Bash output, multiline input, and conversation reset. Additional tests exercise run/turn timing, adapter installation and reload, mandatory adapter validation, typed terminal generation without grid fallback, the file viewer, and styled previews. They do not measure live model quality.
+Integration tests exercise creation, failed command feedback, targeted edits, a successful rerun, rejected completion, cancellation, budgets, Unicode generation, path policy, custom tools, interactive follow-ups, live task updates, permissions, streamed Bash output, multiline input, and conversation reset. Additional tests exercise run/turn timing, adapter installation and reload, mandatory adapter validation, typed terminal generation without grid fallback, the file viewer, and styled previews. They do not measure live model quality.
 
 Live validation on September 17, 2026 used Jev through the official SDK with the objective “Create a simple Python hello world. Run it with python3 to verify it.” Jev chose AST productions for `print('Hello, world!')`, wrote `main.py`, ran `python3 'main.py'`, observed `Hello, world!`, and completed in 3 turns and 16 requests. The live interactive session repeated this successfully in 3 turns and 16 requests (20,426 input tokens), streamed AST progress and command output, remained open, and accepted `/status`. These are narrow smoke tests, not a general coding benchmark.
 

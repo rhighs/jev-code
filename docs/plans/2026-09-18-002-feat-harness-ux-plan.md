@@ -34,13 +34,13 @@ Replace the hand-rolled ANSI session with a terminal UI built on a full TUI fram
 
 Generation improved on the previous plan, but the surface still looks like a script. Tool lines are flat one-color text painted by regex on words like "error". Permission prompts dump raw JSON. Edits show no diff. Decision confidence is counted but never shown. Non-TTY mode reprints the whole source on every AST production. Jev's distinctive property, that every step is a constrained choice with a probability, is invisible to the person watching.
 
-The audience is wider than one terminal: README recordings, live demos, contributors on tmux and odd terminals, and shell pipelines that want a decision, not a coding session.
+The audience is wider than one terminal: README recordings, live sessions, contributors on tmux and odd terminals, and shell pipelines that want a decision, not a coding session.
 
 ### Key Decisions
 
 - **Full TUI framework over hand-rolled ANSI.** The project has had zero UI dependencies. A framework buys layout, redraw, and raw keypress handling that the session needs; the cost is a larger dependency tree and installer bundle. Accepted.
 - **Transcript plus sticky live area.** Of three sketched shapes (transcript with sticky live area, split workbench, compact timeline) the first was chosen. The transcript scrolls and stays in scrollback; the live draft pane and input are pinned at the bottom. Alternate-screen and split layouts are out.
-- **One replayable transcript model.** Journal events reduce to a transcript state that the live view, `--print`, and `replay` all render. Demos, GIFs, and eval journals become replayable from a file, and the decision trace is a view over state the model already holds.
+- **One replayable transcript model.** Journal events reduce to a transcript state that the live view, `--print`, and `replay` all render. Recordings, GIFs, and eval journals become replayable from a file, and the decision trace is a view over state the model already holds.
 - **Decisions are visible on demand.** A one-line strip under the live pane always shows the current slot, chosen production, and confidence. A trace command expands recent decisions with the alternatives Jev rejected and their probabilities.
 - **Approvals are a card and a keypress.** The prompt shows the same card the transcript would show for the tool, then takes `y`, `n`, or `a` (allow this tool for the session). No typing, no editing of the command.
 - **Renderer-free paths stay renderer-free.** `--print`, `--json`, `decide`, and `replay --plain` never load the TUI framework.
@@ -202,7 +202,7 @@ The audience is wider than one terminal: README recordings, live demos, contribu
 - **KTD6. `--print` keeps stderr for progress and stdout for the result.** Cards render to stderr as the run proceeds; the fixed-shape summary goes to stdout at the end. This keeps `jev-code --print ... | tail -1` style usage working and keeps `--json` unaffected.
 - **KTD7. `decide` exit codes: option index for choices, 0 for scores, 125 for failure.** Choice indices are 0-based; up to 100 choices are allowed so indices stay in 0 to 99 and never reach 125, which is reserved for a confidence failure, missing key, or bad arguments (including a single choice, since a choice question needs at least two); on failure the reason goes to stderr. `--score` and `--lines` exit 0 and put the result on stdout.
 - **KTD8. Journal schema version lives on the `start` event.** `start.data.schema: 1`. Replay reads the first line. A higher version is refused with a message naming both versions. A missing field means version 0, which replays best-effort with a warning.
-- **KTD9. The old `TerminalSession` is deleted, not kept behind a flag.** Its session commands (`/help`, `/status`, `/plan`, `/history`, `/files`, `/show`, `/clear`, `/cancel`, `/permissions`, `/paste`, `/exit`), Tab completion, and the `!<command>` direct host shell (run through `runBash`, streamed into a run card, result passed to `harness.observe`) move into the Ink prompt; `/trace` is added. `--interactive` semantics and `--demo` remain. The deletion lands with U4, after approvals work, so the default `ask` mode never ships without a way to approve.
+- **KTD9. The old `TerminalSession` is deleted, not kept behind a flag.** Its session commands (`/help`, `/status`, `/plan`, `/history`, `/files`, `/show`, `/clear`, `/cancel`, `/permissions`, `/paste`, `/exit`), Tab completion, and the `!<command>` direct host shell (run through `runBash`, streamed into a run card, result passed to `harness.observe`) move into the Ink prompt; `/trace` is added. Interactive semantics remain. The deletion lands with U4, after approvals work, so the default `ask` mode never ships without a way to approve.
 
 ### High-Level Technical Design
 
@@ -405,4 +405,3 @@ The live region holds only the current generation: path, source with `__jev_pend
 - `/trace`, `replay`, and `decide` are documented in `docs/guide.md`.
 - Live eval still runs (`npm run dev -- eval`) with no change in records other than the added fields.
 - Shipped by fast-forwarding `main` and pushing; no PR.
-

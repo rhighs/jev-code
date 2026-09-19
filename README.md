@@ -21,24 +21,18 @@ jev-code provider login [id] | logout [id] | list [--json] | models [id] [--json
 jev-code ast install module | ast list | ast remove id
 ```
 
-## DEMO
+## EXAMPLE
 
-A live run. Jev writes `hello.py`, runs it, and reports. `/trace` then lists the last decisions with their alternatives.
+A live run. Jev builds `stats.py`, reads a numeric data file, computes a summary, runs the program, and reports the observed result.
 
 <p align="center">
-  <img src="docs/media/session.gif" alt="A jev-code session: the task, the write card, the run card, the summary, and a decision trace" width="920">
+  <img src="docs/media/session.gif" alt="A jev-code session building and running a Python statistics module" width="920">
 </p>
 
 Play the same recording in your terminal:
 
 ```bash
 asciinema play docs/media/session.cast
-```
-
-Run the offline demo without an API key:
-
-```bash
-jev-code --demo
 ```
 
 ## INSTALL
@@ -90,7 +84,6 @@ jev-code
 | `jev-code ast install <module>` | Install an AST adapter module from a local path or an npm package. |
 | `jev-code ast list` | List the installed AST adapters. |
 | `jev-code ast remove <id>` | Remove an installed AST adapter. |
-| `jev-code --demo` | Run an offline scripted session. No API key is used. |
 | `jev-code --help` | Print all options. |
 
 Session commands, typed at the prompt:

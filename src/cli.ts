@@ -6,10 +6,6 @@ import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { DEFAULT_LIMITS } from './harness.js';
 import { JevProvider } from './provider.js';
-import { DEMO_PROMPT, DemoProvider, runDemo } from './demo.js';
-import { mkdtemp } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { builtInTools } from './tools.js';
 import { createPrinter, printRun } from './print.js';
 import { isInteractiveTTY } from './terminal-style.js';
@@ -71,7 +67,6 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
   --eval-out <dir>        Directory for .jev/eval records (default: current directory)
   --json                  Emit JSONL events on stdout
   --no-journal            Disable .jev/runs JSONL persistence
-  --demo                  Offline scripted demo with real file and Bash tools; in a terminal it opens the full session
   --help                  Show help
 
 The first run asks for your API key; TYPESAFE_API_KEY in the environment overrides the saved one. Ctrl-C cancels the current run.
@@ -177,7 +172,7 @@ async function main(): Promise<void> {
     yes: { type: 'boolean' }, 'confirm-writes': { type: 'boolean' }, 'allow-outside': { type: 'boolean' },
     'max-turns': { type: 'string' }, 'max-requests': { type: 'string' }, 'max-steps': { type: 'string' },
     'timeout-ms': { type: 'string' }, 'grid-batch-size': { type: 'string' }, concurrency: { type: 'string' }, 'search-width': { type: 'string' }, 'max-proposals': { type: 'string' }, tools: { type: 'string' }, json: { type: 'boolean' },
-    'experimental-grid': { type: 'boolean' }, asts: { type: 'string', multiple: true }, 'no-journal': { type: 'boolean' }, demo: { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
+    'experimental-grid': { type: 'boolean' }, asts: { type: 'string', multiple: true }, 'no-journal': { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
     'eval-out': { type: 'string' },
   } });
   if (values.help) { process.stdout.write(HELP); return; }
@@ -211,19 +206,6 @@ async function main(): Promise<void> {
     return;
   }
   const jsonOut = values.json ? process.stdout : undefined;
-  if (values.demo && !values.json && !values.print && isInteractiveTTY(process.stdin, process.stderr)) {
-    const { runSession } = await import('./ui/session.js');
-    const workspace = await mkdtemp(join(tmpdir(), 'jev-demo-'));
-    process.exitCode = await runSession({ harness: { workspace, provider: new DemoProvider(), experimentalGrid: true, journalDirectory: false }, model: 'offline-scripted-demo', initialPrompt: DEMO_PROMPT, yes: true });
-    return;
-  }
-  if (values.demo) {
-    if (!values.json) process.stderr.write('Offline scripted demo (no Jev API calls).\n');
-    const printer = createPrinter(process.stderr, jsonOut);
-    const { workspace } = await runDemo(printer.onEvent);
-    if (!values.json) process.stdout.write(`${printer.summary().join('\n')}\nDemo workspace: ${workspace}\n`);
-    return;
-  }
   if (values['prompt-file'] && positionals.length) throw new Error('Use a positional task or --prompt-file, not both.');
   if (values.interactive && values.print) throw new Error('Choose --interactive or --print, not both.');
   if (values['prompt-file'] === '-' && values.interactive) throw new Error('Interactive mode needs a terminal; stdin is already used for the prompt.');

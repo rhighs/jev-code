@@ -18,8 +18,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
-    "test": "tsx --test test/*.test.ts test/*.test.tsx",
-    "demo": "tsx src/cli.ts --demo"
+    "test": "tsx --test test/*.test.ts test/*.test.tsx"
   },
   "dependencies": {
     "@typesafe-ai/sdk": "^0.6.0",

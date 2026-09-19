@@ -402,7 +402,6 @@ U1 and U2 are independent. U3 precedes U4 because U4's tests need it. U5 depends
 | Typecheck | `npm run typecheck` | all units | exit 0 |
 | Unit and integration tests | `npm test` | all units | exit 0, new test files included |
 | Build | `npm run build` | all units | exit 0 |
-| Offline demo | `npm run demo` | U2, U4 | completes without error |
 | Live eval baseline | `npm run dev -- eval` | before U2, after U2, after U5, after U6 | record written to `.jev/eval/` |
 | Success criteria | five consecutive `eval` runs per stage | stage acceptance | pass counts meet the Product Contract's Success Criteria |
 
