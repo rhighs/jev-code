@@ -16,6 +16,22 @@ export const stripFences = (text: string): string => {
   return `${body.replace(/\n*$/, '')}\n`;
 };
 
+const HEREDOC = /^\s*cat\s*>\s*\S+\s*<<-?\s*'?"?(\w+)'?"?\s*\n([\s\S]*?)\n\1\s*$/;
+
+export const unwrap = (text: string): string => {
+  let cur = text;
+  const t = cur.trim();
+  if (t.startsWith('{')) {
+    try {
+      const obj = JSON.parse(t) as Record<string, unknown>;
+      const vals = Object.values(obj);
+      if (vals.length === 1 && typeof vals[0] === 'string') cur = vals[0];
+    } catch { return cur; }
+  }
+  const m = HEREDOC.exec(cur);
+  return m ? `${m[2]}\n` : cur;
+};
+
 export const normalize = (text: string): string =>
   text.replace(/\r\n/g, '\n').split('\n').map(line => line.trimEnd()).join('\n').replace(/\n*$/, '') + '\n';
 
@@ -47,7 +63,7 @@ export async function validateCandidates(req: ProposalRequest, completions: Arra
   const out = await Promise.all(completions.map(async (c, idx): Promise<Candidate> => {
     const label = String.fromCharCode(65 + idx);
     if ('error' in c) return { label, text: '', valid: false, reason: `generation failed: ${c.error}`, bytes: 0 };
-    const text = stripFences(c.text);
+    const text = stripFences(unwrap(stripFences(c.text)));
     const bytes = Buffer.byteLength(text);
     const reason = await reasonFor(c, text, bytes, cur, req.kind === 'file' ? req.path : undefined, adapter, signal);
     return reason === undefined ? { label, text, valid: true, bytes } : { label, text, valid: false, reason, bytes };

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { AstRegistry } from '../src/ast-adapters.js';
 import type { ProposalRequest } from '../src/providers/types.js';
-import { normalize, stripFences, validateCandidates } from '../src/propose/validate.js';
+import { normalize, stripFences, unwrap, validateCandidates } from '../src/propose/validate.js';
 
 const registry = new AstRegistry();
 const signal = new AbortController().signal;
@@ -70,9 +70,18 @@ test('validateCandidates marks later identical candidates as duplicates', async 
 });
 
 test('validateCandidates rejects a JSON wrapper for non-JSON files but not for .json files', async () => {
-  const wrapped = '{"cmd": "cat > x.py <<EOF\\nprint(1)\\nEOF"}\n';
-  const py = await validateCandidates(fileReq('x.py', 'old\n'), [done(wrapped), done('print(2)\n')], registry, signal);
-  assert.deepEqual(py.map(c => c.reason), ['json wrapper', undefined]);
+  const wrapped = '{"cmd": "echo hi", "cwd": "."}\n';
+  const heredoc = '{"cmd": "cat > x.py <<EOF\\nprint(1)\\nEOF"}\n';
+  const py = await validateCandidates(fileReq('x.py', 'old\n'), [done(wrapped), done('print(2)\n'), done(heredoc)], registry, signal);
+  assert.deepEqual(py.map(c => c.reason), ['json wrapper', undefined, undefined]);
+  assert.equal(py[2]!.text, 'print(1)\n');
   const js = await validateCandidates(fileReq('cfg.json', '{}\n'), [done('{"a": 1}\n')], registry, signal);
   assert.equal(js[0]!.valid, true);
+});
+
+test('unwrap lifts content out of a single-string JSON object and a cat heredoc', () => {
+  assert.equal(unwrap('{"cmd": "cat > haiku.py <<\'PY\'\\nprint(1)\\nprint(2)\\nPY"}'), 'print(1)\nprint(2)\n');
+  assert.equal(unwrap('{"content": "print(3)\\n"}'), 'print(3)\n');
+  assert.equal(unwrap('{"a": "x", "b": "y"}'), '{"a": "x", "b": "y"}');
+  assert.equal(unwrap('print(4)\n'), 'print(4)\n');
 });
