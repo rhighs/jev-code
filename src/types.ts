@@ -26,6 +26,8 @@ export interface ToolContext {
   signal: AbortSignal;
   resolvePath(path: string): Promise<string>;
   onOutput?: (stream: 'stdout' | 'stderr', text: string) => Promise<void>;
+  select?(instruction: string, criteria: Record<string, string>, extra: Record<string, unknown>): Promise<{ choice: string; confidence: number }>;
+  proposals?: { used: number; max: number };
 }
 
 export interface Tool {
