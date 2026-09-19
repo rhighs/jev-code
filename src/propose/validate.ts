@@ -4,11 +4,15 @@ import type { Candidate } from './types.js';
 
 export const MAX_CANDIDATE_BYTES = 16_384;
 
-const FENCED = /^\s*```[^\n]*\n([\s\S]*?)\n?```\s*$/;
+const OPEN = /^\s*```[^\n]*\n/;
 
 export const stripFences = (text: string): string => {
-  const m = FENCED.exec(text);
-  return m ? `${m[1]}\n` : text;
+  const m = OPEN.exec(text);
+  if (!m) return text;
+  const rest = text.slice(m[0].length);
+  const close = rest.search(/\n```[ \t]*(?:\n|$)|^```[ \t]*(?:\n|$)/m);
+  const body = close < 0 ? rest : rest.slice(0, close);
+  return `${body.replace(/\n*$/, '')}\n`;
 };
 
 export const normalize = (text: string): string =>

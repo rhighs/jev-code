@@ -158,7 +158,7 @@ test('providerFromConfig generate issues count completion requests with the KTD9
   assert.equal(reqs.length, 3);
   assert.ok(reqs.every(r => r.url.endsWith('/chat/completions') && r.body.model === 'tiny'));
   const msgs = reqs[0]!.body.messages as Array<{ role: string; content: string }>;
-  assert.equal(msgs[0]!.content, 'You produce candidate content only. Output exactly the requested content with no explanation and no code fences. Output the complete file.');
+  assert.equal(msgs[0]!.content, 'You produce candidate content only. Output exactly the requested content with no explanation and no code fences. Output the complete source code of the file calc.py; the output must be valid code for that file type, not prose.');
   assert.equal(msgs[1]!.content, 'Objective: add f\nConstraints: no imports\nPath: calc.py\nCurrent content:\nx = 1\n');
   assert.equal(reqs[0]!.body.temperature, 0.7);
 });
