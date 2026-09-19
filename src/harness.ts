@@ -27,6 +27,7 @@ export interface HarnessOptions {
   concurrency?: number;
   searchWidth?: number;
   maxRunMs?: number;
+  maxProposals?: number;
   /** Opt into a strict Noul gate; by default completion uses a categorical choice. */
   completionThreshold?: number;
   allowOutsideWorkspace?: boolean;
@@ -52,7 +53,7 @@ export class Harness {
   constructor(private readonly options: HarnessOptions) {
     this.astRegistry = new AstRegistry(options.astAdapters, options.bundledAsts ?? true);
     for (const [name, value] of Object.entries({ maxTurns: options.maxTurns ?? DEFAULT_LIMITS.maxTurns, maxRequests: options.maxRequests ?? DEFAULT_LIMITS.maxRequests,
-      maxGenerationSteps: options.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, maxRunMs: options.maxRunMs ?? DEFAULT_LIMITS.maxRunMs })) {
+      maxGenerationSteps: options.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, maxRunMs: options.maxRunMs ?? DEFAULT_LIMITS.maxRunMs, maxProposals: options.maxProposals ?? 20 })) {
       if (!Number.isSafeInteger(value) || value < 1 || value > 2_147_483_647) throw new Error(`${name} must be a positive integer <= 2147483647.`);
     }
     const threshold = options.completionThreshold ?? 0.85;
@@ -151,6 +152,7 @@ export class Harness {
       await emit('start', { schema: 1, prompt, workspace, decoder: 'dynamic', limits: { turns: this.options.maxTurns ?? DEFAULT_LIMITS.maxTurns, requests: this.options.maxRequests ?? DEFAULT_LIMITS.maxRequests }, journal: journal ?? null });
       const context = toolContext(workspace, signal, path => resolveWorkspacePath(workspace, path, this.options.allowOutsideWorkspace ?? false));
       context.onOutput = async (stream, text) => emit('tool_output', { stream, text });
+      context.proposals = { used: 0, max: this.options.maxProposals ?? 20 };
       for (turn = 1; turn <= (this.options.maxTurns ?? DEFAULT_LIMITS.maxTurns); turn++) {
         const turnStarted = performance.now();
         const turnRequests = decisions.requests;
@@ -180,6 +182,12 @@ export class Harness {
             'Use blocked only when missing information or an external prerequisite prevents further progress.',
           ],
         };
+        context.select = async (instruction, criteria, extra) => {
+          let confidence = 0;
+          const observed = decisions.observe(async data => { confidence = data.confidence ?? confidence; await emit('decision', data); });
+          const choice = await observed.choose({ ...state, ...extra }, instruction, criteria);
+          return { choice, confidence };
+        };
         await emit('turn', { files: inventory.files.length, plan });
         const criteria = Object.fromEntries([...this.registry.values()].map(tool => [tool.name, tool.description]));
         const previous = records.at(-1), earlier = records.at(-2);
@@ -191,6 +199,7 @@ export class Harness {
         const writtenPath = (record: ToolRecord | undefined): string | undefined => {
           if (!record?.result.ok) return undefined;
           if (record.tool === 'write_file' && typeof record.args.path === 'string') return record.args.path;
+          if (record.tool === 'propose' && record.args.kind === 'file' && typeof record.args.path === 'string') return record.args.path;
           if (record.tool === 'write_files' && Array.isArray(record.result.data?.paths)) return [...record.result.data.paths as string[]].sort().join(', ');
           return undefined;
         };
