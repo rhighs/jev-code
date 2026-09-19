@@ -6,7 +6,7 @@ import { gridCursor } from './grid.js';
 import { sanitizedEnv } from './env.js';
 import { LimitError } from './types.js';
 import { choice } from '@typesafe-ai/sdk';
-import { complete, runTree, slot, type ProgramRunOutcome } from './sdk/index.js';
+import { branch, complete, runTree, slot, type ProgramRunOutcome, type ProductionContext, type TreeSlot } from './sdk/index.js';
 
 export type BashAst = { type: 'command'; program: string; args: string[]; redirects: Array<{ operator: '>' | '>>' | '<'; path: string }> }
   | { type: 'binary'; operator: '|' | '&&' | '||' | ';'; left: BashAst; right: BashAst }
@@ -59,7 +59,14 @@ export async function generateBashAst(decisions: Decisions, state: State, field:
   }
   let step = 0;
   let tree: BashAst | undefined;
-  const prepareSelection = (slot: string, criteria: Record<string, string>, tokens: string[] = [], partialAst: BashAst | null = tree ?? null) => {
+  let previewTree: BashAst | undefined;
+  let pendingOperator: Extract<BashAst, { type: 'binary' }>['operator'] | undefined;
+  interface SelectionSpec { readonly semantic: string; readonly criteria: Record<string, string>; readonly tokens: string[] }
+  interface SelectionRequest { readonly input: ReturnType<typeof jsonState>; readonly instruction: string }
+  const selectionSpecs = new Map<string, SelectionSpec>();
+  const pendingRequests = new Map<string, SelectionRequest>();
+  let observedState: State = state;
+  const prepareSelection = (slot: string, criteria: Record<string, string>, tokens: string[] = [], partialAst: BashAst | null = previewTree ?? null) => {
     if (++step > Math.min(options.maxSteps, 96)) throw new LimitError('Bash AST production budget exhausted.');
     decisions.signal.throwIfAborted();
     const input = jsonState({ ...context, generation: { field, phase: 'bash_ast', slot, partialAst, tokens } });
@@ -70,72 +77,179 @@ export async function generateBashAst(decisions: Decisions, state: State, field:
   const reportSelection = async (slot: string, selected: string, preview: string): Promise<void> => {
     await options.onText?.(field, preview, false, { replace: preview }, { decoder: 'ast', step, cursor: gridCursor(preview), bytes: Buffer.byteLength(preview), ast: { slot, production: selected, symbols: [] } });
   };
-  async function pick(slot: string, criteria: Record<string, string>, tokens?: string[]): Promise<string> {
-    const request = prepareSelection(slot, criteria, tokens);
-    const keys = Object.keys(criteria);
-    const selected = keys.length === 1 ? keys[0]! : await decisions.choose(request.input, request.instruction, criteria);
-    const preview = tree ? renderBashAst(tree) : '';
-    await reportSelection(slot, selected, preview);
-    return selected;
-  }
+  const registerSlot = (id: string, semantic: string, criteria: Record<string, string>, tokens: string[] = []): void => {
+    selectionSpecs.set(id, { semantic, criteria, tokens });
+  };
+  const requestFor = (id: string): SelectionRequest => {
+    const existing = pendingRequests.get(id);
+    if (existing !== undefined) return existing;
+    const spec = selectionSpecs.get(id);
+    if (spec === undefined) throw new Error(`Missing Bash tree selection metadata for ${id}.`);
+    const request = prepareSelection(spec.semantic, spec.criteria, spec.tokens);
+    pendingRequests.set(id, request);
+    observedState = request.input;
+    return request;
+  };
+  const selected = async (id: string, production: string): Promise<void> => {
+    const spec = selectionSpecs.get(id);
+    if (spec === undefined) throw new Error(`Missing Bash tree selection metadata for ${id}.`);
+    requestFor(id);
+    const preview = previewTree ? renderBashAst(previewTree) : '';
+    await reportSelection(spec.semantic, production, preview);
+    pendingRequests.delete(id);
+  };
   const plansCriteria: Record<string, string> = { compose: 'Compose a new command tree from program, argument, redirect and operator productions.' };
   plans.slice(0, 200).forEach((plan, index) => { plansCriteria[`plan_${index}`] = renderBashAst(plan); });
-  const planRequest = prepareSelection('plan', plansCriteria, [], null);
-  const root = slot<State, { id: string; tree?: BashAst }>({
+  const words = objective.match(/[\p{L}\p{N}_./=-]+/gu) ?? [];
+  const literals = [...objective.matchAll(/"([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`/g)].map(match => match[1] ?? match[2] ?? match[3]!);
+  const programs = [...new Set(['python3', 'node', 'npm', 'git', 'ls', 'cat', 'printf', 'echo', 'test', 'bash', 'pytest', 'rg', 'find', 'pwd', 'wc', 'head', 'tail', 'sed', 'awk', 'mkdir', 'cp', 'mv', 'rm', 'curl', 'cargo', 'go', 'make', ...words.filter(word => /^[A-Za-z_][\w./-]*$/.test(word))])].slice(0, 200);
+  const argumentsList = [...new Set([...files, ...literals, 'test', 'run', 'build', 'typecheck', '-m', 'py_compile', '-c', '--version', '--check', '--experimental-strip-types', '-n', '-l', '-a', '-p', '.', '1', '2', '5', '10', ...words])].slice(0, 240);
+  const paths = [...new Set([...files, '/dev/null'])];
+  type CommandNode = Extract<BashAst, { type: 'command' }>;
+  type Connector = (left: BashAst) => BashAst;
+  interface ArgumentsResult { readonly args: readonly string[]; readonly connect: Connector }
+
+  const connectorCriteria = { END: 'Complete command tree.', pipe: 'Pipe stdout into another command.', and: 'Run another command only on success (&&).', or: 'Run another command only on failure (||).', sequence: 'Run another command (;).', output: 'Redirect stdout to a file (>).', append: 'Append stdout to a file (>>).', input: 'Read stdin from a file (<).' };
+  const identityConnector: Connector = left => left;
+  const commandSlot = (commandIndex: number, nextConnector: number | undefined): TreeSlot<State, BashAst> => {
+    const id = `bash-program-${commandIndex}`;
+    const criteria = Object.fromEntries(programs.map((value, index) => [`word_${index}`, value]));
+    registerSlot(id, 'program', criteria, programs);
+    return slot({
+      id, description: 'the executable program for a Bash command',
+      productions: programs.map((program, index) => branch<State, BashAst, { arguments: TreeSlot<State, ArgumentsResult> }>(
+        `word_${index}`, program,
+        async () => {
+          await selected(id, `word_${index}`);
+          const current: CommandNode = { type: 'command', program, args: [], redirects: [] };
+          previewTree = previewTree !== undefined && pendingOperator !== undefined
+            ? { type: 'binary', operator: pendingOperator, left: previewTree, right: current }
+            : current;
+          pendingOperator = undefined;
+          return { arguments: argumentSlot(commandIndex, program, [], 0, nextConnector) };
+        },
+        children => {
+          const command: CommandNode = { type: 'command', program, args: [...children.arguments.args], redirects: [] };
+          const assembled = children.arguments.connect(command);
+          tree = assembled;
+          return assembled;
+        },
+      )),
+    });
+  };
+  const argumentSlot = (commandIndex: number, program: string, args: readonly string[], count: number, nextConnector: number | undefined): TreeSlot<State, ArgumentsResult> => {
+    const id = `bash-argument-${commandIndex}-${count}`;
+    const available = argumentsList.flatMap((value, index) => args.includes(value) ? [] : [[`word_${index}`, JSON.stringify(value)] as const]);
+    const criteria = Object.fromEntries([...available, ['END', 'No more arguments are needed.']]);
+    registerSlot(id, 'argument', criteria, argumentsList);
+    const end = nextConnector === undefined
+      ? complete<State, ArgumentsResult>('END', criteria.END!, async () => {
+        await selected(id, 'END');
+        return { args, connect: identityConnector };
+      })
+      : branch<State, ArgumentsResult, { connector: TreeSlot<State, Connector> }>('END', criteria.END!, async () => {
+        await selected(id, 'END');
+        return { connector: connectorSlot(nextConnector) };
+      }, ({ connector }) => ({ args, connect: connector }));
+    const argumentProductions = available.map(([production, description]) => {
+      const value = argumentsList[Number(production.slice(5))]!;
+      if (count === 15) return complete<State, ArgumentsResult>(production, description, async () => {
+        await selected(id, production);
+        throw new LimitError('Bash AST argument budget exhausted.');
+      });
+      return branch<State, ArgumentsResult, { next: TreeSlot<State, ArgumentsResult> }>(production, description, async () => {
+        await selected(id, production);
+        rightmostCommand(previewTree!).args.push(value);
+        return { next: argumentSlot(commandIndex, program, [...args, value], count + 1, nextConnector) };
+      }, ({ next }) => next);
+    });
+    return slot({ id, description: `the next argument for ${program}`, productions: [...argumentProductions, end] });
+  };
+  const redirectPathSlot = (connectorCount: number, operator: '>' | '>>' | '<'): TreeSlot<State, Connector> => {
+    const id = `bash-redirect-path-${connectorCount}`;
+    const criteria = Object.fromEntries(paths.map((value, index) => [`word_${index}`, value]));
+    registerSlot(id, 'redirect_path', criteria, paths);
+    return slot({
+      id, description: 'the redirect path',
+      productions: paths.map((path, index) => connectorCount === 7
+        ? complete<State, Connector>(`word_${index}`, path, async () => {
+          await selected(id, `word_${index}`);
+          rightmostCommand(previewTree!).redirects.push({ operator, path });
+          return left => {
+            const last = rightmostCommand(left);
+            last.redirects.push({ operator, path });
+            return left;
+          };
+        })
+        : branch<State, Connector, { next: TreeSlot<State, Connector> }>(`word_${index}`, path, async () => {
+          await selected(id, `word_${index}`);
+          rightmostCommand(previewTree!).redirects.push({ operator, path });
+          return { next: connectorSlot(connectorCount + 1) };
+        }, ({ next }) => left => {
+          const last = rightmostCommand(left);
+          last.redirects.push({ operator, path });
+          return next(left);
+        })),
+    });
+  };
+  const rightmostCommand = (value: BashAst): CommandNode => {
+    let last = value;
+    while (last.type === 'binary') last = last.right;
+    if (last.type !== 'command') throw new Error('Redirect requires a simple command.');
+    return last;
+  };
+  const connectorSlot = (count: number): TreeSlot<State, Connector> => {
+    const id = `bash-connector-${count}`;
+    registerSlot(id, 'connector', connectorCriteria);
+    const connector = (production: 'pipe' | 'and' | 'or' | 'sequence', operator: '|' | '&&' | '||' | ';') =>
+      branch<State, Connector, { right: TreeSlot<State, BashAst> }>(production, connectorCriteria[production], async () => {
+        await selected(id, production);
+        pendingOperator = operator;
+        return { right: commandSlot(count + 1, count === 7 ? undefined : count + 1) };
+      }, ({ right }) => left => ({ type: 'binary', operator, left, right }));
+    const redirect = (production: 'output' | 'append' | 'input', operator: '>' | '>>' | '<') =>
+      branch<State, Connector, { path: TreeSlot<State, Connector> }>(production, connectorCriteria[production], async () => {
+        await selected(id, production);
+        return { path: redirectPathSlot(count, operator) };
+      }, ({ path }) => left => path(left));
+    return slot({
+      id, description: 'the next Bash connector or redirect',
+      productions: [
+        complete('END', connectorCriteria.END, async () => { await selected(id, 'END'); return identityConnector; }),
+        connector('pipe', '|'), connector('and', '&&'), connector('or', '||'), connector('sequence', ';'),
+        redirect('output', '>'), redirect('append', '>>'), redirect('input', '<'),
+      ].map(production => count === 7 && production.id !== 'END'
+        ? { ...production, assemble: production.kind === 'branch' ? async (children: never, context: ProductionContext<State>) => {
+          await production.assemble(children, context);
+          throw new LimitError('Bash AST connector budget exhausted.');
+        } : undefined } as typeof production
+        : production),
+    });
+  };
+
+  registerSlot('bash-plan', 'plan', plansCriteria);
+  const root = slot<State, BashAst>({
     id: 'bash-plan',
     description: 'the root Bash command plan',
-    productions: Object.entries(plansCriteria).map(([id, description]) => complete(id, description, () => ({
-      id,
-      ...(id === 'compose' ? {} : { tree: plans[Number(id.slice(5))]! }),
-    }))),
+    productions: Object.entries(plansCriteria).map(([id, description]) => id === 'compose'
+      ? branch<State, BashAst, { command: TreeSlot<State, BashAst> }>(id, description, async () => {
+        await selected('bash-plan', id);
+        return { command: commandSlot(0, 0) };
+      }, ({ command }) => command)
+      : complete(id, description, async () => {
+        await selected('bash-plan', id);
+        const plan = plans[Number(id.slice(5))]!;
+        previewTree = plan;
+        return plan;
+      })),
   });
   const planOutcome = await runTree(root, state, {
-    session: decisions.publicSession(planRequest.input),
-    state: () => planRequest.input,
-    instructions: () => planRequest.instruction,
+    session: decisions.publicSession(() => observedState),
+    state: treeSlot => requestFor(treeSlot.id).input,
+    instructions: treeSlot => requestFor(treeSlot.id).instruction,
   });
   decisions.signal.throwIfAborted();
-  const selectedPlan = completedTreeValue(planOutcome);
-  await reportSelection('plan', selectedPlan.id, '');
-  if (selectedPlan.id !== 'compose') tree = selectedPlan.tree!;
-  else {
-    const words = objective.match(/[\p{L}\p{N}_./=-]+/gu) ?? [];
-    const literals = [...objective.matchAll(/"([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`/g)].map(match => match[1] ?? match[2] ?? match[3]!);
-    const programs = [...new Set(['python3', 'node', 'npm', 'git', 'ls', 'cat', 'printf', 'echo', 'test', 'bash', 'pytest', 'rg', 'find', 'pwd', 'wc', 'head', 'tail', 'sed', 'awk', 'mkdir', 'cp', 'mv', 'rm', 'curl', 'cargo', 'go', 'make', ...words.filter(word => /^[A-Za-z_][\w./-]*$/.test(word))])].slice(0, 200);
-    const argumentsList = [...new Set([...files, ...literals, 'test', 'run', 'build', 'typecheck', '-m', 'py_compile', '-c', '--version', '--check', '--experimental-strip-types', '-n', '-l', '-a', '-p', '.', '1', '2', '5', '10', ...words])].slice(0, 240);
-    async function command(left?: BashAst, operator?: Extract<BashAst, { type: 'binary' }>['operator']): Promise<BashAst> {
-      const selected = await pick('program', Object.fromEntries(programs.map((value, index) => [`word_${index}`, value])), programs);
-      const current: Extract<BashAst, { type: 'command' }> = { type: 'command', program: programs[Number(selected.slice(5))]!, args: [], redirects: [] };
-      tree = left && operator ? { type: 'binary', operator, left, right: current } : current;
-      for (let count = 0; count < 16; count++) {
-        const criteria = Object.fromEntries(argumentsList.flatMap((value, index) => current.args.includes(value) ? [] : [[`word_${index}`, JSON.stringify(value)]]));
-        criteria.END = 'No more arguments are needed.';
-        const argument = await pick('argument', criteria, argumentsList);
-        if (argument === 'END') return current;
-        current.args.push(argumentsList[Number(argument.slice(5))]!);
-      }
-      throw new LimitError('Bash AST argument budget exhausted.');
-    }
-    tree = await command();
-    for (let count = 0; count < 8; count++) {
-      const selected = await pick('connector', { END: 'Complete command tree.', pipe: 'Pipe stdout into another command.', and: 'Run another command only on success (&&).', or: 'Run another command only on failure (||).', sequence: 'Run another command (;).', output: 'Redirect stdout to a file (>).', append: 'Append stdout to a file (>>).', input: 'Read stdin from a file (<).' });
-      if (selected === 'END') break;
-      if (['output', 'append', 'input'].includes(selected)) {
-        const paths = [...new Set([...files, '/dev/null'])];
-        const chosen = await pick('redirect_path', Object.fromEntries(paths.map((value, index) => [`word_${index}`, value])), paths);
-        let last = tree;
-        while (last.type === 'binary') last = last.right;
-        if (last.type !== 'command') throw new Error('Redirect requires a simple command.');
-        last.redirects.push({ operator: selected === 'input' ? '<' : selected === 'append' ? '>>' : '>', path: paths[Number(chosen.slice(5))]! });
-      } else {
-        const left: BashAst = tree;
-        const operator = selected === 'pipe' ? '|' : selected === 'and' ? '&&' : selected === 'or' ? '||' : ';';
-        const right = await command(left, operator);
-        tree = { type: 'binary', operator, left, right };
-      }
-      if (count === 7) throw new LimitError('Bash AST connector budget exhausted.');
-    }
-  }
+  tree = completedTreeValue(planOutcome);
   const source = renderBashAst(tree!);
   if (Buffer.byteLength(source) > options.maxBytes) throw new LimitError('Bash AST exceeds its source byte budget.');
   await validateBashSource(source, decisions.signal);

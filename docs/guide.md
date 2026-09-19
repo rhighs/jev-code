@@ -11,19 +11,19 @@ This is an experimental harness with tested execution plumbing. Jev is a decisio
 Requires Node.js 22+, Bash, and Python 3.9+ for Python AST generation. Node.js 24+ is needed for the native TypeScript execution example below.
 
 ```bash
-npm install
-npm run build
+pnpm install --frozen-lockfile
+pnpm run build
 ```
 
 The first interactive run asks for your typesafe.ai API key and saves it to `~/.config/jev-code/config.json` (mode 600; `$XDG_CONFIG_HOME` and `JEV_CODE_CONFIG_DIR` are honored). `jev-code login` re-enters it, `jev-code logout` removes it. A `TYPESAFE_API_KEY` in the environment or a local `.env` file (loaded automatically) takes precedence over the saved key, and non-interactive commands (`--print`, `decide`, `eval`) never prompt; they fail with a pointer to `login` instead. Optional SDK settings are `TYPESAFE_DEFAULT_MODEL` and `TYPESAFE_BASE_URL`. `.env`, journals, dependencies, and build output are ignored by Git.
 
 ```bash
-npm run dev
-npm start -- --workspace /path/to/project
-npm start -- --workspace /path/to/project "Create a TypeScript CLI and test it"
-npm start -- -p --yes --workspace /path/to/project --prompt-file task.md
-npm start -- --interactive --workspace /path/to/project
-npm run dev -- --help
+pnpm run dev
+pnpm start -- --workspace /path/to/project
+pnpm start -- --workspace /path/to/project "Create a TypeScript CLI and test it"
+pnpm start -- -p --yes --workspace /path/to/project --prompt-file task.md
+pnpm start -- --interactive --workspace /path/to/project
+pnpm run dev -- --help
 ```
 
 In a terminal, launching without a task starts a persistent interactive session. A positional task starts the first run and leaves the session open for follow-ups. `-p`/`--print` runs once and exits. Task files, JSON output, and non-terminal input select one-shot mode unless `--interactive` is explicit.
@@ -60,7 +60,7 @@ Direct file tools resolve symlinks and reject paths outside the selected workspa
 
 **Degradation.** Below 80 columns the live pane is dropped and only the decision strip remains; every line is clipped to the terminal width with a trailing ellipsis, so the terminal's own auto-wrap never splits a word across two screen lines. `NO_COLOR` or `TERM=dumb` turn off color and cursor movement in both the interactive session and `--print`. Under tmux and over SSH, the pinned live area redraws only when its content changes, so scrollback and multiplexer redraws stay legible. A non-TTY stdin or stderr — a pipe, a redirect, `--json`, a task file — falls back to the plain, `--print`-style renderer instead of mounting Ink.
 
-Interactive rendering runs on Ink, React, and `ink-text-input` at runtime; `--print`, `--json`, `decide`, and `replay --plain` never load them. The installer is unaffected: it still runs `npm ci --ignore-scripts` from the source tarball against the committed `package-lock.json`.
+Interactive rendering runs on Ink, React, and `ink-text-input` at runtime; `--print`, `--json`, `decide`, and `replay --plain` never load them. The installer uses Corepack and the committed `pnpm-lock.yaml` to build from the source tarball.
 
 ## Tools and turns
 
@@ -186,21 +186,21 @@ To add a language, write a dialect and export `adapterFor(dialect)` from a modul
 To install an adapter module from a source checkout:
 
 ```bash
-npm run build
-npm run dev -- ast install ./examples/dialect-ast.mjs
-npm run dev -- ast list
-npm run dev
+pnpm run build
+pnpm run dev -- ast install ./examples/dialect-ast.mjs
+pnpm run dev -- ast list
+pnpm run dev
 # Later, remove it:
-npm run dev -- ast remove racket
+pnpm run dev -- ast remove racket
 ```
 
 Installation records adapter modules in `<workspace>/.jev/asts.json`; subsequent CLI sessions load them automatically. Use `--workspace /path/to/project` for another workspace. Local module paths resolve against that workspace and are stored as absolute paths. To load an adapter for one session without installation:
 
 ```bash
-npm run dev -- --asts ./examples/dialect-ast.mjs
+pnpm run dev -- --asts ./examples/dialect-ast.mjs
 ```
 
-Packages work too: install an adapter package into your workspace using npm, then run `npm run dev -- ast install <package-name>` from this harness with the target `--workspace`. The package must provide a Node-resolvable ESM module exporting an `astAdapters` array. A parser package alone is not a Jev generator: an adapter must implement the production loop, AST rendering, and source validation. Adapter modules execute as trusted host code, like tool modules.
+Packages work too: install an adapter package into your workspace using pnpm, then run `pnpm run dev -- ast install <package-name>` from this harness with the target `--workspace`. The package must provide a Node-resolvable ESM module exporting an `astAdapters` array. A parser package alone is not a Jev generator: an adapter must implement the production loop, AST rendering, and source validation. Adapter modules execute as trusted host code, like tool modules.
 
 An adapter implements the exported `AstAdapter` interface: `id`, `extensions`, `languages`, `generate(decisions, state, field, options)`, and mandatory `validate(source, signal)`. Generation uses the shared Jev request budget and abort signal. The host checks byte limits and validates returned source before marking generation complete or executing a file tool. Registered language/file extensions choose their AST adapter automatically, and adapter errors terminate that draft without reverting to the grid. Duplicate ids, languages, or extensions are rejected. Library hosts can pass `astAdapters` in `HarnessOptions` or call `harness.registerAst(adapter)` between runs. See [the JavaScript dialect](../src/lang/javascript.ts) and [the shared core](../src/lang/core.ts) for the bundled implementation.
 
@@ -239,9 +239,9 @@ For direct library use, export the API key before constructing `JevProvider`; `.
 ## Verify
 
 ```bash
-npm run typecheck
-npm test
-npm run build
+pnpm run typecheck
+pnpm test
+pnpm run build
 ```
 
 Integration tests exercise creation, failed command feedback, targeted edits, a successful rerun, rejected completion, cancellation, budgets, Unicode generation, path policy, custom tools, interactive follow-ups, live task updates, permissions, streamed Bash output, multiline input, and conversation reset. Additional tests exercise run/turn timing, adapter installation and reload, mandatory adapter validation, typed terminal generation without grid fallback, the file viewer, and styled previews. They do not measure live model quality.
@@ -253,15 +253,15 @@ After removing default grids and generated finish prose, a live “write a for l
 ## Eval
 
 ```bash
-npm run dev -- eval
-npm run dev -- eval guessing-game
-npm run dev -- eval --eval-out /path/to/records
-npm run dev -- eval compare .jev/eval/<before>.json .jev/eval/<after>.json
+pnpm run dev -- eval
+pnpm run dev -- eval guessing-game
+pnpm run dev -- eval --eval-out /path/to/records
+pnpm run dev -- eval compare .jev/eval/<before>.json .jev/eval/<after>.json
 ```
 
 `eval` runs a fixed ladder of tasks against live Jev: `guessing-game`, `file-io-script`, and `multi-file-package`, each defined in `eval/<task>/task.json` with a prompt, a `stage` tag, and optional limit overrides, plus a `check.ts` that judges the resulting workspace deterministically. The guessing-game checker plays the game adaptively from the program's own feedback lines, so no seed is needed. Every task runs in a fresh temporary workspace that is deleted afterwards; its journal is kept under `.jev/eval/journals/<task>/`. One record per task is written to `.jev/eval/<timestamp>.json` under the current directory or `--eval-out`. `--search-width` applies to eval runs and is recorded on each record as `searchWidth`. A record file is a JSON array with one object per task: `task`, `stage`, `status`, `summary`, `check` (`ok`, `reason`), `turns`, `requests`, `inputTokens`, `durationMs`, `runId`, `commit`, `startedAt`. `eval compare <a> <b>` prints one row per task across the two files with pass, requests, duration, and status side by side and the request and duration deltas; a task present in only one file shows `absent`. `eval compare` does not need an API key.
 
-`eval` is a development command: task checkers live outside the compiled `src/` tree, so run it with `npm run dev`, not the installed binary. It implies `--yes`: agent Bash executes on this host without confirmation, and checkers execute the generated programs. Run it inside a container or VM when you want isolation. Programs spawned by checkers do not receive `TYPESAFE_API_KEY`. Eval never runs in CI.
+`eval` is a development command: task checkers live outside the compiled `src/` tree, so run it with `pnpm run dev`, not the installed binary. It implies `--yes`: agent Bash executes on this host without confirmation, and checkers execute the generated programs. Run it inside a container or VM when you want isolation. Programs spawned by checkers do not receive `TYPESAFE_API_KEY`. Eval never runs in CI.
 
 ### Eval results
 

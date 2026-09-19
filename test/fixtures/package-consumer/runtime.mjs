@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {
   DecisionSession,
-  Program,
+  DecisionProgram,
   defineRouter,
   route,
   runTree,
@@ -10,7 +10,7 @@ import {
 } from 'jev-code';
 
 assert.equal(typeof DecisionSession, 'function');
-assert.equal(typeof Program, 'function');
+assert.equal(typeof DecisionProgram, 'function');
 assert.equal(typeof defineRouter, 'function');
 assert.equal(typeof route, 'function');
 assert.equal(typeof runTree, 'function');

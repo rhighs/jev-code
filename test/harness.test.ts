@@ -211,6 +211,33 @@ test('host denial is observed and causes no file mutation', async t => {
   assert.equal(result.requests, provider.states.length);
 });
 
+test('malformed or unavailable action routes fail before authorization or effects', async t => {
+  for (const answer of [
+    { type: 'choice', choice: 'missing', confidence: 1, probabilities: { write_file: 1 } },
+    { type: 'choice', choice: 'write_file', confidence: 1, probabilities: { write_file: 1 }, extra: true },
+  ]) {
+    const root = await workspace(t);
+    let authorizations = 0;
+    let executions = 0;
+    const provider: DecisionProvider = { decide: async () => ({
+      model: 'invalid-route', usage: { input_tokens: 0, output_tokens: 0 }, answers: { selection: answer },
+    }) as never };
+    const tool: Tool = {
+      name: 'write_file', effect: 'write', description: 'Write a file.', fields: {},
+      async execute() { executions++; return { ok: true, output: 'unexpected' }; },
+    };
+    const result = await new Harness({
+      workspace: root, provider, tools: [tool], journalDirectory: false,
+      authorize: () => { authorizations++; return true; },
+    }).run('Write a file.');
+
+    assert.equal(result.status, 'error');
+    assert.equal(authorizations, 0);
+    assert.equal(executions, 0);
+    assert.deepEqual(await readdir(root), []);
+  }
+});
+
 test('new user instructions are included at the next turn', async t => {
   const root = await workspace(t);
   const provider = new ScriptedProvider([

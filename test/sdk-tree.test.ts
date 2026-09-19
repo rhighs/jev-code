@@ -5,8 +5,10 @@ import {
   TreeDefinitionError,
   branch,
   complete,
+  runProgram,
   runTree,
   slot,
+  treeProgram,
   type BranchProduction,
   type DecisionProvider,
   type TreeSlot,
@@ -229,4 +231,139 @@ test('production validation is bounded before dispatch and receives cancellation
   const outcome = await runTree(validated, undefined);
   assert.equal(outcome.status, 'completed');
   assert.equal(sawContext, true);
+});
+
+test('tree depth limits above the program default compile without a hidden depth failure', async () => {
+  let current = slot<void, number>({
+    id: 'depth-260', description: 'Deep leaf', productions: [complete('leaf', 'Leaf', () => 260)],
+  });
+  for (let depth = 259; depth >= 0; depth--) {
+    const child = current;
+    current = slot<void, number>({
+      id: `depth-${depth}`,
+      description: 'Deep branch',
+      productions: [branch('next', 'Continue', { child }, values => values.child)],
+    });
+  }
+
+  const outcome = await runTree(current, undefined, { maxDepth: 300 });
+  assert.equal(outcome.status, 'completed');
+  if (outcome.status === 'completed') assert.equal(outcome.value, 260);
+});
+
+test('lazy children are built only after their production is selected', async () => {
+  let lazyBuilds = 0;
+  const root = slot<void, string>({
+    id: 'lazy-root',
+    description: 'Lazy root',
+    productions: [
+      complete('short', 'Stop immediately', () => 'short'),
+      branch('expand', 'Build an expensive child', () => {
+        lazyBuilds++;
+        return {
+          child: slot<void, string>({
+            id: 'lazy-child', description: 'Lazy child',
+            productions: [complete('value', 'Child value', () => 'expanded')],
+          }),
+        };
+      }, children => children.child),
+    ],
+  });
+
+  const outcome = await runTree(root, undefined, { provider: choosing(['short']) });
+  assert.equal(outcome.status, 'completed');
+  if (outcome.status === 'completed') assert.equal(outcome.value, 'short');
+  assert.equal(lazyBuilds, 0);
+});
+
+test('one tree program gives sequential and concurrent runs fresh lazy grammar registries', async () => {
+  const root = slot<void, string>({
+    id: 'reusable-lazy-root',
+    description: 'Reusable lazy root',
+    productions: [branch('expand', 'Expand a fresh child', async () => {
+      await new Promise(resolve => setImmediate(resolve));
+      return {
+        child: slot<void, string>({
+          id: 'fresh-lazy-child', description: 'Fresh lazy child',
+          productions: [complete('value', 'Value', () => 'done')],
+        }),
+      };
+    }, children => children.child)],
+  });
+  const program = treeProgram(root);
+
+  const first = await runProgram(program, undefined);
+  const second = await runProgram(program, undefined);
+  const [third, fourth] = await Promise.all([runProgram(program, undefined), runProgram(program, undefined)]);
+  for (const outcome of [first, second, third, fourth]) {
+    assert.equal(outcome.status, 'completed');
+    if (outcome.status === 'completed') assert.deepEqual(outcome.value, { ok: true, value: 'done' });
+  }
+});
+
+test('data-dependent lazy recursion stays bounded and assembles typed children', async () => {
+  interface Node { readonly depth: number; readonly child?: Node }
+  const recursive = (depth: number): TreeSlot<{ maxDepth: number }, Node> => slot({
+    id: `lazy-depth-${depth}`,
+    description: `Node at depth ${depth}`,
+    productions: [
+      complete('stop', 'Stop here', () => ({ depth })),
+      branch('continue', 'Add one child', ({ input }) => ({ child: recursive(depth + 1) }),
+        children => ({ depth, child: children.child }),
+        input => depth < input.maxDepth),
+    ],
+  });
+
+  const outcome = await runTree(recursive(0), { maxDepth: 3 }, {
+    provider: choosing(['continue', 'continue', 'continue']),
+    maxDepth: 4,
+  });
+  assert.equal(outcome.status, 'completed');
+  if (outcome.status === 'completed') assert.deepEqual(outcome.value, {
+    depth: 0, child: { depth: 1, child: { depth: 2, child: { depth: 3 } } },
+  });
+});
+
+test('large static grammars fail the iterative preflight budget without overflowing the call stack', async () => {
+  let current = slot<void, number>({
+    id: 'huge-20000', description: 'Leaf', productions: [complete('leaf', 'Leaf', () => 20_000)],
+  });
+  for (let index = 19_999; index >= 0; index--) {
+    const child = current;
+    current = slot({
+      id: `huge-${index}`, description: 'Static chain',
+      productions: [branch('next', 'Continue', { child }, values => values.child)],
+    });
+  }
+
+  await assert.rejects(runTree(current, undefined, { maxStaticSlots: 1_000 }), error => {
+    assert.ok(error instanceof TreeDefinitionError);
+    assert.match(error.message, /slot preflight budget/);
+    assert.doesNotMatch(error.message, /RangeError|call stack/i);
+    return true;
+  });
+});
+
+test('lazy children reject missing, duplicate, and cyclic dependencies on admission', async () => {
+  const missing = slot<void, string>({
+    id: 'lazy-missing-root', description: 'Missing child root',
+    productions: [branch('expand', 'Expand', () => ({ absent: undefined as never }), () => 'never')],
+  });
+  await assert.rejects(runTree(missing, undefined), /missing child slot "absent"/i);
+
+  const shared = slot<void, string>({
+    id: 'lazy-shared', description: 'Shared child', productions: [complete('leaf', 'Leaf', () => 'x')],
+  });
+  const duplicate = slot<void, string>({
+    id: 'lazy-duplicate-root', description: 'Duplicate root',
+    productions: [branch('expand', 'Expand', () => ({ first: shared, second: shared }), values => values.first + values.second)],
+  });
+  await assert.rejects(runTree(duplicate, undefined), /duplicate slot identity/i);
+
+  let cyclic!: TreeSlot<void, string>;
+  cyclic = slot({
+    id: 'lazy-cycle-root', description: 'Cycle root',
+    productions: [branch('expand', 'Expand', () => ({ self: cyclic }), () => 'never')],
+  });
+  await assert.rejects(runTree(cyclic, undefined), /cycle/i);
 });

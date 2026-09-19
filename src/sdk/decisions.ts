@@ -1,5 +1,5 @@
 import { choice, noul, score, type EntryType, type Questions, type ScoreCriteria, type SystemOneResult } from '@typesafe-ai/sdk';
-import { RunResources, type RunResourceOptions } from './resources.js';
+import { RunResources, resourceView, type ProgramResourceView, type RunResourceOptions } from './resources.js';
 import {
   DecisionError,
   type ChoiceDecisionResult,
@@ -17,9 +17,19 @@ const DISTRIBUTION_TOLERANCE = 1e-3;
 const MAX_ALTERNATIVES = 4;
 
 export interface DecisionSessionOptions extends RunResourceOptions {
-  resources?: RunResources;
   onDecision?: (result: DecisionResult) => void | Promise<void>;
+  eventTimeoutMs?: number;
 }
+
+interface SessionInternals {
+  readonly provider: DecisionProvider;
+  readonly resources: RunResources;
+  readonly onDecision?: (result: DecisionResult) => void | Promise<void>;
+  readonly eventTimeoutMs: number;
+}
+
+const DEFAULT_EVENT_TIMEOUT_MS = 5_000;
+const sessionInternals = new WeakMap<DecisionSession, SessionInternals>();
 
 function invalid(message: string): never {
   throw new DecisionError(message, { evidence: { kind: 'invalid-response', detail: message } });
@@ -27,6 +37,11 @@ function invalid(message: string): never {
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const assertExactKeys = (value: Record<string, unknown>, allowed: readonly string[], message: string): void => {
+  const keys = Object.keys(value);
+  if (keys.length !== allowed.length || keys.some(key => !allowed.includes(key))) invalid(message);
+};
 
 const assertUnit = (value: unknown, message: string): number => {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) invalid(message);
@@ -92,48 +107,37 @@ const cloneState = (state: JsonObject): EntryType => {
 };
 
 export class DecisionSession {
-  readonly resources: RunResources;
-  readonly signal: AbortSignal;
+  get resources(): ProgramResourceView { return resourceView(sessionInternals.get(this)!.resources); }
+  get signal(): AbortSignal { return sessionInternals.get(this)!.resources.signal; }
 
   constructor(
-    private readonly provider: DecisionProvider,
+    provider: DecisionProvider,
     options: DecisionSessionOptions = {},
   ) {
-    if (options.resources !== undefined && (options.limits !== undefined || options.concurrency !== undefined ||
-      options.signal !== undefined || options.timeoutMs !== undefined)) {
-      throw new Error('Pass either resources or run resource options, not both.');
-    }
-    this.resources = options.resources ?? new RunResources(options);
-    this.signal = this.resources.signal;
-    this.onDecision = options.onDecision;
+    const eventTimeoutMs = options.eventTimeoutMs ?? DEFAULT_EVENT_TIMEOUT_MS;
+    if (!Number.isSafeInteger(eventTimeoutMs) || eventTimeoutMs < 1) throw new Error('eventTimeoutMs must be a positive safe integer.');
+    sessionInternals.set(this, {
+      provider,
+      resources: new RunResources(options),
+      ...(options.onDecision === undefined ? {} : { onDecision: options.onDecision }),
+      eventTimeoutMs,
+    });
   }
 
-  private readonly onDecision: ((result: DecisionResult) => void | Promise<void>) | undefined;
-
   fork(signal?: AbortSignal): DecisionSession {
-    return new DecisionSession(this.provider, {
-      resources: this.resources.fork(signal),
-      ...(this.onDecision === undefined ? {} : { onDecision: this.onDecision }),
-    });
+    const internals = sessionInternals.get(this)!;
+    return createDecisionSession(internals.provider, internals.resources.fork(signal), internals.onDecision, internals.eventTimeoutMs);
   }
 
   observe(onDecision: (result: DecisionResult) => void | Promise<void>): DecisionSession {
-    if (this.onDecision === undefined) return new DecisionSession(this.provider, { resources: this.resources, onDecision });
-    const previous = this.onDecision;
-    return new DecisionSession(this.provider, {
-      resources: this.resources,
-      onDecision: async result => {
+    const internals = sessionInternals.get(this)!;
+    if (internals.onDecision === undefined) {
+      return createDecisionSession(internals.provider, internals.resources, onDecision, internals.eventTimeoutMs);
+    }
+    const previous = internals.onDecision;
+    return createDecisionSession(internals.provider, internals.resources, async result => {
         await Promise.all([previous(result), onDecision(result)]);
-      },
-    });
-  }
-
-  /** Bind this session's provider and observers to another scope of the same run resources. */
-  withResources(resources: RunResources): DecisionSession {
-    return new DecisionSession(this.provider, {
-      resources,
-      ...(this.onDecision === undefined ? {} : { onDecision: this.onDecision }),
-    });
+      }, internals.eventTimeoutMs);
   }
 
   async choose<const Criteria extends Record<string, string>>(
@@ -147,6 +151,7 @@ export class DecisionSession {
     this.assertAnswerKeys(response.answers, ['selection']);
     const answer: unknown = response.answers.selection;
     if (!isRecord(answer) || answer.type !== 'choice' || typeof answer.choice !== 'string') invalid('Jev returned an invalid choice answer.');
+    assertExactKeys(answer, ['type', 'choice', 'confidence', 'probabilities'], 'Jev returned an invalid choice answer.');
     if (!Object.hasOwn(criteria, answer.choice)) invalid(`Jev returned an unavailable choice: ${answer.choice}`);
     const probabilities = assertDistribution(answer.probabilities, labels, 'Jev returned an invalid choice distribution.');
     const confidence = assertUnit(answer.confidence, 'Jev returned invalid confidence.');
@@ -161,7 +166,7 @@ export class DecisionSession {
         alternatives: topAlternatives(probabilities),
       },
     };
-    await this.onDecision?.(result);
+    await this.notify(result);
     return result;
   }
 
@@ -170,12 +175,13 @@ export class DecisionSession {
     this.assertAnswerKeys(response.answers, ['verdict']);
     const answer: unknown = response.answers.verdict;
     if (!isRecord(answer) || answer.type !== 'noul') invalid('Jev returned an invalid noul answer.');
+    assertExactKeys(answer, ['type', 'noul'], 'Jev returned an invalid noul answer.');
     const value = assertUnit(answer.noul, 'Jev returned an invalid noul.');
     const result: ProbabilityDecisionResult = {
       type: 'probability', value,
       metadata: { model: response.model, usage: this.usage(response), probability: value },
     };
-    await this.onDecision?.(result);
+    await this.notify(result);
     return result;
   }
 
@@ -185,7 +191,13 @@ export class DecisionSession {
     this.assertAnswerKeys(response.answers, ['rating']);
     const answer: unknown = response.answers.rating;
     if (!isRecord(answer) || answer.type !== 'score') invalid('Jev returned an invalid score answer.');
+    assertExactKeys(answer, ['type', 'score', 'confidence', 'legend', 'probabilities'], 'Jev returned an invalid score answer.');
     const labels = levels.map((_, index) => String(index));
+    if (!isRecord(answer.legend)) invalid('Jev returned an invalid score legend.');
+    assertExactKeys(answer.legend, labels, 'Jev returned an invalid score legend.');
+    for (const [index, level] of levels.entries()) {
+      if (answer.legend[String(index)] !== level) invalid('Jev returned an invalid score legend.');
+    }
     const distribution = assertDistribution(answer.probabilities, labels, 'Jev returned an invalid score distribution.');
     const probabilities = labels.map(label => distribution[label]!);
     const expected = probabilities.reduce((sum, probability, index) => sum + probability * index, 0);
@@ -203,7 +215,7 @@ export class DecisionSession {
         alternatives: topAlternatives(distribution, key => levels[Number(key)]!),
       },
     };
-    await this.onDecision?.(result);
+    await this.notify(result);
     return result;
   }
 
@@ -222,46 +234,62 @@ export class DecisionSession {
       if (!isRecord(answer) || answer.type !== 'choice' || typeof answer.choice !== 'string' || !Object.hasOwn(criteria, answer.choice)) {
         invalid(`Jev returned an invalid or missing cell choice: ${key}`);
       }
+      assertExactKeys(answer, ['type', 'choice', 'confidence', 'probabilities'], `Jev returned an invalid or missing cell choice: ${key}`);
       const probabilities = assertDistribution(answer.probabilities, labels, `Jev returned an invalid character distribution: ${key}`,
         label => `Jev returned an invalid or missing character probability: ${key}.${label}`);
       assertUnit(answer.confidence, `Jev returned invalid confidence for: ${key}`);
-      let best = labels[0]!;
-      for (const label of labels) if (probabilities[label]! > probabilities[best]!) best = label;
-      if (probabilities[best]! <= 0) invalid(`Jev returned an invalid character distribution: ${key}`);
-      values[key] = { choice: best, score: probabilities[best]!, probabilities };
+      values[key] = { choice: answer.choice, score: probabilities[answer.choice]!, probabilities };
     }
     const result: ManyChoiceDecisionResult = {
       type: 'many-choice',
       value: values,
       metadata: { model: response.model, usage: this.usage(response), questions: questionKeys.length },
     };
-    await this.onDecision?.(result);
+    await this.notify(result);
     return result;
   }
 
   private async ask<Q extends Questions>(state: JsonObject, questions: Q): Promise<SystemOneResult<Q>> {
     const input = cloneState(state);
-    return this.resources.execute('decisions', async signal => {
+    const { provider, resources } = sessionInternals.get(this)!;
+    return resources.execute('decisions', async signal => {
       let response: SystemOneResult<Q>;
       try {
-        response = await this.provider.decide(input, questions, signal);
+        response = await provider.decide(input, questions, signal);
       } catch (error) {
-        if (signal.aborted) this.resources.throwIfAborted();
+        if (signal.aborted) resources.throwIfAborted();
         const detail = error instanceof Error ? error.message : String(error);
         throw new DecisionError(detail, { cause: error, evidence: { kind: 'provider-failure', detail } });
       }
-      this.resources.throwIfAborted();
+      resources.throwIfAborted();
       if (!isRecord(response) || typeof response.model !== 'string' || response.model.length === 0 || !isRecord(response.answers) || !isRecord(response.usage)) {
         invalid('Jev returned invalid response metadata.');
       }
+      assertExactKeys(response, ['model', 'answers', 'usage'], 'Jev returned invalid response metadata.');
+      assertExactKeys(response.usage, ['input_tokens', 'output_tokens'], 'Jev returned invalid usage metadata.');
       const inputTokens = response.usage.input_tokens;
       const outputTokens = response.usage.output_tokens;
       if (!Number.isSafeInteger(inputTokens) || inputTokens < 0 || !Number.isSafeInteger(outputTokens) || outputTokens < 0) {
         invalid('Jev returned invalid usage metadata.');
       }
-      this.resources.addUsage({ inputTokens, outputTokens });
+      resources.addUsage({ inputTokens, outputTokens });
       return response;
     });
+  }
+
+  private async notify(result: DecisionResult): Promise<void> {
+    const { onDecision, resources, eventTimeoutMs } = sessionInternals.get(this)!;
+    if (onDecision === undefined) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`Decision observer did not settle within ${eventTimeoutMs}ms.`)), eventTimeoutMs);
+    });
+    try {
+      const observed = (async (): Promise<void> => { await onDecision(result); })();
+      await resources.raceSignal(Promise.race([observed, timeout]));
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   private usage(response: { usage: { input_tokens: number; output_tokens: number } }): TokenUsage {
@@ -273,3 +301,21 @@ export class DecisionSession {
     if (keys.length !== expected.length || keys.some(key => !expected.includes(key))) invalid('Jev returned unexpected or missing answers.');
   }
 }
+
+export const createDecisionSession = (
+  provider: DecisionProvider,
+  resources: RunResources,
+  onDecision?: (result: DecisionResult) => void | Promise<void>,
+  eventTimeoutMs = DEFAULT_EVENT_TIMEOUT_MS,
+): DecisionSession => {
+  const session = Object.create(DecisionSession.prototype) as DecisionSession;
+  sessionInternals.set(session, { provider, resources, ...(onDecision === undefined ? {} : { onDecision }), eventTimeoutMs });
+  return session;
+};
+
+export const decisionSessionResources = (session: DecisionSession): RunResources => sessionInternals.get(session)!.resources;
+
+export const rebindDecisionSession = (session: DecisionSession, resources: RunResources): DecisionSession => {
+  const internals = sessionInternals.get(session)!;
+  return createDecisionSession(internals.provider, resources, internals.onDecision, internals.eventTimeoutMs);
+};

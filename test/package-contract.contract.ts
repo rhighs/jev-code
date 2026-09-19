@@ -17,6 +17,8 @@ const npmEnvironment = {
   npm_config_update_notifier: 'false',
 };
 
+// npm is intentional here: this is an npm consumer interoperability test, not a repository workflow.
+
 const run = async (file: string, args: readonly string[], cwd: string) => exec(file, [...args], {
   cwd,
   env: npmEnvironment,
@@ -37,6 +39,9 @@ test('packed ESM package satisfies the public consumer contract', { timeout: 180
   await mkdir(packed);
   await mkdir(consumer);
 
+  await mkdir(join(root, 'dist/providers'), { recursive: true });
+  await writeFile(join(root, 'dist/providers/stale.js'), 'export const stale = true;\n');
+  await writeFile(join(root, 'dist/propose.js'), 'export const stale = true;\n');
   await run('npm', ['pack', '--silent', '--pack-destination', packed], root);
   const archives = (await readdir(packed)).filter(file => file.endsWith('.tgz'));
   assert.equal(archives.length, 1, 'npm pack should produce one archive');
@@ -57,6 +62,12 @@ test('packed ESM package satisfies the public consumer contract', { timeout: 180
   assert.ok(entries.includes('package/dist/index.js'));
   assert.ok(entries.includes('package/dist/index.d.ts'));
   assert.ok(entries.includes('package/dist/cli.js'));
+  const removedPaths = [
+    'providers/', 'propose/', 'propose.js', 'action-map.js', 'action-map.d.ts', 'program-map.js', 'program-map.d.ts',
+  ];
+  for (const removed of removedPaths) {
+    assert.ok(!entries.some(entry => entry.startsWith(`package/dist/${removed}`)), `removed path shipped: ${removed}`);
+  }
 
   await writeFile(join(consumer, 'package.json'), JSON.stringify({ private: true, type: 'module' }, null, 2));
   for (const file of [
@@ -80,6 +91,15 @@ test('packed ESM package satisfies the public consumer contract', { timeout: 180
   const tsc = join(root, 'node_modules/.bin/tsc');
   await run(tsc, ['-p', 'tsconfig.nodenext.json'], consumer);
   await run(tsc, ['-p', 'tsconfig.bundler.json'], consumer);
+
+  const declarations = await import('node:fs/promises').then(fs => fs.readFile(join(consumer, 'node_modules/jev-code/dist/index.d.ts'), 'utf8'));
+  const sdkDeclarations = await import('node:fs/promises').then(fs => fs.readFile(join(consumer, 'node_modules/jev-code/dist/sdk/index.d.ts'), 'utf8'));
+  for (const removed of ['proposeTool', 'ProposalProvider', 'ProviderSpec', 'mapProgram', 'mapAction']) {
+    assert.doesNotMatch(declarations, new RegExp(`\\b${removed}\\b`), `removed symbol remains public: ${removed}`);
+  }
+  assert.doesNotMatch(declarations, /\bRunResources\b/, 'mutable RunResources remains public');
+  assert.doesNotMatch(declarations, /\bwithResources\b/, 'session resource rebinding remains public');
+  assert.match(sdkDeclarations, /ProgramResourceView/, 'read-only program resource view is missing');
 
   await assert.rejects(
     run(process.execPath, ['deep-import.mjs'], consumer),
@@ -105,5 +125,5 @@ test('packed ESM package satisfies the public consumer contract', { timeout: 180
   const router = await run(tsx, ['examples/router.ts'], root);
   assert.equal(router.stdout.trim(), 'account: priority 1');
   const tree = await run(tsx, ['examples/dependency-tree.ts'], root);
-  assert.equal(tree.stdout.trim(), 'coordinated deployment: migrate database -> roll out 3 replicas');
+  assert.equal(tree.stdout.trim(), '{"name":"Oak","children":[{"name":"Birch","children":[{"name":"Elm","children":[]},{"name":"Ash","children":[]}]},{"name":"Cedar","children":[{"name":"Pine","children":[]},{"name":"Oak","children":[]}]}]}');
 });

@@ -1,10 +1,10 @@
-import type { RunResources } from './resources.js';
+import type { ProgramResourceView } from './resources.js';
 
 export type ValidationResult = boolean | string | void;
 
 export interface ValidationContext {
   readonly signal: AbortSignal;
-  readonly resources: RunResources;
+  readonly resources: ProgramResourceView;
 }
 
 export type Validator<Value> = (value: Value, context: ValidationContext) => ValidationResult | Promise<ValidationResult>;

@@ -6,20 +6,24 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
-          cache: npm
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: npm ci
+      - run: pnpm install --frozen-lockfile
       - run: bash -n install.sh
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
+      - run: pnpm run typecheck
+      - run: pnpm test
+      - run: pnpm run build
   package-contract:
     runs-on: ubuntu-latest
     strategy:
@@ -27,9 +31,10 @@ jobs:
         node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-          cache: npm
-      - run: npm ci
-      - run: npm run test:package
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run test:package

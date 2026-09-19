@@ -1,7 +1,8 @@
 export { DecisionSession, type DecisionSessionOptions } from './decisions.js';
-export { RunResources, type RunLimits, type RunResourceOptions, type RunResourceSnapshot } from './resources.js';
+export { type ProgramResourceView, type RunLimits, type RunResourceOptions, type RunResourceSnapshot } from './resources.js';
 export {
-  Program,
+  Program as DecisionProgram,
+  fromInput,
   node,
   parallel,
   runProgram,
@@ -30,6 +31,7 @@ export {
   slot,
   treeProgram,
   type BranchProduction,
+  type ChildSlotFactory,
   type ChildSlots,
   type ChildValues,
   type CompleteProduction,
@@ -47,6 +49,7 @@ export {
   CancelledError,
   DecisionError,
   LimitError,
+  ResourceExhaustedError,
   type ChoiceDecisionResult,
   type DecisionAlternative,
   type DecisionFailureEvidence,

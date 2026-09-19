@@ -1,8 +1,13 @@
 ---
 title: "feat: Add Jev decision and tree SDK"
 type: feat
-status: active
+status: completed
 date: 2026-09-19
+topic: typed-decision-sdk
+artifact_contract: ce-unified-plan/v1
+artifact_readiness: implementation-ready
+product_contract_source: ce-brainstorm
+execution: code
 origin: docs/brainstorms/2026-09-19-typed-decision-program-sdk-requirements.md
 ---
 

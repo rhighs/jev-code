@@ -8,7 +8,7 @@ jev-code - typed routing, decision programs, and validated formal trees driven b
 
 ## SDK
 
-`jev-code` is first a Jev-only TypeScript library. Applications supply finite alternatives and keep ownership of effects; Jev selects among those alternatives. The public ESM API provides validated decision sessions, typed routers, immutable programs, and bounded formal-tree construction. The coding harness and CLI are built on the same contracts.
+`jev-code` is first a Jev-only TypeScript library. Applications supply finite alternatives and keep ownership of effects; Jev selects among those alternatives. The public ESM API provides validated decision sessions, typed routers, immutable `DecisionProgram` values, and bounded formal-tree construction. The coding harness and CLI are built on the same contracts.
 
 ```typescript
 import { DecisionSession, defineRouter, route } from 'jev-code';
@@ -265,7 +265,7 @@ git diff | jev-code decide --true "safe to commit" && git commit -am wip
 | `~/.config/jev-code/config.json` | The saved typesafe.ai API key. Mode 600. `XDG_CONFIG_HOME` and `JEV_CODE_CONFIG_DIR` change the directory. |
 | `.env` | Optional. `TYPESAFE_API_KEY=...` in the current directory. Loaded before the saved key. |
 | `.jev/runs/<run-id>.jsonl` | One journal per run: every event as one JSON line. Input for `replay`. |
-| `.jev/eval/` | Eval records and journals from `npm run dev -- eval`. |
+| `.jev/eval/` | Eval records and journals from `pnpm run dev -- eval`. |
 
 ## EXIT STATUS
 

@@ -92,6 +92,23 @@ test('Bash executes pipelines, records stderr and nonzero exits, and bounds outp
   assert.ok(flood.output.length < 200);
 });
 
+test('Bash subprocesses never receive current or legacy Jev credentials', async t => {
+  const { root, signal } = await setup(t);
+  const previousTypesafe = process.env.TYPESAFE_API_KEY;
+  const previousGeneration = process.env.JEV_GENERATION_API_KEY;
+  process.env.TYPESAFE_API_KEY = 'current-secret';
+  process.env.JEV_GENERATION_API_KEY = 'legacy-secret';
+  try {
+    const result = await runBash('test -z "${TYPESAFE_API_KEY:-}" && test -z "${JEV_GENERATION_API_KEY:-}"', root, 1000, signal);
+    assert.equal(result.ok, true, result.output);
+  } finally {
+    if (previousTypesafe === undefined) delete process.env.TYPESAFE_API_KEY;
+    else process.env.TYPESAFE_API_KEY = previousTypesafe;
+    if (previousGeneration === undefined) delete process.env.JEV_GENERATION_API_KEY;
+    else process.env.JEV_GENERATION_API_KEY = previousGeneration;
+  }
+});
+
 test('Bash timeout kills the process group, including TERM-resistant children', async t => {
   const { root, signal } = await setup(t);
   const start = Date.now();

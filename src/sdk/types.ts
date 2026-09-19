@@ -20,6 +20,10 @@ interface ErrorOptionsWithEvidence extends ErrorOptions {
   evidence?: DecisionFailureEvidence;
 }
 
+interface ResourceErrorOptions extends ErrorOptions {
+  evidence: Extract<DecisionFailureEvidence, { kind: 'exhausted' | 'deadline-exceeded' }>;
+}
+
 export class DecisionError extends Error {
   readonly evidence: DecisionFailureEvidence;
 
@@ -38,12 +42,22 @@ export class CancelledError extends DecisionError {
 
 /** Also used by the compatibility application for its non-SDK limits. */
 export class LimitError extends Error {
-  readonly evidence: DecisionFailureEvidence;
+  readonly evidence: DecisionFailureEvidence | undefined;
 
   constructor(message: string, options: ErrorOptionsWithEvidence = {}) {
     super(message, options);
     this.name = new.target.name;
-    this.evidence = options.evidence ?? { kind: 'exhausted', resource: 'decisions', limit: 0, used: 0 };
+    this.evidence = options.evidence;
+  }
+}
+
+/** A deadline or SDK resource budget exhausted by RunResources. */
+export class ResourceExhaustedError extends LimitError {
+  declare readonly evidence: ResourceErrorOptions['evidence'];
+
+  constructor(message: string, options: ResourceErrorOptions) {
+    super(message, options);
+    this.evidence = options.evidence;
   }
 }
 
@@ -127,6 +141,7 @@ export interface ProgramRunMetadata {
   readonly events: readonly ProgramEvent[];
   readonly droppedEvents: number;
   readonly resources: RunResourceSnapshotLike;
+  readonly observerFailure?: { readonly detail: string };
 }
 
 /** Kept structural here so the public outcome types do not introduce a runtime import cycle. */

@@ -20,7 +20,7 @@ async function fixture(t: test.TestContext) {
   const archive = join(root, 'source.tar.gz');
   await execute('tar', ['-czf', archive, '-C', join(root, 'archive'), 'jev-code-main']);
   await writeFile(join(tools, 'curl'), '#!/usr/bin/env bash\nset -eu\nwhile [ "$#" -gt 0 ]; do if [ "$1" = "-o" ]; then cp "$JEV_TEST_ARCHIVE" "$2"; exit; fi; shift; done\nexit 1\n', { mode: 0o755 });
-  await writeFile(join(tools, 'npm'), '#!/usr/bin/env bash\nset -eu\nif [ "${JEV_TEST_BUILD_FAIL:-}" = "1" ]; then exit 42; fi\nif [ "$1" = "run" ]; then mkdir -p dist; printf "console.log(JSON.stringify(process.argv.slice(2)));\\n" > dist/cli.js; fi\n', { mode: 0o755 });
+  await writeFile(join(tools, 'corepack'), '#!/usr/bin/env bash\nset -eu\nif [ "${JEV_TEST_BUILD_FAIL:-}" = "1" ]; then exit 42; fi\nif [ "$1" = "pnpm" ] && [ "$2" = "run" ]; then mkdir -p dist; printf "console.log(JSON.stringify(process.argv.slice(2)));\\n" > dist/cli.js; fi\n', { mode: 0o755 });
   const installRoot = join(root, 'app with spaces');
   const binRoot = join(root, 'bin with spaces');
   const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${tools}:${process.env.PATH}`, JEV_TEST_ARCHIVE: archive, JEV_INSTALL_DIR: installRoot, JEV_BIN_DIR: binRoot };
@@ -77,7 +77,7 @@ test('private Node bootstrap verifies, extracts and launches a working runtime',
   const runtime = join(f.root, 'node-fixture/bin');
   await mkdir(runtime, { recursive: true });
   await symlink(process.execPath, join(runtime, 'node'));
-  await writeFile(join(runtime, 'npm'), await readFile(join(f.tools, 'npm')), { mode: 0o755 });
+  await writeFile(join(runtime, 'corepack'), await readFile(join(f.tools, 'corepack')), { mode: 0o755 });
   const archive = join(f.root, 'node.tar.gz');
   await execute('tar', ['-czf', archive, '-C', f.root, 'node-fixture']);
   const hash = createHash('sha256').update(await readFile(archive)).digest('hex');

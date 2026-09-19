@@ -31,7 +31,8 @@ const rate = (fn: (input: string) => Record<string, number>): Answer => (state, 
   if (q.type !== 'score') throw new Error(`unexpected ${q.type}`);
   const probabilities = fn(String(state.input));
   const score = Object.entries(probabilities).sort((a, b) => b[1] - a[1])[0]![0];
-  return { type: 'score', score: Number(score), confidence: 0.8, legend: {}, probabilities };
+  return { type: 'score', score: Number(score), confidence: 0.8,
+    legend: Object.fromEntries(q.criteria.map((description, index) => [String(index), description])), probabilities };
 };
 const spec = async (t: test.TestContext, entries: unknown): Promise<string> => {
   const dir = await mkdtemp(join(tmpdir(), 'jev-decide-'));
@@ -178,7 +179,7 @@ test('cli decide without TYPESAFE_API_KEY exits 125 with a message', async t => 
   env.JEV_CODE_CONFIG_DIR = await mkdtemp(join(tmpdir(), 'jev-cfg-'));
   const cwd = await mkdtemp(join(tmpdir(), 'jev-decide-'));
   t.after(async () => { await rm(cwd, { recursive: true, force: true }); await rm(env.JEV_CODE_CONFIG_DIR!, { recursive: true, force: true }); });
-  await assert.rejects(run('npx', ['tsx', resolve('src/cli.ts'), 'decide', 'Is this an error?', '--choices', 'yes,no'], { cwd, env, timeout: 60_000 }),
+  await assert.rejects(run(resolve('node_modules/.bin/tsx'), [resolve('src/cli.ts'), 'decide', 'Is this an error?', '--choices', 'yes,no'], { cwd, env, timeout: 60_000 }),
     (err: Error & { code?: unknown; stderr?: string }) => err.code === 125 && /jev-code login.*TYPESAFE_API_KEY/.test(err.stderr ?? ''));
 });
 

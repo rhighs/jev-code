@@ -6,9 +6,9 @@ import {
   type DecisionProvider,
 } from 'jev-code';
 
-interface DeploymentPlan {
+interface FamilyTree {
   readonly name: string;
-  readonly steps: readonly string[];
+  readonly children: readonly FamilyTree[];
 }
 
 const choose = (...selections: string[]): DecisionProvider => {
@@ -33,41 +33,29 @@ const choose = (...selections: string[]): DecisionProvider => {
   };
 };
 
-const database = slot<{ replicas: number }, string>({
-  id: 'database',
-  description: 'Database deployment mode',
+const names = ['Oak', 'Birch', 'Cedar', 'Elm', 'Ash', 'Pine'];
+const family = (index: number, generation: number): ReturnType<typeof slot<{ generations: number }, FamilyTree>> => slot({
+  id: `person-${index}-${generation}`,
+  description: `Family member in generation ${generation}`,
   productions: [
-    complete('migrate', 'Apply migrations before starting the service', () => 'migrate database'),
-    complete('verify', 'Verify the existing schema without changing it', () => 'verify schema'),
+    complete('leaf', 'Record this person without descendants', () => ({ name: names[index % names.length]!, children: [] })),
+    branch('descendants', 'Add two descendants', ({ input }) => ({
+      first: family(index * 2 + 1, generation + 1),
+      second: family(index * 2 + 2, generation + 1),
+    }), children => ({ name: names[index % names.length]!, children: [children.first, children.second] }),
+    input => generation < input.generations),
   ],
+  validate: person => person.name.length > 0 && (person.children.length === 0 || person.children.length === 2)
+    || 'Every family member must have a name and either zero or two children.',
 });
 
-const service = slot<{ replicas: number }, string>({
-  id: 'service',
-  description: 'Service rollout mode',
-  productions: [
-    complete('rolling', 'Replace instances gradually', ({ input }) => `roll out ${input.replicas} replicas`),
-    complete('replace', 'Replace all instances together', ({ input }) => `replace ${input.replicas} replicas`),
-  ],
-});
-
-const deployment = slot<{ replicas: number }, DeploymentPlan>({
-  id: 'deployment',
-  description: 'Validated deployment plan',
-  productions: [
-    branch('coordinated', 'Coordinate database and service work', { database, service }, children => ({
-      name: 'coordinated deployment',
-      steps: [children.database, children.service],
-    })),
-  ],
-  validate: plan => plan.steps.length === 2 || 'A deployment needs database and service steps.',
-});
-
-const outcome = await runTree(deployment, { replicas: 3 }, {
-  provider: choose('migrate', 'rolling'),
+const outcome = await runTree(family(0, 0), { generations: 2 }, {
+  provider: choose('descendants'),
   concurrency: 2,
-  limits: { decisions: 2, nodes: 16 },
+  maxDepth: 3,
+  limits: { decisions: 3, nodes: 64 },
+  validate: tree => tree.children.length === 2 || 'The root must include descendants.',
 });
 
 if (outcome.status !== 'completed') throw new Error(`Tree did not complete: ${outcome.status}`);
-console.log(`${outcome.value.name}: ${outcome.value.steps.join(' -> ')}`);
+console.log(JSON.stringify(outcome.value));

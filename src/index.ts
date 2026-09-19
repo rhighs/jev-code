@@ -9,7 +9,7 @@ export { formatDuration } from './timing.js';
 export { runEval, loadTasks, compareRecords, formatComparison, type EvalRecord, type EvalTask, type CheckResult } from './eval.js';
 export { runDecide, type DecideResult, type SpecEntry } from './decide.js';
 export { javascriptAstAdapter, typescriptAstAdapter } from './lang/javascript.js';
-export { adapterFor, generateProgram, type Dialect, type Expr, type Stmt, type Program as LanguageProgram, type ValueType } from './lang/core.js';
+export { adapterFor, generateProgram, type Dialect, type Expr, type Stmt, type Program, type Program as LanguageProgram, type ValueType } from './lang/core.js';
 export { generateBashAst, renderBashAst, validateBashSource, type BashAst } from './bash-ast.js';
 export type { CharacterSymbol, GridCursor, GridProgress, ScoredCell, TextChange, TextProgress } from './grid.js';
 export type { Field, HarnessEvent, RunResult, RunStatus, Tool, ToolContext, ToolResult } from './types.js';

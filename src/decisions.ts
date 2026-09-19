@@ -1,4 +1,5 @@
-import { DecisionSession, RunResources } from './sdk/index.js';
+import { DecisionSession, createDecisionSession } from './sdk/decisions.js';
+import { RunResources } from './sdk/resources.js';
 import { DecisionError, LimitError, type DecisionProvider, type DecisionResult, type JsonObject } from './sdk/types.js';
 import type { DecisionEventData } from './types.js';
 
@@ -54,7 +55,7 @@ export class Decisions {
     resources?: RunResources,
   ) {
     this.resources = resources ?? new RunResources({ limits: { decisions: maxRequests }, signal, concurrency });
-    this.session = new DecisionSession(provider, { resources: this.resources });
+    this.session = createDecisionSession(provider, this.resources);
     this.signal = this.resources.signal;
   }
 
@@ -67,28 +68,32 @@ export class Decisions {
   }
 
   /** Public SDK session sharing this facade's budget, cancellation, usage, and event observer. */
-  publicSession(state: State): DecisionSession {
+  publicSession(state: State | (() => State)): DecisionSession {
     return this.observed(state);
   }
 
   assertRequestBudget(count: number): void {
     try { this.resources.assertAvailable('decisions', count); }
     catch (error) {
-      if (error instanceof LimitError) throw new LimitError(`Request budget exhausted (${this.maxRequests}).`, { cause: error, evidence: error.evidence });
+      if (error instanceof LimitError) throw new LimitError(`Request budget exhausted (${this.maxRequests}).`, {
+        cause: error,
+        ...(error.evidence === undefined ? {} : { evidence: error.evidence }),
+      });
       throw error;
     }
   }
 
-  private observed(state: State): DecisionSession {
+  private observed(state: State | (() => State)): DecisionSession {
     return this.session.observe(async (result: DecisionResult) => {
+      const currentState = typeof state === 'function' ? state() : state;
       if (result.type === 'choice') {
         await this.onDecision({ choice: result.value, confidence: result.metadata.confidence, model: result.metadata.model,
-          options: [...result.metadata.alternatives], ...identity(state) });
+          options: [...result.metadata.alternatives], ...identity(currentState) });
       } else if (result.type === 'probability') {
-        await this.onDecision({ probability: result.value, model: result.metadata.model, ...identity(state) });
+        await this.onDecision({ probability: result.value, model: result.metadata.model, ...identity(currentState) });
       } else if (result.type === 'score') {
         await this.onDecision({ choice: String(Math.round(result.value.expected)), confidence: result.metadata.confidence,
-          model: result.metadata.model, options: [...result.metadata.alternatives], ...identity(state) });
+          model: result.metadata.model, options: [...result.metadata.alternatives], ...identity(currentState) });
       } else {
         await this.onDecision({ questions: result.metadata.questions, model: result.metadata.model });
       }

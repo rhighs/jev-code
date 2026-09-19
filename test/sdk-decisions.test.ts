@@ -5,10 +5,11 @@ import {
   CancelledError,
   DecisionError,
   DecisionSession,
-  LimitError,
-  RunResources,
+  ResourceExhaustedError,
   type DecisionProvider,
 } from '../src/sdk/index.js';
+import { createDecisionSession } from '../src/sdk/decisions.js';
+import { RunResources } from '../src/sdk/resources.js';
 
 const responseProvider = (answer: unknown): DecisionProvider => ({
   decide: async <Q extends Questions>(_state: EntryType, questions: Q) => ({
@@ -20,16 +21,16 @@ const responseProvider = (answer: unknown): DecisionProvider => ({
 
 test('public decisions return typed metadata for choice, probability, and score', async () => {
   const resources = new RunResources({ limits: { decisions: 3 } });
-  const choice = await new DecisionSession(responseProvider({
+  const choice = await createDecisionSession(responseProvider({
     type: 'choice', choice: 'technical', confidence: 0.8,
     probabilities: { billing: 0.2, technical: 0.8 },
-  }), { resources }).choose({}, 'Route this ticket.', { billing: 'Billing', technical: 'Technical' });
-  const probability = await new DecisionSession(responseProvider({ type: 'noul', noul: 0.7 }), { resources })
+  }), resources).choose({}, 'Route this ticket.', { billing: 'Billing', technical: 'Technical' });
+  const probability = await createDecisionSession(responseProvider({ type: 'noul', noul: 0.7 }), resources)
     .probability({}, 'Is this urgent?');
-  const score = await new DecisionSession(responseProvider({
-    type: 'score', score: 1.75, confidence: 0.9, legend: {},
+  const score = await createDecisionSession(responseProvider({
+    type: 'score', score: 1.75, confidence: 0.9, legend: { '0': 'low', '1': 'medium', '2': 'high' },
     probabilities: { '0': 0, '1': 0.25, '2': 0.75 },
-  }), { resources }).score({}, 'Rate urgency.', ['low', 'medium', 'high']);
+  }), resources).score({}, 'Rate urgency.', ['low', 'medium', 'high']);
 
   assert.equal(choice.value, 'technical');
   assert.equal(choice.metadata.probability, 0.8);
@@ -64,6 +65,45 @@ test('choice rejects missing, extra, non-finite, and non-normalized probabilitie
   }
 });
 
+test('chooseMany preserves Jev selected labels when they differ from probability argmax', async () => {
+  const result = await new DecisionSession(responseProvider({
+    type: 'choice', choice: 'b', confidence: 0.4, probabilities: { a: 0.6, b: 0.4 },
+  })).chooseMany({}, { cell: 'pick' }, { a: 'A', b: 'B' });
+
+  assert.deepEqual(result.value.cell, {
+    choice: 'b',
+    score: 0.4,
+    probabilities: { a: 0.6, b: 0.4 },
+  });
+});
+
+test('response envelopes, usage, and every answer variant reject extra keys', async () => {
+  const withExtra = (answer: unknown, location: 'response' | 'usage' | 'answer'): DecisionProvider => ({
+    decide: async <Q extends Questions>(_state: EntryType, questions: Q) => ({
+      model: 'strict',
+      usage: { input_tokens: 1, output_tokens: 1, ...(location === 'usage' ? { cached: 1 } : {}) },
+      answers: Object.fromEntries(Object.keys(questions).map(key => [key,
+        location === 'answer' ? { ...(answer as Record<string, unknown>), explanation: 'not allowed' } : answer])),
+      ...(location === 'response' ? { request_id: 'secret-metadata' } : {}),
+    }) as unknown as SystemOneResult<Q>,
+  });
+  const choiceAnswer = { type: 'choice', choice: 'a', confidence: 1, probabilities: { a: 1, b: 0 } };
+  const scoreAnswer = { type: 'score', score: 1, confidence: 1, legend: { '0': 'low', '1': 'high' }, probabilities: { '0': 0, '1': 1 } };
+
+  const calls = [
+    new DecisionSession(withExtra(choiceAnswer, 'response')).choose({}, 'pick', { a: 'A', b: 'B' }),
+    new DecisionSession(withExtra(choiceAnswer, 'usage')).choose({}, 'pick', { a: 'A', b: 'B' }),
+    new DecisionSession(withExtra(choiceAnswer, 'answer')).choose({}, 'pick', { a: 'A', b: 'B' }),
+    new DecisionSession(withExtra({ type: 'noul', noul: 1 }, 'answer')).probability({}, 'ready?'),
+    new DecisionSession(withExtra(scoreAnswer, 'answer')).score({}, 'rate', ['low', 'high']),
+    new DecisionSession(withExtra(choiceAnswer, 'answer')).chooseMany({}, { cell: 'pick' }, { a: 'A', b: 'B' }),
+  ];
+  for (const call of calls) {
+    await assert.rejects(call, (error: unknown) =>
+      error instanceof DecisionError && error.evidence.kind === 'invalid-response');
+  }
+});
+
 test('forks share the decision budget and do not issue an eleventh call', async () => {
   let calls = 0;
   const provider: DecisionProvider = {
@@ -85,7 +125,7 @@ test('forks share the decision budget and do not issue an eleventh call', async 
   assert.equal(calls, 10);
   assert.equal(outcomes.filter(result => result.status === 'fulfilled').length, 10);
   const rejected = outcomes.find(result => result.status === 'rejected');
-  assert.ok(rejected?.status === 'rejected' && rejected.reason instanceof LimitError);
+  assert.ok(rejected?.status === 'rejected' && rejected.reason instanceof ResourceExhaustedError);
   assert.equal(rejected.reason.evidence.kind, 'exhausted');
   assert.equal(rejected.reason.evidence.resource, 'decisions');
 });
@@ -96,7 +136,7 @@ test('run resource dimensions are shared across forks', () => {
   child.reserve('nodes');
   assert.deepEqual(root.snapshot().used, { decisions: 0, nodes: 1 });
   assert.throws(() => root.reserve('nodes'), (error: unknown) =>
-    error instanceof LimitError && error.evidence.kind === 'exhausted' && error.evidence.resource === 'nodes');
+    error instanceof ResourceExhaustedError && error.evidence.kind === 'exhausted' && error.evidence.resource === 'nodes');
 });
 
 test('decision projections reject values that JSON serialization would silently alter', async () => {
@@ -152,6 +192,87 @@ test('provider failure, caller cancellation, and deadline expiry retain distinct
 
   await assert.rejects(
     new DecisionSession(hanging, { timeoutMs: 10 }).probability({}, 'ready?'),
-    (error: unknown) => error instanceof LimitError && error.evidence.kind === 'deadline-exceeded',
+    (error: unknown) => error instanceof ResourceExhaustedError && error.evidence.kind === 'deadline-exceeded',
+  );
+});
+
+test('cancellation and deadlines settle when a provider ignores AbortSignal', async () => {
+  const ignoring: DecisionProvider = { decide: async () => new Promise(() => {}) };
+  const caller = new AbortController();
+  const cancelled = new DecisionSession(ignoring, { signal: caller.signal }).probability({}, 'ready?');
+  await new Promise(resolve => setImmediate(resolve));
+  caller.abort(new Error('stop ignored provider'));
+  await assert.rejects(cancelled, (error: unknown) => error instanceof CancelledError);
+
+  await assert.rejects(
+    new DecisionSession(ignoring, { timeoutMs: 10 }).probability({}, 'ready?'),
+    (error: unknown) => error instanceof ResourceExhaustedError && error.evidence.kind === 'deadline-exceeded',
+  );
+});
+
+test('cancelled provider work keeps its permit until the ignored operation settles', async () => {
+  type Response = SystemOneResult<Questions>;
+  const pending: Array<{ resolve: (response: Response) => void; reject: (error: Error) => void }> = [];
+  let calls = 0;
+  const provider: DecisionProvider = {
+    decide: async (_state, questions) => {
+      calls++;
+      return new Promise((resolve, reject) => pending.push({
+        resolve: response => resolve(response as never), reject,
+      })) as never;
+    },
+  };
+  const answer = (questions: Questions): Response => ({
+    model: 'gate-test', usage: { input_tokens: 0, output_tokens: 0 },
+    answers: Object.fromEntries(Object.keys(questions).map(key => [key, { type: 'noul', noul: 1 }])),
+  }) as Response;
+  const resources = new RunResources({ concurrency: 1 });
+  const controller = new AbortController();
+  const cancelledSession = createDecisionSession(provider, resources.fork(controller.signal));
+  const sharedSession = createDecisionSession(provider, resources);
+
+  const cancelled = cancelledSession.probability({}, 'first');
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort(new Error('caller left'));
+  await assert.rejects(cancelled, (error: unknown) => error instanceof CancelledError);
+
+  const queued = sharedSession.probability({}, 'second');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 1);
+  assert.equal(resources.snapshot().inflight, 1);
+
+  pending[0]!.reject(new Error('late provider rejection'));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 2);
+  pending[1]!.resolve(answer({ verdict: {} as never }));
+  assert.equal((await queued).value, 1);
+  assert.equal(resources.snapshot().inflight, 0);
+});
+
+test('decision observers reject, time out, and yield promptly to cancellation or deadline', async () => {
+  const provider = responseProvider({ type: 'noul', noul: 1 });
+  await assert.rejects(
+    new DecisionSession(provider, { onDecision: () => { throw new Error('observer offline'); } }).probability({}, 'ready?'),
+    /observer offline/,
+  );
+  await assert.rejects(
+    new DecisionSession(provider, { eventTimeoutMs: 10, onDecision: () => new Promise(() => {}) }).probability({}, 'ready?'),
+    /observer did not settle/i,
+  );
+
+  const controller = new AbortController();
+  const cancelled = new DecisionSession(provider, {
+    signal: controller.signal,
+    eventTimeoutMs: 10_000,
+    onDecision: () => new Promise(() => {}),
+  }).probability({}, 'ready?');
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort(new Error('stop observer'));
+  await assert.rejects(cancelled, (error: unknown) => error instanceof CancelledError);
+
+  await assert.rejects(
+    new DecisionSession(provider, { timeoutMs: 10, eventTimeoutMs: 10_000, onDecision: () => new Promise(() => {}) })
+      .probability({}, 'ready?'),
+    (error: unknown) => error instanceof ResourceExhaustedError && error.evidence.kind === 'deadline-exceeded',
   );
 });
