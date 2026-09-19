@@ -72,35 +72,6 @@ test('edit card holds a hunk with one removed and one added line (AE1)', () => {
   assert.deepEqual(state.files, ['main.py']);
 });
 
-test('propose cards show a diff for files and output for text, and a file proposal counts as a written file', () => {
-  const head = 'provider=fake model=tiny\nA valid 20 bytes\nB invalid: syntax\nC valid 20 bytes\nselected C 0.81';
-  const file = { kind: 'file', path: 'x.py', objective: 'f returns 2', constraints: '', count: 3 };
-  const hunk = [{ kind: 'remove', text: '  return 1' }, { kind: 'add', text: '  return 2' }];
-  const state = run([
-    start(), ev('turn', { files: 1, plan: '' }), ev('action', { tool: 'propose' }),
-    ev('decision', { model: 'm', choice: 'C', confidence: 0.81, options: [{ label: 'C', probability: 0.81 }], field: 'candidate', phase: 'propose', slot: 'select' }),
-    ev('tool_start', { tool: 'propose', args: file }),
-    ev('tool_end', record('propose', file, true, head, { provider: 'fake', model: 'tiny', kind: 'file', path: 'x.py', selected: 'C', confidence: 0.81, hunk })),
-  ]);
-  const card = tools(state)[0]!;
-  assert.equal(card.target, 'x.py');
-  assert.equal(card.requests, 1);
-  assert.deepEqual(card.body, { kind: 'diff', path: 'x.py', hunk });
-  assert.deepEqual(state.files, ['x.py']);
-  const text = { kind: 'text', path: '', objective: 'name it', constraints: '', count: 3 };
-  const textState = run([
-    start(), ev('action', { tool: 'propose' }), ev('tool_start', { tool: 'propose', args: text }),
-    ev('tool_end', record('propose', text, true, `${head}\n\nhello`, { provider: 'fake', model: 'tiny', kind: 'text', selected: 'C', confidence: 0.81 })),
-  ]);
-  const textCard = tools(textState)[0]!;
-  assert.equal(textCard.target, 'text');
-  assert.equal(textCard.body?.kind, 'output');
-  assert.deepEqual(textState.files, []);
-  const rejected = run([start(), ev('action', { tool: 'propose' }), ev('tool_end', record('propose', file, false, `${head.split('\n').slice(0, -1).join('\n')}\nrejected all`))]);
-  assert.equal(tools(rejected)[0]!.body?.kind, 'output');
-  assert.deepEqual(rejected.files, []);
-});
-
 test('a close decision is marked low confidence and the ring keeps its options (AE2)', () => {
   const state = run([
     start(), ev('turn', { files: 0, plan: '' }), ev('action', { tool: 'write_file' }),

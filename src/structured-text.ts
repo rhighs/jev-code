@@ -13,7 +13,7 @@ export async function generateStructuredText(decisions: Decisions, state: State,
   const spans = raw.match(/[\p{L}\p{N}_./-]+(?:\s+[\p{L}\p{N}_./-]+){0,3}/gu) ?? [];
   const atoms = raw.match(/[\p{L}\p{N}_./-]+/gu) ?? [];
   const domain = field === 'path' || field === 'cwd' ? ['main.py', 'main.ts', 'main.js', 'main.txt', 'README.md', './', 'src/', 'test/', '.py', '.ts', '.js', '.mjs', '.txt', '.json', '.md', '/', '.', '_', '-']
-    : field === 'command' ? ['python3 ', 'node ', 'npm test', 'npm run build', 'npm run typecheck', 'pytest', 'python3 -m py_compile ', 'printf ', 'cat ', 'test ', ' && ', ' | ', "'", '"', '$(cat ', ')', ' = ', 'wc -c < ', './'] : [];
+    : field === 'command' ? ['python3 ', 'node ', 'pnpm test', 'pnpm run build', 'pnpm run typecheck', 'pytest', 'python3 -m py_compile ', 'printf ', 'cat ', 'test ', ' && ', ' | ', "'", '"', '$(cat ', ')', ' = ', 'wc -c < ', './'] : [];
   const values = [...new Set([...domain, ...quoted, ...spans, ...atoms].filter(value => value && !value.includes('\0')))].slice(0, 145);
   // Scalar tokens permit values absent from the objective without allocating an output grid.
   for (let code = 32; code <= 126; code++) if (!values.includes(String.fromCharCode(code))) values.push(String.fromCharCode(code));

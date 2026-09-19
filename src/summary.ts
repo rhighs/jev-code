@@ -14,10 +14,6 @@ export function summaryFacts(records: ToolRecord[]): string[] {
       case 'list_files': facts.add(`Listed ${String(record.args.path)}.`); break;
       case 'set_plan': break;
       case 'bash': facts.add(`Bash exited with code ${String(record.result.data?.exitCode ?? 'unknown')}.`); break;
-      case 'propose':
-        if (record.args.kind === 'text') facts.add(record.result.output.slice(record.result.output.indexOf('\n\n') + 2, 2000).trimEnd());
-        else facts.add(`Wrote ${String(record.args.path)} from proposal ${String(record.result.data?.selected)}.`);
-        break;
       default: facts.add(`Ran ${record.tool}: ${record.result.output.slice(0, 200)}`);
     }
   }

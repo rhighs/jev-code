@@ -4,9 +4,30 @@
 
 ## NAME
 
-jev-code - coding agent and decision pipe driven by Jev, the decision-only model from [typesafe.ai](https://typesafe.ai)
+jev-code - typed routing, decision programs, and validated formal trees driven by Jev, the decision-only model from [typesafe.ai](https://typesafe.ai)
 
-## SYNOPSIS
+## SDK
+
+`jev-code` is first a Jev-only TypeScript library. Applications supply finite alternatives and keep ownership of effects; Jev selects among those alternatives. The public ESM API provides validated decision sessions, typed routers, immutable `DecisionProgram` values, and bounded formal-tree construction. The coding harness and CLI are built on the same contracts.
+
+```typescript
+import { DecisionSession, defineRouter, route } from 'jev-code';
+
+const router = defineRouter({
+  inspect: route('Read state without changing it', { effect: 'read' } as const),
+  modify: route('Change application state', { effect: 'write' } as const),
+});
+
+const selected = await router.select(
+  new DecisionSession(provider),
+  { request: 'Show the current status' },
+  'Choose the application route.',
+);
+```
+
+See [the SDK guide](docs/sdk.md) and the executable [router](examples/router.ts) and [dependency-tree](examples/dependency-tree.ts) examples. Import from the package root; implementation paths are intentionally private.
+
+## CLI SYNOPSIS
 
 ```
 jev-code [options] ["task"]
@@ -17,7 +38,6 @@ jev-code decide --score "criteria" [--lines]
 jev-code decide --spec file.json
 jev-code replay run-id [--speed x] [--plain]
 jev-code login | logout
-jev-code provider login [id] | logout [id] | list [--json] | models [id] [--json] | use [id|none] [--model id] [--base-url url]
 jev-code ast install module | ast list | ast remove id
 ```
 
@@ -52,8 +72,6 @@ The interactive session is a transcript of cards. Each tool call is one card: a 
 
 `decide` uses the same model on standard input. A shell script can branch on the exit code without parsing.
 
-jev-code is a hybrid. Jev is the only policy. With a generation provider configured, `write_file` and Python `write_files` ask the LLM to map a source task into meaningful subproblems and compatible code options. Jev approves the map, chooses implementations, and reviews the assembled program. Language validators check it before writing; the harness then runs applicable verification. The LLM proposes structure and code but cannot approve a plan, choose tools, write files, or end a run. `propose` remains available for explanations and other file formats. See PROVIDERS.
-
 ## FIRST RUN
 
 The first interactive run asks for your typesafe.ai API key. jev-code saves the key in `~/.config/jev-code/config.json` with mode 600.
@@ -76,11 +94,6 @@ jev-code
 | `jev-code replay <run-id>` | Render a saved journal through the same transcript. |
 | `jev-code login` | Enter the API key and save it. |
 | `jev-code logout` | Remove the saved API key. |
-| `jev-code provider login [id]` | Configure the generation provider: provider, authentication, model. Without `id` a picker opens. |
-| `jev-code provider logout [id]` | Remove the stored credential of a provider. |
-| `jev-code provider list [--json]` | List the providers, their authentication methods, the active one, and which are signed in. |
-| `jev-code provider models [id] [--json]` | List the bundled and discovered models of a provider. |
-| `jev-code provider use [id\|none] [--model <id>] [--base-url <url>]` | Select the active provider. Without `id` a picker opens; missing model or base URL are asked for on a terminal. Flags skip the prompts. `none` turns mapping and `propose` off. |
 | `jev-code ast install <module>` | Install an AST adapter module from a local path or an npm package. |
 | `jev-code ast list` | List the installed AST adapters. |
 | `jev-code ast remove <id>` | Remove an installed AST adapter. |
@@ -123,81 +136,6 @@ Every language below is built in. jev-code selects the grammar from the file ext
 | Other | any | Install an adapter module. Files without an adapter use bounded text choices. | adapter |
 
 A validator must be on `PATH` before Jev writes a file in that language. A missing validator stops the write with a message that names the tool. Each rendered program of the shared core is checked by its real toolchain: a fuzz suite in `test/lang-fuzz.test.ts` drives every dialect with random productions and compiles the result.
-
-## PROVIDERS
-
-Program mapping and `propose` use the same generation provider. The first interactive run asks whether to configure one. `Not now` records the choice and does not ask again. `jev-code provider login` opens the same setup at any time:
-
-```text
-Select generation provider:
-> OpenAI
-  Anthropic
-  Google
-  OpenRouter
-  OpenAI-compatible
-  Local
-
-Authentication:
-> Sign in with OAuth (vendor terms apply)
-  Use API key
-
-Model:
-> gpt-5-nano
-  gpt-5-mini
-  gpt-4.1-nano
-```
-
-| Provider | Authentication | Wire | Models |
-| --- | --- | --- | --- |
-| `openai` | OAuth (browser, port 1455) or API key | Chat completions with a key; Responses on the ChatGPT backend with OAuth | `gpt-5-nano`, `gpt-5-mini`, `gpt-4.1-nano`, live list with a key |
-| `anthropic` | OAuth (paste the code) or API key | Messages | `claude-haiku-4-5`, `claude-3-5-haiku` |
-| `google` | API key | OpenAI-compatible endpoint | `gemini-2.5-flash-lite`, `gemini-2.5-flash`, live list |
-| `openrouter` | OAuth (browser) or API key | Chat completions | small models from several vendors, live list |
-| `openai-compatible` | API key | Chat completions at the base URL you enter | live list |
-| `local` | none | Chat completions at `http://localhost:11434/v1` | live list from the server |
-
-Use small, cheap, fast models. The generator only writes candidates; Jev does the judging. API keys are the supported path. OAuth with a consumer subscription is a convenience the vendor can withdraw; jev-code shows that in the picker label. Google OAuth is not implemented.
-
-For a source file with a registered language adapter, `write_file` uses a program map: at most eight steps, each with one to three code options explained in task terms. For Fibonacci, the decisions concern the starting pair, advancing the sequence, and printing the requested count—not choosing AST nodes. Jev can reject the map or any piece, triggering a bounded remap. Each piece is at most 2 KB, and every candidate combination considered by Jev passes the language adapter's source check. Without a provider, the existing grammar builders remain available. `write_files` uses maps with a destination path per step and validates the assembled Python project, including local imports. Existing single-file rewrites load the destination source (up to 16 KB) and preserve behavior unrelated to the requested change.
-
-If tool calls repeat without progress, the same provider proposes concrete next actions with paths or commands. Jev selects or rejects them; ordinary permissions still apply. Recovery cannot supply source contents directly and shares the proposal budget.
-
-
-The Python prompt “a simple python fibonaci program writing the first 10” completed in a live run on September 19, 2026: 3 turns, 13 Jev requests, about 20 seconds, and output `0 1 1 2 3 5 8 13 21 34`. This is a smoke test, not a general benchmark.
-
-How one `propose` call runs:
-
-1. Jev fills the request: `kind` (`file` or `text`), `objective`, `constraints`, `count` (1 to 5), `path`.
-2. The provider returns `count` candidates. One refresh of an expired OAuth token covers the whole batch.
-3. Validators drop candidates that are truncated, empty, too large, unchanged, duplicates of an earlier candidate, a JSON wrapper around the content, or fail the language validator of the file type.
-4. Jev selects one label or `reject`. The selection is one decision with `field=candidate`.
-5. A `file` candidate is written atomically. A `text` candidate is returned as the output.
-
-A run recorded against an OpenAI-compatible gateway (`gpt-5.5` behind LiteLLM) with a scripted Jev stand-in:
-
-```text
-✓ propose haiku.py · 6.0 s · 61 req
-  │ +print("Moon pulls the tide in")
-  │ +print("Salt wind combs the sleeping waves")
-  │ +print("Dawn shells gleam softly")
-── turn 2 · 1 file
-  │ Moon pulls the tide in
-  │ Salt wind combs the sleeping waves
-  │ Dawn shells gleam softly
-✓ bash 'python3' 'haiku.py' · exit 0 · 18 ms · 5 req
-```
-
-The journal record of that call:
-
-```json
-{"provider":"openai-compatible","model":"gpt-5.5",
- "candidates":[{"label":"A","valid":true,"bytes":109},
-               {"label":"B","valid":true,"bytes":109},
-               {"label":"C","valid":true,"bytes":112}],
- "selected":"A","confidence":0.81}
-```
-
-One failed request drops only its own candidate; the others still reach Jev. Limits: `--max-proposals <n>` caps generator calls per run (default 20). Each generator request times out after 60 s. `propose` counts as a write for `--confirm-writes`; the approval covers the request, and the content is shown in the diff card after the write. The current file and the objective are sent to the configured provider.
 
 ## DECIDE
 
@@ -324,11 +262,10 @@ git diff | jev-code decide --true "safe to commit" && git commit -am wip
 
 | Path | Content |
 | --- | --- |
-| `~/.config/jev-code/config.json` | The saved typesafe.ai API key and the `generation` settings (provider, model, auth, base URL). Mode 600. `XDG_CONFIG_HOME` and `JEV_CODE_CONFIG_DIR` change the directory. |
-| `~/.config/jev-code/credentials.json` | Generation provider secrets: API keys, OAuth access and refresh tokens, keyed by provider id. Mode 600. Never copied into events, journals, or child processes. |
-| `.env` | Optional. `TYPESAFE_API_KEY=...` in the current directory. Loaded before the saved key. `JEV_GENERATION_API_KEY=...` overrides the stored generation credential. |
+| `~/.config/jev-code/config.json` | The saved typesafe.ai API key. Mode 600. `XDG_CONFIG_HOME` and `JEV_CODE_CONFIG_DIR` change the directory. |
+| `.env` | Optional. `TYPESAFE_API_KEY=...` in the current directory. Loaded before the saved key. |
 | `.jev/runs/<run-id>.jsonl` | One journal per run: every event as one JSON line. Input for `replay`. |
-| `.jev/eval/` | Eval records and journals from `npm run dev -- eval`. |
+| `.jev/eval/` | Eval records and journals from `pnpm run dev -- eval`. |
 
 ## EXIT STATUS
 
@@ -346,4 +283,6 @@ Jev has a 32k context and selects from bounded lists. Small programs complete. L
 
 ## SEE ALSO
 
-[docs/guide.md](docs/guide.md) - session, output formats, AST adapters, options, journals, eval results.
+[docs/sdk.md](docs/sdk.md) - public decisions, routers, programs, formal trees, limits, and package contract.
+
+[docs/guide.md](docs/guide.md) - CLI sessions, output formats, AST adapters, options, journals, and eval results.

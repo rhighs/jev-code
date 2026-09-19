@@ -18,7 +18,8 @@ test('experimental grid asks one Choice per output cell concurrently and decodes
       alphabet: Array<{ key: string; value: string }>; rows: number; columns: number; capacity: number;
     } } }).generation;
     if (questions.selection?.type === 'choice') return { model: 'test', usage: { input_tokens: 0, output_tokens: 0 },
-      answers: { selection: { type: 'choice', choice: 'cells_8', confidence: 1, probabilities: { cells_8: 1 } } } } as never;
+      answers: { selection: { type: 'choice', choice: 'cells_8', confidence: 1,
+        probabilities: Object.fromEntries(Object.keys(questions.selection.criteria).map(key => [key, key === 'cells_8' ? 1 : 0])) } } } as never;
     if (questions.verdict) return { model: 'test', usage: { input_tokens: 0, output_tokens: 0 }, answers: { verdict: { type: 'noul', noul: 1 } } } as never;
     assert.equal(generation.phase, 'cells');
     assert.equal(generation.grid.capacity, 8);
@@ -32,8 +33,7 @@ test('experimental grid asks one Choice per output cell concurrently and decodes
       const index = Number(row) * generation.grid.columns + Number(column);
       const value = [...target][index] ?? '';
       const symbol = generation.grid.alphabet.find(symbol => symbol.value === value)!;
-      // The host must use the highest candidate score, even if reported selection disagrees.
-      answers[key] = { type: 'choice', choice: 'x', confidence: 0.1,
+      answers[key] = { type: 'choice', choice: symbol.key, confidence: 0.1,
         probabilities: Object.fromEntries(Object.keys(question.criteria).map(key => [key, key === symbol.key ? 1 : 0])) };
       cellsAsked++;
     }
@@ -61,7 +61,8 @@ test('large requested batches split before exceeding the request payload budget'
       calls++;
     }
     if (questions.selection?.type === 'choice') return { model: 'test', usage: { input_tokens: 0, output_tokens: 0 },
-      answers: { selection: { type: 'choice', choice: 'cells_128', confidence: 1, probabilities: { cells_128: 1 } } } } as never;
+      answers: { selection: { type: 'choice', choice: 'cells_128', confidence: 1,
+        probabilities: Object.fromEntries(Object.keys(questions.selection.criteria).map(key => [key, key === 'cells_128' ? 1 : 0])) } } } as never;
     return base.decide(state, questions, signal);
   } };
   assert.equal(await generateText(new Decisions(provider, 100, new AbortController().signal), task, 'content', 'Exact text.',

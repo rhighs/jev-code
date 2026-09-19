@@ -92,6 +92,23 @@ test('Bash executes pipelines, records stderr and nonzero exits, and bounds outp
   assert.ok(flood.output.length < 200);
 });
 
+test('Bash subprocesses never receive current or legacy Jev credentials', async t => {
+  const { root, signal } = await setup(t);
+  const previousTypesafe = process.env.TYPESAFE_API_KEY;
+  const previousGeneration = process.env.JEV_GENERATION_API_KEY;
+  process.env.TYPESAFE_API_KEY = 'current-secret';
+  process.env.JEV_GENERATION_API_KEY = 'legacy-secret';
+  try {
+    const result = await runBash('test -z "${TYPESAFE_API_KEY:-}" && test -z "${JEV_GENERATION_API_KEY:-}"', root, 1000, signal);
+    assert.equal(result.ok, true, result.output);
+  } finally {
+    if (previousTypesafe === undefined) delete process.env.TYPESAFE_API_KEY;
+    else process.env.TYPESAFE_API_KEY = previousTypesafe;
+    if (previousGeneration === undefined) delete process.env.JEV_GENERATION_API_KEY;
+    else process.env.JEV_GENERATION_API_KEY = previousGeneration;
+  }
+});
+
 test('Bash timeout kills the process group, including TERM-resistant children', async t => {
   const { root, signal } = await setup(t);
   const start = Date.now();
@@ -108,16 +125,6 @@ test('Bash cancellation returns a cancelled result promptly', async t => {
   const result = await runBash('sleep 30', root, 10_000, controller.signal);
   assert.equal(result.ok, false);
   assert.equal(result.data?.cancelled, true);
-});
-
-test('the bash tool never exposes JEV_GENERATION_API_KEY to the child', async t => {
-  const { context, tools } = await setup(t);
-  const prev = process.env.JEV_GENERATION_API_KEY;
-  process.env.JEV_GENERATION_API_KEY = 'sk-x';
-  t.after(() => { if (prev === undefined) delete process.env.JEV_GENERATION_API_KEY; else process.env.JEV_GENERATION_API_KEY = prev; });
-  const result = await tools.get('bash')!.execute({ command: 'printf %s "${JEV_GENERATION_API_KEY:-absent}"', cwd: '.' }, context);
-  assert.equal(result.ok, true);
-  assert.equal(result.output, 'absent');
 });
 
 test('Bash streaming callback errors fail the command and release its resources', async t => {

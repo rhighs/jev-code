@@ -37,10 +37,13 @@ test('Bash AST quotes literal words and preserves mixed operator tree grouping',
 
 test('Bash AST composes programs, arguments and pipelines entirely with choices', async () => {
   const provider = fixture([{ label: 'printf' }, { label: JSON.stringify('hello') }, 'END', 'pipe', { label: 'cat' }, 'END', 'END']);
-  const events: Array<{ value: string; done: boolean; decoder: string | undefined }> = [];
-  const source = await generateBashAst(new Decisions(provider, 30, new AbortController().signal), { task: { prompt: 'Print "hello" using printf and pipe it to cat.' } }, 'command', { ...options, onText: async (_field, value, done, _change, progress) => { events.push({ value, done, decoder: progress?.decoder }); } });
+  const decisions = new Decisions(provider, 30, new AbortController().signal);
+  const events: Array<{ value: string; done: boolean; decoder: string | undefined; slot?: string }> = [];
+  const source = await generateBashAst(decisions, { task: { prompt: 'Print "hello" using printf and pipe it to cat.' } }, 'command', { ...options, onText: async (_field, value, done, _change, progress) => { events.push({ value, done, decoder: progress?.decoder, ...(progress?.ast?.slot === undefined ? {} : { slot: progress.ast.slot }) }); } });
   assert.equal(source, "'printf' 'hello' | 'cat'");
   assert.equal((await execute('bash', ['-c', source])).stdout, 'hello');
+  assert.equal(decisions.requests, 7);
+  assert.deepEqual(events.filter(event => !event.done).map(event => event.slot), ['plan', 'program', 'argument', 'argument', 'connector', 'program', 'argument', 'connector']);
   assert.ok(events.every(event => event.decoder === 'ast'));
   assert.equal(events.at(-1)?.done, true);
 });
@@ -65,4 +68,12 @@ test('Bash syntax validation never executes source, and AST budget and cancellat
 test('Bash AST never offers an argument the command already has', async () => {
   const provider = fixture([{ label: 'python3' }, { label: JSON.stringify('-m') }, { label: JSON.stringify('py_compile') }, { label: JSON.stringify('main.py') }, { label: JSON.stringify('-m') }]);
   await assert.rejects(generateBashAst(new Decisions(provider, 30, new AbortController().signal), { task: { prompt: 'Verify it compiles with python3 -m py_compile main.py.' } }, 'command', options), /Unavailable production/);
+});
+
+test('Bash AST assembles redirects and their continuation through tree branches', async () => {
+  const provider = fixture([{ label: 'printf' }, { label: JSON.stringify('hello') }, 'END', 'output', { label: 'result.txt' }, 'END']);
+  const source = await generateBashAst(new Decisions(provider, 30, new AbortController().signal), {
+    task: { prompt: 'Print "hello" with printf and redirect output to result.txt.' },
+  }, 'command', options);
+  assert.equal(source, "'printf' 'hello' > 'result.txt'");
 });

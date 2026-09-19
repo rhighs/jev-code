@@ -1,6 +1,8 @@
 # Jev Code
 
-A TypeScript coding harness built from Jev's typed decisions. Each action is a turn: choose a tool, construct its arguments, execute it, observe its real result, then decide what to do next. Python files and Bash commands use constrained AST productions; paths and text use choices. Completion summaries come from observed tool results.
+`jev-code` is a Jev-only TypeScript SDK for typed routing, composable decision programs, and validated formal trees. The coding harness documented here is one application of that public API. It keeps tools, authorization, workspace policy, journals, and execution in application code while Jev makes bounded choices over alternatives supplied by deterministic code. Start with the [SDK guide](sdk.md) for library use.
+
+The CLI is a coding harness built from those typed decisions. Each action is a turn: choose a tool, construct its arguments, execute it, observe its real result, then decide what to do next. Python files and Bash commands use constrained AST productions; paths and text use choices. Completion summaries come from observed tool results.
 
 This is an experimental harness with tested execution plumbing. Jev is a decision model, not a text model: general code generation quality remains an empirical question. Accepting arbitrary tasks does **not** guarantee it can solve every task. Use actual compiler/test outcomes to assess generated code.
 
@@ -9,19 +11,19 @@ This is an experimental harness with tested execution plumbing. Jev is a decisio
 Requires Node.js 22+, Bash, and Python 3.9+ for Python AST generation. Node.js 24+ is needed for the native TypeScript execution example below.
 
 ```bash
-npm install
-npm run build
+pnpm install --frozen-lockfile
+pnpm run build
 ```
 
 The first interactive run asks for your typesafe.ai API key and saves it to `~/.config/jev-code/config.json` (mode 600; `$XDG_CONFIG_HOME` and `JEV_CODE_CONFIG_DIR` are honored). `jev-code login` re-enters it, `jev-code logout` removes it. A `TYPESAFE_API_KEY` in the environment or a local `.env` file (loaded automatically) takes precedence over the saved key, and non-interactive commands (`--print`, `decide`, `eval`) never prompt; they fail with a pointer to `login` instead. Optional SDK settings are `TYPESAFE_DEFAULT_MODEL` and `TYPESAFE_BASE_URL`. `.env`, journals, dependencies, and build output are ignored by Git.
 
 ```bash
-npm run dev
-npm start -- --workspace /path/to/project
-npm start -- --workspace /path/to/project "Create a TypeScript CLI and test it"
-npm start -- -p --yes --workspace /path/to/project --prompt-file task.md
-npm start -- --interactive --workspace /path/to/project
-npm run dev -- --help
+pnpm run dev
+pnpm start -- --workspace /path/to/project
+pnpm start -- --workspace /path/to/project "Create a TypeScript CLI and test it"
+pnpm start -- -p --yes --workspace /path/to/project --prompt-file task.md
+pnpm start -- --interactive --workspace /path/to/project
+pnpm run dev -- --help
 ```
 
 In a terminal, launching without a task starts a persistent interactive session. A positional task starts the first run and leaves the session open for follow-ups. `-p`/`--print` runs once and exits. Task files, JSON output, and non-terminal input select one-shot mode unless `--interactive` is explicit.
@@ -58,7 +60,7 @@ Direct file tools resolve symlinks and reject paths outside the selected workspa
 
 **Degradation.** Below 80 columns the live pane is dropped and only the decision strip remains; every line is clipped to the terminal width with a trailing ellipsis, so the terminal's own auto-wrap never splits a word across two screen lines. `NO_COLOR` or `TERM=dumb` turn off color and cursor movement in both the interactive session and `--print`. Under tmux and over SSH, the pinned live area redraws only when its content changes, so scrollback and multiplexer redraws stay legible. A non-TTY stdin or stderr — a pipe, a redirect, `--json`, a task file — falls back to the plain, `--print`-style renderer instead of mounting Ink.
 
-Interactive rendering runs on Ink, React, and `ink-text-input` at runtime; `--print`, `--json`, `decide`, and `replay --plain` never load them. The installer is unaffected: it still runs `npm ci --ignore-scripts` from the source tarball against the committed `package-lock.json`.
+Interactive rendering runs on Ink, React, and `ink-text-input` at runtime; `--print`, `--json`, `decide`, and `replay --plain` never load them. The installer uses Corepack and the committed `pnpm-lock.yaml` to build from the source tarball.
 
 ## Tools and turns
 
@@ -71,7 +73,6 @@ Interactive rendering runs on Ink, React, and `ink-text-input` at runtime; `--pr
 | `edit_file` | Replace one unambiguous exact match; fail without mutation otherwise. |
 | `bash` | Execute an arbitrary Bash command with bounded output and an explicit exit status. |
 | `set_plan` | Record/revise the active plan and progress. |
-| `propose` | Ask the configured generation model for candidates, filter them, let Jev select one or reject all, then write the file or return the text. Registered only when a provider is configured. See Propose. |
 | `finish` | End the run, gated by a separate task-scoped Jev completion choice. |
 | `blocked` | Explain a missing prerequisite or user decision. |
 
@@ -105,41 +106,6 @@ Numeric arguments use choices over valid values and documented defaults, with te
 Limits are explicit: 50 action turns, 512 Jev requests, 256 AST productions or experimental grid cells per field, and five minutes per run by default. Python AST nesting is capped at eight levels, a single Python block stops after 16 statements, and decision payloads are bounded. Override run budgets with `--max-turns`, `--max-requests`, `--max-steps`, and `--timeout-ms`. Bash AST composition also has a 96-production limit. Bash execution has a generated timeout of up to 10 minutes, defaulting to 30 seconds; the run deadline still applies. Ctrl-C aborts model requests and terminates the current Bash process group. Background daemons intentionally detached by a command are outside that cancellation guarantee.
 
 Run statuses are `completed`, `blocked`, `limited`, `cancelled`, or `error`. Only `completed` exits with code 0; cancellation exits with 130, other failures with 1. Interactive mode carries a bounded conversation summary and inspects the current workspace on each run. New API-side instructions can be queued during a run and are applied at the next turn boundary.
-
-## Program mapping
-
-With a generation provider, `write_file` resolves the destination first and uses the registered language adapter to validate a mapped program. It no longer asks Jev to choose individual AST productions for this route. The LLM proposes a JSON map containing an observable goal, verification checks, ordered subproblems, input/output names, and compatible code options. Jev reviews the map against the original task, selects each implementation by its meaning and code, and reviews the assembled result. The generator has no tool access or authority to approve its own plan.
-
-Maps contain at most eight steps and three options per step. Each option is at most 2 KB; the map is at most 32 KB. For each option, validation assembles the selected earlier pieces, that option, and the first option from each remaining step. This checks compatibility before Jev selects; those later pieces remain tentative. An invalid default later piece can require remapping. Jev rejection or source validation failure returns feedback to the mapper. There are at most three mapping attempts per draft, sharing `--max-proposals` with `propose`. Jev reviews and selections share the normal request and generation-step budgets. Errors never fall back silently to token-by-token grammar generation, and no draft is written before approval and validation finish.
-
-The journal and trace mark these decisions with `phase: "program_map"`: `review_plan`, `choose_step`, and `review_program`. Progress displays the subproblem and the meaning of the selected implementation. Language validation is not proof of runtime behavior; the harness must still run applicable verification. The current adapter's validation determines which syntax or static checks are available.
-
-Repeated calls with unchanged results trigger action mapping. The provider proposes at most four concrete actions; unknown tools, invalid arguments, repeated calls, and embedded source contents are filtered out. Jev selects or rejects the remaining options in `phase: "action_map"`. The selected action still passes ordinary authorization. Source writes go through program mapping; recovery shares `--max-proposals` with code maps and `propose`. A successful write resets the repetition window.
-
-
-Python `write_files` uses the same mapping flow with a safe relative `.py` path per step. Fragments are joined per file, and candidate projects pass cross-file import validation. For single-file rewrites, the mapper receives the actual destination source, capped at 16 KB; larger files require focused edits. Both generator and review are scoped to the destination file, while task completion still covers every requested change and verification. Without a configured generation provider, both write tools retain their grammar builders. Free text still uses `propose text`. Library hosts enable mapping by passing `generationProvider` in `HarnessOptions`; the CLI shares its configured provider with mapping and `propose`.
-
-## Propose
-
-Jev cannot write open-ended text. `propose` gives it a bounded way to get some: a small autoregressive model produces candidates, TypeScript filters them, and Jev selects. The generator is not an agent. It does not see the tool list, the plan, or the history. It receives one objective, optional constraints, the path, and the current file content. It returns text.
-
-The request fields are filled by Jev through the normal argument generator: `kind` (`file` or `text`), `objective`, `constraints` (may be empty), `count` (1 to 5, default 3), `path` (required for `file`; for `text` an optional existing file whose content is given to the generator as context and left unchanged). The provider returns `count` completions from `count` parallel single-completion requests. Validators run in a fixed order and stop at the first failure: `generation failed` (the request itself failed), `truncated` (the model hit its output limit), `empty`, `too large` (over 16 KB), `unchanged` (equal to the current file after whitespace normalization), `json wrapper` (a JSON object or array standing in for a non-JSON file), `duplicate of <label>` (equal to an earlier valid candidate), then the language validator of the matching adapter (`python3` compile, the TypeScript compiler, `gcc`, `rustc`, `go vet`, `luac`, `ruby -c`). Code fences are stripped first, including an unterminated fence or trailing prose after the closing fence. A candidate that is a JSON object with a single string value, or a `cat > file <<'EOF'` heredoc, is unwrapped to its inner content before the checks run.
-
-Jev then answers one `choice` question. The options are the valid labels (`A` to `E`) and `reject`. Each label's text is the first line where that candidate differs from every other valid one, with `+n/-m` line counts against the current file. The state carries a bounded diff or head per candidate, never the full texts, so the request stays inside the usual budget. The decision event carries `field: "candidate"` and `phase: "propose"`, so `/trace` and `--json` show it like any other decision. `reject` returns `ok: false` with the candidate table so Jev can change the constraints or take another action. A `file` selection is written with the same atomic write as `write_file`; a `text` selection is the tool output.
-
-The tool output lists the provider, the model, one line per candidate with its verdict, and the selection with its confidence. The `tool_end` record carries the same data plus a diff hunk of at most 120 lines. The session card shows the diff. Two consecutive `propose` writes to the same path without a run leave only shell tools for the next turn, as for `write_file`. Two consecutive rejected `propose` calls with the same request remove `propose` for the next turn. Provider response bodies are capped at 4 MB. `--max-proposals <n>` (default 20) caps generator calls across mapping and proposals per run; when exhausted, the tool returns `ok: false` and names `write_file` and `edit_file`.
-
-`propose` has `effect: write`. With `--confirm-writes` the host approves the request (path, objective, constraints) before any candidate exists; the content is visible in the diff card afterwards. The current file content and the objective leave the machine and reach the configured provider; do not point `propose` at files that hold secrets.
-
-## Providers
-
-The provider layer lives in `src/providers/` and does not import the harness. A provider is one row in `catalog.ts`: id, base URL, wire protocol, authentication methods, bundled lightweight models, and an OAuth descriptor when the vendor offers one. Three wire protocols cover the six providers: OpenAI chat completions (`openai` with a key, `google`, `openrouter`, `openai-compatible`, `local`), Anthropic messages (`anthropic`), and OpenAI Responses over SSE on the ChatGPT backend (`openai` with OAuth). Adding a provider is one catalog row and, at most, one wire function.
-
-Configuration is split. `~/.config/jev-code/config.json` holds `generation: { provider, model, auth, baseUrl }`. `~/.config/jev-code/credentials.json` holds the secrets keyed by provider id, mode 600, written like the config file. `JEV_GENERATION_API_KEY` in the environment overrides the stored credential for the active provider only, and `sanitizedEnv()` strips it, like `TYPESAFE_API_KEY`, from every child process. Errors from the wire client are scrubbed of bearer tokens, key-shaped strings, and every header value that was sent before they reach a tool result, an event, or a journal.
-
-OAuth uses authorization code with PKCE. `openai` opens the browser and listens on `127.0.0.1:1455` (when the port is taken, paste the redirect URL from the browser instead); `anthropic` opens the browser and asks you to paste the code (or the whole redirect URL); `openrouter` opens the browser, listens on an ephemeral loopback port, and exchanges the code for an API key. `state` is checked where the vendor sends it. Tokens are refreshed once per `generate` call when expired and once more on a 401; concurrent calls share one refresh. A failed refresh leaves the stored credential untouched and reports `run jev-code provider login <id>`. `provider logout` deletes the local credential; it does not revoke the grant at the vendor. Consumer-subscription OAuth (ChatGPT, Claude) is meant for the vendors' own clients and can stop working; API keys are the supported path. Google OAuth is not implemented.
-
-Commands: `provider login [id]` runs the picker (provider, authentication, model; live model lists come from `/models` when the provider has one); `provider logout [id]`; `provider list [--json]`; `provider models [id] [--json]`; `provider use [id|none] [--model <id>] [--base-url <url>]`: on a terminal it asks for whatever is missing (provider, base URL, model); the flags and `JEV_GENERATION_API_KEY` cover scripted setups. On the first interactive run without a `generation` section, the session asks once whether to configure a provider. Non-interactive runs never ask; without a usable provider, `propose` is not registered and nothing else changes.
 
 ## Observe
 
@@ -220,21 +186,21 @@ To add a language, write a dialect and export `adapterFor(dialect)` from a modul
 To install an adapter module from a source checkout:
 
 ```bash
-npm run build
-npm run dev -- ast install ./examples/dialect-ast.mjs
-npm run dev -- ast list
-npm run dev
+pnpm run build
+pnpm run dev -- ast install ./examples/dialect-ast.mjs
+pnpm run dev -- ast list
+pnpm run dev
 # Later, remove it:
-npm run dev -- ast remove racket
+pnpm run dev -- ast remove racket
 ```
 
 Installation records adapter modules in `<workspace>/.jev/asts.json`; subsequent CLI sessions load them automatically. Use `--workspace /path/to/project` for another workspace. Local module paths resolve against that workspace and are stored as absolute paths. To load an adapter for one session without installation:
 
 ```bash
-npm run dev -- --asts ./examples/dialect-ast.mjs
+pnpm run dev -- --asts ./examples/dialect-ast.mjs
 ```
 
-Packages work too: install an adapter package into your workspace using npm, then run `npm run dev -- ast install <package-name>` from this harness with the target `--workspace`. The package must provide a Node-resolvable ESM module exporting an `astAdapters` array. A parser package alone is not a Jev generator: an adapter must implement the production loop, AST rendering, and source validation. Adapter modules execute as trusted host code, like tool modules.
+Packages work too: install an adapter package into your workspace using pnpm, then run `pnpm run dev -- ast install <package-name>` from this harness with the target `--workspace`. The package must provide a Node-resolvable ESM module exporting an `astAdapters` array. A parser package alone is not a Jev generator: an adapter must implement the production loop, AST rendering, and source validation. Adapter modules execute as trusted host code, like tool modules.
 
 An adapter implements the exported `AstAdapter` interface: `id`, `extensions`, `languages`, `generate(decisions, state, field, options)`, and mandatory `validate(source, signal)`. Generation uses the shared Jev request budget and abort signal. The host checks byte limits and validates returned source before marking generation complete or executing a file tool. Registered language/file extensions choose their AST adapter automatically, and adapter errors terminate that draft without reverting to the grid. Duplicate ids, languages, or extensions are rejected. Library hosts can pass `astAdapters` in `HarnessOptions` or call `harness.registerAst(adapter)` between runs. See [the JavaScript dialect](../src/lang/javascript.ts) and [the shared core](../src/lang/core.ts) for the bundled implementation.
 
@@ -273,9 +239,9 @@ For direct library use, export the API key before constructing `JevProvider`; `.
 ## Verify
 
 ```bash
-npm run typecheck
-npm test
-npm run build
+pnpm run typecheck
+pnpm test
+pnpm run build
 ```
 
 Integration tests exercise creation, failed command feedback, targeted edits, a successful rerun, rejected completion, cancellation, budgets, Unicode generation, path policy, custom tools, interactive follow-ups, live task updates, permissions, streamed Bash output, multiline input, and conversation reset. Additional tests exercise run/turn timing, adapter installation and reload, mandatory adapter validation, typed terminal generation without grid fallback, the file viewer, and styled previews. They do not measure live model quality.
@@ -287,15 +253,15 @@ After removing default grids and generated finish prose, a live “write a for l
 ## Eval
 
 ```bash
-npm run dev -- eval
-npm run dev -- eval guessing-game
-npm run dev -- eval --eval-out /path/to/records
-npm run dev -- eval compare .jev/eval/<before>.json .jev/eval/<after>.json
+pnpm run dev -- eval
+pnpm run dev -- eval guessing-game
+pnpm run dev -- eval --eval-out /path/to/records
+pnpm run dev -- eval compare .jev/eval/<before>.json .jev/eval/<after>.json
 ```
 
-`eval` uses the configured generation provider for mapping and runs a fixed ladder of tasks against live Jev: `guessing-game`, `file-io-script`, and `multi-file-package`, each defined in `eval/<task>/task.json` with a prompt, a `stage` tag, and optional limit overrides, plus a `check.ts` that judges the resulting workspace deterministically. The guessing-game checker plays the game adaptively from the program's own feedback lines, so no seed is needed. Every task runs in a fresh temporary workspace that is deleted afterwards; its journal is kept under `.jev/eval/journals/<task>/`. One record per task is written to `.jev/eval/<timestamp>.json` under the current directory or `--eval-out`. `--search-width` applies to eval runs and is recorded on each record as `searchWidth`. A record file is a JSON array with one object per task: `task`, `stage`, `status`, `summary`, `check` (`ok`, `reason`), `turns`, `requests`, `inputTokens`, `durationMs`, `runId`, `commit`, `startedAt`. `eval compare <a> <b>` prints one row per task across the two files with pass, requests, duration, and status side by side and the request and duration deltas; a task present in only one file shows `absent`. `eval compare` does not need an API key.
+`eval` runs a fixed ladder of tasks against live Jev: `guessing-game`, `file-io-script`, and `multi-file-package`, each defined in `eval/<task>/task.json` with a prompt, a `stage` tag, and optional limit overrides, plus a `check.ts` that judges the resulting workspace deterministically. The guessing-game checker plays the game adaptively from the program's own feedback lines, so no seed is needed. Every task runs in a fresh temporary workspace that is deleted afterwards; its journal is kept under `.jev/eval/journals/<task>/`. One record per task is written to `.jev/eval/<timestamp>.json` under the current directory or `--eval-out`. `--search-width` applies to eval runs and is recorded on each record as `searchWidth`. A record file is a JSON array with one object per task: `task`, `stage`, `status`, `summary`, `check` (`ok`, `reason`), `turns`, `requests`, `inputTokens`, `durationMs`, `runId`, `commit`, `startedAt`. `eval compare <a> <b>` prints one row per task across the two files with pass, requests, duration, and status side by side and the request and duration deltas; a task present in only one file shows `absent`. `eval compare` does not need an API key.
 
-`eval` is a development command: task checkers live outside the compiled `src/` tree, so run it with `npm run dev`, not the installed binary. It implies `--yes`: agent Bash executes on this host without confirmation, and checkers execute the generated programs. Run it inside a container or VM when you want isolation. Programs spawned by checkers do not receive `TYPESAFE_API_KEY`. Eval never runs in CI.
+`eval` is a development command: task checkers live outside the compiled `src/` tree, so run it with `pnpm run dev`, not the installed binary. It implies `--yes`: agent Bash executes on this host without confirmation, and checkers execute the generated programs. Run it inside a container or VM when you want isolation. Programs spawned by checkers do not receive `TYPESAFE_API_KEY`. Eval never runs in CI.
 
 ### Eval results
 
@@ -314,15 +280,5 @@ Live results on 2026-09-18 (one run per task, default task limits; `pass` means 
 | call-nesting and bash fixes (`517d0f0`) | fail, 38 turns, 2000 requests, 10 min 44 s | fail, 34 turns, 3000 requests, 13 min 24 s | fail, 60 turns, 2516 requests, 13 min 53 s |
 
 In those grammar-only baseline runs, no task passed. The failure mode moved from crashes (request-size overflow, token loops, a serializer error on every `else` branch) to decision quality. Since the rewrite guard forces a run, programs execute every third turn (19 runs in a 60-turn multi-file run, up from 1) and the shapes are nearly right: `'Hello, ' + name` in a package module imported by `main.py`, a `randint` call and an input loop, `open` with a running total. The remaining defects are single wrong picks, such as `randint(range(1 + 100, 100), 100)`, `print('Too low', None)`, or calling the greeting with `'Name'` instead of `'World'`. Search width 3 spends the same request budget in a third of the turns without a better program, so the request budget, not candidate count, is the binding limit.
-
-The mapped implementation passed the same live ladder on 2026-09-19 with Jev 1.13.0 and the configured `gpt-5.5` generation provider:
-
-| task | result | turns | Jev requests | elapsed |
-| --- | --- | --- | --- | --- |
-| guessing-game | pass | 5 | 31 | 22.8 s |
-| file-io-script | pass | 3 | 13 | 13.0 s |
-| multi-file-package | pass | 3 | 12 | 19.9 s |
-
-Separate live checks covered Fibonacci creation in Python and TypeScript, a three-file Python project, preservation of existing tests while adding a negative-input case, and an interactive terminal follow-up changing the output count from 10 to 15. These are observed runs, not guarantees for every model response. The automated suite passed all 358 tests.
 
 API integration follows the [official TypeScript SDK](https://github.com/typesafe-ai/typesafe-sdk-js) and its [typed question builders](https://github.com/typesafe-ai/typesafe-sdk-js/blob/main/src/questions.ts).

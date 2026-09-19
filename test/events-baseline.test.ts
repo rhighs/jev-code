@@ -44,7 +44,7 @@ const compare = async (events: HarnessEvent[], ws: string): Promise<void> => {
   assert.deepEqual(events.map(e => strip(mask(e, ws))), baseline);
 };
 
-/** Regenerate with UPDATE_FIXTURES=1 npm test -- test/events-baseline.test.ts */
+/** Regenerate with UPDATE_FIXTURES=1 pnpm test -- test/events-baseline.test.ts */
 test('--json events only gain fields relative to the recorded baseline', async t => {
   const ws = await workspace(t);
   const events: HarnessEvent[] = [];

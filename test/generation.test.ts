@@ -49,7 +49,8 @@ test('structured path tokens never repeat the span just appended', async () => {
     if (!q || q.type !== 'choice') throw new Error('Expected a choice question.');
     const span = Object.entries(q.criteria).find(([, v]) => v === JSON.stringify('main.py'))?.[0];
     const choice = span ?? (Object.hasOwn(q.criteria, 'plan_0') ? 'free' : 'END');
-    return { model: 't', usage: { input_tokens: 0, output_tokens: 0 }, answers: { selection: { type: 'choice', choice, confidence: 1, probabilities: {} } } } as never;
+    return { model: 't', usage: { input_tokens: 0, output_tokens: 0 }, answers: { selection: { type: 'choice', choice, confidence: 1,
+      probabilities: Object.fromEntries(Object.keys(q.criteria).map(key => [key, key === choice ? 1 : 0])) } } } as never;
   } };
   const actual = await generateText(new Decisions(provider, 100, new AbortController().signal), {
     task: { turn: 1, prompt: 'write a program that prints numbers from 1 to 10', updates: [] }, action: 'write_file',
@@ -63,7 +64,8 @@ test('a path plan offers conventional filenames when the task names no file or l
     const q = questions.selection;
     if (!q || q.type !== 'choice') throw new Error('Expected a choice question.');
     offered = Object.values(q.criteria).filter((v): v is string => typeof v === 'string');
-    return { model: 't', usage: { input_tokens: 0, output_tokens: 0 }, answers: { selection: { type: 'choice', choice: 'plan_1', confidence: 1, probabilities: {} } } } as never;
+    return { model: 't', usage: { input_tokens: 0, output_tokens: 0 }, answers: { selection: { type: 'choice', choice: 'plan_1', confidence: 1,
+      probabilities: Object.fromEntries(Object.keys(q.criteria).map(key => [key, key === 'plan_1' ? 1 : 0])) } } } as never;
   } };
   const actual = await generateText(new Decisions(provider, 100, new AbortController().signal), {
     task: { turn: 1, prompt: 'write a program that prints numbers from 1 to 10', updates: [] }, action: 'write_file',
@@ -78,7 +80,8 @@ test('a read path plan offers workspace files instead of default program names',
     const q = questions.selection;
     if (!q || q.type !== 'choice') throw new Error('Expected a choice question.');
     offered = Object.values(q.criteria).filter((v): v is string => typeof v === 'string');
-    return { model: 't', usage: { input_tokens: 0, output_tokens: 0 }, answers: { selection: { type: 'choice', choice: 'plan_1', confidence: 1, probabilities: {} } } } as never;
+    return { model: 't', usage: { input_tokens: 0, output_tokens: 0 }, answers: { selection: { type: 'choice', choice: 'plan_1', confidence: 1,
+      probabilities: Object.fromEntries(Object.keys(q.criteria).map(key => [key, key === 'plan_1' ? 1 : 0])) } } } as never;
   } };
   const actual = await generateText(new Decisions(provider, 100, new AbortController().signal), {
     task: { turn: 1, prompt: 'what happened exactly?', updates: [] }, action: 'read_file', workspace: { root: '/w', files: ['notes.md', 'main.ts'] },

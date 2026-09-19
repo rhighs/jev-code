@@ -1,9 +1,7 @@
-import { recoverAction, stalled } from './action-map.js';
-import type { ProposalProvider } from './providers/types.js';
 import { randomUUID } from 'node:crypto';
 import { mkdir, open, realpath, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
-import { Decisions, type State } from './decisions.js';
+import { Decisions, jsonState, type State } from './decisions.js';
 import { fragmentsFrom, generateArguments, generateText } from './generation.js';
 import { builtInTools, toolContext } from './tools.js';
 import { listWorkspace, resolveWorkspacePath } from './workspace.js';
@@ -11,13 +9,13 @@ import { completionSummary } from './summary.js';
 import { AstRegistry, type AstAdapter } from './ast-adapters.js';
 import { gridCursor, type TextProgress, type TextChange } from './grid.js';
 import { DecisionError, LimitError, type DecisionProvider, type HarnessEvent, type HarnessEventData, type RunResult, type RunStatus, type Tool, type ToolRecord } from './types.js';
+import { defineRouter, route, type RouteTable } from './sdk/index.js';
 
-export const DEFAULT_LIMITS = { maxTurns: 50, maxRequests: 512, maxGenerationSteps: 256, maxRunMs: 300_000, maxProposals: 20 } as const;
+export const DEFAULT_LIMITS = { maxTurns: 50, maxRequests: 512, maxGenerationSteps: 256, maxRunMs: 300_000 } as const;
 
 export interface HarnessOptions {
   workspace: string;
   provider: DecisionProvider;
-  generationProvider?: ProposalProvider;
   tools?: Tool[];
   astAdapters?: AstAdapter[];
   bundledAsts?: boolean;
@@ -30,7 +28,6 @@ export interface HarnessOptions {
   concurrency?: number;
   searchWidth?: number;
   maxRunMs?: number;
-  maxProposals?: number;
   /** Opt into a strict Noul gate; by default completion uses a categorical choice. */
   completionThreshold?: number;
   allowOutsideWorkspace?: boolean;
@@ -56,7 +53,7 @@ export class Harness {
   constructor(private readonly options: HarnessOptions) {
     this.astRegistry = new AstRegistry(options.astAdapters, options.bundledAsts ?? true);
     for (const [name, value] of Object.entries({ maxTurns: options.maxTurns ?? DEFAULT_LIMITS.maxTurns, maxRequests: options.maxRequests ?? DEFAULT_LIMITS.maxRequests,
-      maxGenerationSteps: options.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, maxRunMs: options.maxRunMs ?? DEFAULT_LIMITS.maxRunMs, maxProposals: options.maxProposals ?? DEFAULT_LIMITS.maxProposals })) {
+      maxGenerationSteps: options.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, maxRunMs: options.maxRunMs ?? DEFAULT_LIMITS.maxRunMs })) {
       if (!Number.isSafeInteger(value) || value < 1 || value > 2_147_483_647) throw new Error(`${name} must be a positive integer <= 2147483647.`);
     }
     const threshold = options.completionThreshold ?? 0.85;
@@ -155,7 +152,6 @@ export class Harness {
       await emit('start', { schema: 1, prompt, workspace, decoder: 'dynamic', limits: { turns: this.options.maxTurns ?? DEFAULT_LIMITS.maxTurns, requests: this.options.maxRequests ?? DEFAULT_LIMITS.maxRequests }, journal: journal ?? null });
       const context = toolContext(workspace, signal, path => resolveWorkspacePath(workspace, path, this.options.allowOutsideWorkspace ?? false));
       context.onOutput = async (stream, text) => emit('tool_output', { stream, text });
-      context.proposals = { used: 0, max: this.options.maxProposals ?? DEFAULT_LIMITS.maxProposals };
       context.assertRequests = count => decisions.assertRequestBudget(count);
       for (turn = 1; turn <= (this.options.maxTurns ?? DEFAULT_LIMITS.maxTurns); turn++) {
         const turnStarted = performance.now();
@@ -184,14 +180,7 @@ export class Harness {
             'Choose a concrete next action. Read tool outcomes and repair failures. Update the plan when useful.',
             'Only finish after the requested work and its applicable verification have succeeded. Never invent tool results.',
             'Use blocked only when missing information or an external prerequisite prevents further progress.',
-            ...(this.options.generationProvider ? ['Use write_file for a single source file and write_files for a multi-file Python project. The generation model maps the task into meaningful program steps; you approve the map, choose implementations, and review the program. Use propose for explanations or file types without an AST adapter.'] : []),
           ],
-        };
-        context.select = async (instruction, criteria, extra) => {
-          let confidence = 0;
-          const observed = decisions.observe(async data => { confidence = data.confidence ?? confidence; await emit('decision', data); });
-          const choice = await observed.choose({ ...state, ...extra }, instruction, criteria);
-          return { choice, confidence };
         };
         await emit('turn', { files: inventory.files.length, plan });
         const criteria = Object.fromEntries([...this.registry.values()].map(tool => [tool.name, tool.description]));
@@ -209,15 +198,9 @@ export class Harness {
           for (const tool of repeated) delete criteria[tool];
           state.progressFeedback = `${previous.tool} ${JSON.stringify(previous.args)} failed ${failures.get(failKey(previous))} times: ${trim(previous.result.output, 200)}. The same call will fail again; ${repeated.join(', ')} unavailable for this turn. Use the workspace listing, another action, or finish with what is known.`;
         }
-        if (previous && earlier && previous.tool === 'propose' && earlier.tool === 'propose' && !previous.result.ok && !earlier.result.ok &&
-            JSON.stringify(previous.args) === JSON.stringify(earlier.args)) {
-          delete criteria.propose;
-          state.progressFeedback = 'The last two propose calls with the same request produced no accepted candidate. Change the objective or constraints next time, or use another tool; propose is unavailable for this turn.';
-        }
         const writtenPath = (record: ToolRecord | undefined): string | undefined => {
           if (!record?.result.ok) return undefined;
           if (record.tool === 'write_file' && typeof record.args.path === 'string') return record.args.path;
-          if (record.tool === 'propose' && record.args.kind === 'file' && typeof record.args.path === 'string') return record.args.path;
           if (record.tool === 'write_files' && Array.isArray(record.result.data?.paths)) return [...record.result.data.paths as string[]].sort().join(', ');
           return undefined;
         };
@@ -232,11 +215,14 @@ export class Harness {
         criteria.finish = 'All requested work is complete and applicable verification has passed; summarize the observed outcome.';
         if (records.at(-1)?.tool === 'finish' && !records.at(-1)?.result.ok) delete criteria.finish;
         criteria.blocked = 'No further useful action is possible without user information or an external prerequisite; explain it.';
-        const recoveryTools = [...this.registry.values()].filter(t => rewritten !== undefined && rewritten === writtenPath(earlier) ? Object.hasOwn(criteria, t.name) : true);
-        const recovery = this.options.generationProvider && stalled(records, recoveryTools)
-          ? await recoverAction({ provider: this.options.generationProvider, budget: context.proposals! }, decisions, state, recoveryTools, records)
-          : undefined;
-        const action = recovery?.tool ?? await decisions.choose(state, `Choose the next action for this coding task:\n${messages.join('\nUpdate: ')}\nUse the actual workspace and tool outcomes to decide.`, criteria);
+        const routes = Object.fromEntries(Object.entries(criteria).map(([key, description]) => [key, route(description, key)])) as RouteTable;
+        const actionRouter = defineRouter(routes);
+        const selection = await actionRouter.select(
+          decisions.publicSession(state),
+          jsonState(state),
+          `Choose the next action for this coding task:\n${messages.join('\nUpdate: ')}\nUse the actual workspace and tool outcomes to decide.`,
+        );
+        const action = selection.value as string;
         await emit('action', { tool: action });
         const fragments = fragmentsFrom([...messages, ...inventory.files, plan, ...recent.flatMap(record => [
           ...Object.values(record.args).filter((value): value is string => typeof value === 'string'), record.result.output,
@@ -244,20 +230,6 @@ export class Harness {
         const generationOptions = {
           maxSteps: this.options.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, fragments,
           astRegistry: this.astRegistry,
-          ...(this.options.generationProvider ? { mapper: { provider: this.options.generationProvider, budget: context.proposals!, readSource: async (path: string) => {
-            let file: FileHandle | undefined;
-            try {
-              file = await open(await context.resolvePath(path), 'r');
-              const info = await file.stat();
-              if (!info.isFile() || info.size > 16_000) throw new Error('Mapped rewrites require a regular source file of at most 16000 bytes. Use a focused edit for larger files.');
-              const source = await file.readFile('utf8');
-              if (Buffer.byteLength(source) > 16_000) throw new Error('Source grew beyond the mapped rewrite limit.');
-              return source;
-            } catch (error) {
-              if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-              throw error;
-            } finally { await file?.close(); }
-          } } } : {}),
           experimentalGrid: this.options.experimentalGrid ?? false,
           gridBatchSize: this.options.gridBatchSize ?? 8, concurrency: this.options.concurrency ?? 4, searchWidth: this.options.searchWidth ?? 1,
           // Patch events preserve the scored cells without duplicating the draft per batch.
@@ -313,10 +285,7 @@ export class Harness {
         const tool = this.registry.get(action)!;
         let args: ToolRecord['args'] = {};
         try {
-          const supplied = recovery?.args ?? {};
-          const fields = Object.fromEntries(Object.entries(tool.fields).filter(([name]) => !Object.hasOwn(supplied, name)));
-          const task = recovery ? { ...(state.task as Record<string, unknown>), prompt: `${messages.join('\nUpdate: ')}\nCurrent subproblem selected by Jev: ${recovery.objective}` } : state.task;
-          args = { ...supplied, ...await generateArguments(decisions, { ...state, task, action, argumentsSoFar: supplied }, fields, generationOptions) };
+          args = await generateArguments(decisions, { ...state, action }, tool.fields, generationOptions);
           signal.throwIfAborted();
           const authorized = await this.options.authorize?.(tool, args, signal) ?? true;
           signal.throwIfAborted();

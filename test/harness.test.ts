@@ -3,12 +3,9 @@ import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { AstRegistry } from '../src/ast-adapters.js';
 import { Harness } from '../src/harness.js';
-import { proposeTool } from '../src/propose/tool.js';
-import type { ProposalProvider, ProposalRequest } from '../src/providers/types.js';
 import { builtInTools } from '../src/tools.js';
-import type { DecisionProvider, HarnessEvent, Tool } from '../src/types.js';
+import type { DecisionProvider, Tool } from '../src/types.js';
 import { ScriptedProvider, type Step } from './helpers.js';
 
 async function workspace(t: test.TestContext): Promise<string> {
@@ -197,14 +194,48 @@ test('rejected completion becomes next-turn feedback', async t => {
 
 test('host denial is observed and causes no file mutation', async t => {
   const root = await workspace(t);
+  const order: string[] = [];
   const provider = new ScriptedProvider([
     { action: 'write_file', args: { path: 'a.txt', content: 'x' } },
     { action: 'blocked', args: { summary: 'The host declined the write.' } },
   ]);
-  const result = await new Harness({ experimentalGrid: true, workspace: root, provider, journalDirectory: false, authorize: () => false }).run('Write a file.');
+  const result = await new Harness({ experimentalGrid: true, workspace: root, provider, journalDirectory: false,
+    onEvent: event => { if (event.type === 'decision' || event.type === 'action') order.push(event.type); },
+    authorize: () => { order.push('authorize'); return false; },
+  }).run('Write a file.');
   assert.equal(result.status, 'blocked');
   assert.match(result.records[0]!.result.output, /declined/);
   assert.deepEqual(await readdir(root), []);
+  assert.deepEqual(order.slice(0, 3), ['decision', 'action', 'decision']);
+  assert.ok(order.indexOf('authorize') > order.indexOf('action'));
+  assert.equal(result.requests, provider.states.length);
+});
+
+test('malformed or unavailable action routes fail before authorization or effects', async t => {
+  for (const answer of [
+    { type: 'choice', choice: 'missing', confidence: 1, probabilities: { write_file: 1 } },
+    { type: 'choice', choice: 'write_file', confidence: 1, probabilities: { write_file: 1 }, extra: true },
+  ]) {
+    const root = await workspace(t);
+    let authorizations = 0;
+    let executions = 0;
+    const provider: DecisionProvider = { decide: async () => ({
+      model: 'invalid-route', usage: { input_tokens: 0, output_tokens: 0 }, answers: { selection: answer },
+    }) as never };
+    const tool: Tool = {
+      name: 'write_file', effect: 'write', description: 'Write a file.', fields: {},
+      async execute() { executions++; return { ok: true, output: 'unexpected' }; },
+    };
+    const result = await new Harness({
+      workspace: root, provider, tools: [tool], journalDirectory: false,
+      authorize: () => { authorizations++; return true; },
+    }).run('Write a file.');
+
+    assert.equal(result.status, 'error');
+    assert.equal(authorizations, 0);
+    assert.equal(executions, 0);
+    assert.deepEqual(await readdir(root), []);
+  }
 });
 
 test('new user instructions are included at the next turn', async t => {
@@ -288,7 +319,10 @@ test('custom tools are selectable and enum/boolean fields are constructed', asyn
     if (input.field === 'mode' || input.field === 'flag') {
       const key = input.field === 'mode' ? 'fast' : 'true';
       return { model: 'test', usage: { input_tokens: 0, output_tokens: 0 }, answers: {
-        selection: { type: 'choice', choice: key, confidence: 1, probabilities: { [key]: 1 } },
+        selection: { type: 'choice', choice: key, confidence: 1, probabilities: input.field === 'mode'
+          ? { fast: 1, slow: 0 }
+          : { true: 1, false: 0 },
+        },
       } } as never;
     }
     return base.decide(state, questions, signal);
@@ -362,100 +396,6 @@ test('two consecutive write_files over the same paths trigger the rewrite guard'
   assert.match(third?.progressFeedback ?? '', /rewrote main\.py, pkg\/mod\.py/);
 });
 
-const CANDIDATES = ['def f():\n  return 1\n', 'def f(:\n', 'def f():\n  return 2\n'];
-const fakeProvider = (texts: string[] = CANDIDATES): ProposalProvider & { calls: ProposalRequest[] } => {
-  const calls: ProposalRequest[] = [];
-  return { id: 'fake', model: 'tiny', calls, async generate(req) { calls.push(req); return texts.map(text => ({ text, truncated: false })); } };
-};
-const proposeStep = (candidate = 'C'): Step => ({ action: 'propose', args: { kind: 'file', path: 'x.py', objective: 'f returns 2', constraints: '', count: '3' }, candidate });
-const withPropose = (fake: ProposalProvider): Tool[] => [...builtInTools(), proposeTool(fake, new AstRegistry())];
-
-test('propose runs through the harness: the selection is a journaled candidate decision under the request budget', async t => {
-  const root = await workspace(t);
-  const journals = await workspace(t);
-  const fake = fakeProvider();
-  const provider = new ScriptedProvider([proposeStep(), { action: 'finish', verdict: 1 }]);
-  const events: HarnessEvent[] = [];
-  const result = await new Harness({ workspace: root, provider, tools: withPropose(fake), journalDirectory: journals, onEvent: e => { events.push(e); } }).run('Make f return 2 in x.py.');
-  assert.equal(result.status, 'completed', result.summary);
-  assert.ok(events.some(e => e.type === 'action' && e.data.tool === 'propose'));
-  assert.ok(events.some(e => e.type === 'tool_start' && e.data.tool === 'propose'));
-  const picks = events.flatMap(e => e.type === 'decision' && e.data.field === 'candidate' ? [e.data] : []);
-  assert.equal(picks.length, 1);
-  assert.equal(picks[0]!.choice, 'C');
-  assert.equal(picks[0]!.phase, 'propose');
-  const journal = (await readFile(join(journals, `${result.id}.jsonl`), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as HarnessEvent);
-  assert.ok(journal.some(e => e.type === 'decision' && e.data.field === 'candidate' && e.data.choice === 'C'));
-  const end = events.find(e => e.type === 'tool_end' && e.data.tool === 'propose');
-  assert.ok(end && end.type === 'tool_end');
-  assert.equal(end.data.result.ok, true);
-  assert.equal(end.data.result.data?.selected, 'C');
-  assert.equal(await readFile(join(root, 'x.py'), 'utf8'), CANDIDATES[2]);
-  assert.equal(fake.calls.length, 1);
-  assert.equal(fake.calls[0]!.count, 3);
-  const decisions = events.filter(e => e.type === 'decision');
-  assert.equal(result.requests, decisions.length);
-  const firstTurn = result.turnTimings[0]!.requests;
-  assert.equal(firstTurn, decisions.filter(e => e.turn === 1).length);
-  const limited = await new Harness({ workspace: await workspace(t), provider: new ScriptedProvider([proposeStep(), { action: 'finish', verdict: 1 }]), tools: withPropose(fakeProvider()),
-    maxRequests: firstTurn - 1, journalDirectory: false }).run('Make f return 2 in x.py.');
-  assert.equal(limited.status, 'limited');
-  assert.equal(limited.requests, firstTurn - 1);
-  assert.ok(!limited.records.some(record => record.tool === 'propose'));
-});
-
-test('two consecutive file proposes to the same path trigger the rewrite guard', async t => {
-  const root = await workspace(t);
-  const provider = new ScriptedProvider([proposeStep(), proposeStep('A'), { action: 'bash', args: { command: 'python3 x.py', cwd: '.', timeout_ms: '' } }, { action: 'finish', verdict: 1 }]);
-  const result = await new Harness({ workspace: root, provider, tools: withPropose(fakeProvider()), journalDirectory: false }).run('Make f return 2.');
-  assert.equal(result.status, 'completed', result.summary);
-  assert.ok(result.records.filter(record => record.tool === 'propose').every(record => record.result.ok));
-  assert.equal(await readFile(join(root, 'x.py'), 'utf8'), CANDIDATES[0]);
-  assert.deepEqual(provider.actions.find(a => a.turn === 3)?.offered, ['bash', 'finish', 'blocked']);
-  const third = provider.states.find(state => state.task.turn === 3 && !state.generation && !state.field) as { progressFeedback?: string } | undefined;
-  assert.match(third?.progressFeedback ?? '', /rewrote x\.py without running it/);
-});
-
-test('two consecutive rejected proposes with the same request remove propose for a turn', async t => {
-  const root = await workspace(t);
-  const provider = new ScriptedProvider([proposeStep('reject'), proposeStep('reject'), { action: 'finish', verdict: 1 }]);
-  const result = await new Harness({ workspace: root, provider, tools: withPropose(fakeProvider()), journalDirectory: false }).run('Make f return 2.');
-  assert.equal(result.status, 'completed', result.summary);
-  assert.ok(!provider.actions.find(a => a.turn === 3)?.offered.includes('propose'));
-  const third = provider.states.find(state => state.task.turn === 3 && !state.generation && !state.field) as { progressFeedback?: string } | undefined;
-  assert.match(third?.progressFeedback ?? '', /propose is unavailable for this turn/);
-});
-
-test('maxProposals bounds the run and the second propose fails without calling the provider', async t => {
-  const root = await workspace(t);
-  const fake = fakeProvider();
-  const provider = new ScriptedProvider([proposeStep(), proposeStep(), { action: 'finish', verdict: 1 }]);
-  const result = await new Harness({ workspace: root, provider, tools: withPropose(fake), maxProposals: 1, journalDirectory: false }).run('Make f return 2.');
-  assert.equal(result.status, 'completed', result.summary);
-  const [first, second] = result.records.filter(record => record.tool === 'propose');
-  assert.equal(first?.result.ok, true);
-  assert.equal(second?.result.ok, false);
-  assert.match(second?.result.output ?? '', /write_file/);
-  assert.equal(fake.calls.length, 1);
-  assert.throws(() => new Harness({ workspace: root, provider, maxProposals: 0 }), /maxProposals/);
-});
-
-test('aborting while the provider generates cancels the run without a propose tool_end', async t => {
-  const root = await workspace(t);
-  const ctrl = new AbortController();
-  const fake: ProposalProvider = { id: 'fake', model: 'tiny', generate: (_req, signal) => new Promise((_resolve, reject) => {
-    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-    ctrl.abort(new Error('Stop now.'));
-  }) };
-  const provider = new ScriptedProvider([proposeStep(), { action: 'finish', verdict: 1 }]);
-  const events: HarnessEvent[] = [];
-  const result = await new Harness({ workspace: root, provider, tools: withPropose(fake), journalDirectory: false, onEvent: e => { events.push(e); } }).run('Make f return 2.', ctrl.signal);
-  assert.equal(result.status, 'cancelled');
-  assert.ok(events.some(e => e.type === 'tool_start' && e.data.tool === 'propose'));
-  assert.ok(!events.some(e => e.type === 'tool_end' && e.data.tool === 'propose'));
-  assert.deepEqual(await readdir(root), []);
-});
-
 test('an identical call that failed twice removes its tool until another action is taken', async t => {
   const root = await workspace(t);
   const scripted = new ScriptedProvider([
@@ -477,25 +417,4 @@ test('an identical call that failed twice removes its tool until another action 
   const result = await new Harness({ experimentalGrid: true, workspace: root, provider, journalDirectory: false }).run('What is in missing.py?');
   assert.equal(result.status, 'completed');
   assert.match(feedback[0] ?? '', /read_file .*failed 2 times/);
-});
-
-test('loop recovery uses Jev-selected routing arguments and still requires authorization', async t => {
-  const root = await workspace(t);
-  let ran = false;
-  const observed: Array<Record<string, unknown>> = [];
-  const tools: Tool[] = [
-    { name: 'inspect', description: 'Inspect evidence.', effect: 'read', fields: {}, execute: async () => ({ ok: true, output: 'unchanged' }) },
-    { name: 'advance', description: 'Verify the missing requirement.', effect: 'shell', fields: { command: { type: 'string', description: 'Command.' } }, execute: async () => { ran = true; return { ok: true, output: 'done' }; } },
-  ];
-  const base = new ScriptedProvider([{ action: 'inspect' }, { action: 'inspect' }, { action: 'option_0' }]);
-  const generationProvider: ProposalProvider = { id: 'test', model: 'test', generate: async () => [{ text: JSON.stringify([{ tool: 'advance', objective: 'Check the remaining requirement', args: { command: 'verify' } }]), truncated: false }] };
-  const result = await new Harness({ workspace: root, provider: base, generationProvider, tools, journalDirectory: false,
-    maxTurns: 3, authorize: async (tool, args) => { if (tool.name === 'advance') { observed.push(args); return false; } return true; },
-  }).run('Inspect then verify.');
-  assert.equal(result.status, 'limited');
-  assert.deepEqual(observed, [{ command: 'verify' }]);
-  assert.equal(ran, false);
-  assert.equal(result.records.at(-1)?.tool, 'advance');
-  assert.equal(result.records.at(-1)?.result.ok, false);
-  assert.ok(base.states.some(s => s.generation?.phase === 'action_map'));
 });

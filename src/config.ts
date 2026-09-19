@@ -2,27 +2,20 @@ import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import type { AuthMethod } from './providers/types.js';
 import { isInteractiveTTY } from './terminal-style.js';
 
-export interface Generation { provider: string; model?: string; auth?: AuthMethod; baseUrl?: string | null }
-export interface Config { apiKey?: string; generation?: Generation }
+export interface Config { apiKey?: string }
 
 export const configDir = (env: NodeJS.ProcessEnv = process.env): string =>
   env.JEV_CODE_CONFIG_DIR ?? join(env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'jev-code');
 export const configPath = (env: NodeJS.ProcessEnv = process.env): string => join(configDir(env), 'config.json');
 
-const isGeneration = (val: unknown): val is Generation =>
-  !!val && typeof val === 'object' && typeof (val as Record<string, unknown>).provider === 'string';
-
 export async function readConfig(env: NodeJS.ProcessEnv = process.env): Promise<Config> {
   try {
     const parsed = JSON.parse(await readFile(configPath(env), 'utf8')) as unknown;
     if (!parsed || typeof parsed !== 'object') return {};
-    const { apiKey, generation } = parsed as Record<string, unknown>;
-    const cfg: Config = typeof apiKey === 'string' && apiKey ? { apiKey } : {};
-    if (isGeneration(generation)) cfg.generation = generation;
-    return cfg;
+    const { apiKey } = parsed as Record<string, unknown>;
+    return typeof apiKey === 'string' && apiKey ? { apiKey } : {};
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {};
     throw err;

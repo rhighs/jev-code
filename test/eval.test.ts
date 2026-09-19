@@ -170,7 +170,7 @@ test('runner rejects an unknown task name', async t => {
 
 test('cli eval with an unknown task exits nonzero with a one-line error', async () => {
   const run = promisify(execFile);
-  await assert.rejects(run('npx', ['tsx', resolve('src/cli.ts'), 'eval', 'no-such-task'], { cwd: resolve('.'), env: { ...process.env, TYPESAFE_API_KEY: 'x' } }),
+  await assert.rejects(run(resolve('node_modules/.bin/tsx'), [resolve('src/cli.ts'), 'eval', 'no-such-task'], { cwd: resolve('.'), env: { ...process.env, TYPESAFE_API_KEY: 'x' } }),
     (err: Error & { code?: unknown; stderr?: string }) => err.code === 1 && /no-such-task/.test(err.stderr ?? ''));
 });
 
@@ -203,6 +203,6 @@ test('cli eval compare prints the comparison table for two record files', async 
   await writeFile(join(dir, 'a.json'), JSON.stringify([record('a', false, 100, 30_000)]));
   await writeFile(join(dir, 'b.json'), JSON.stringify([record('a', true, 80, 20_000)]));
   const run = promisify(execFile);
-  const { stdout } = await run('npx', ['tsx', resolve('src/cli.ts'), 'eval', 'compare', join(dir, 'a.json'), join(dir, 'b.json')], { cwd: resolve('.') });
+  const { stdout } = await run(resolve('node_modules/.bin/tsx'), [resolve('src/cli.ts'), 'eval', 'compare', join(dir, 'a.json'), join(dir, 'b.json')], { cwd: resolve('.') });
   assert.match(stdout, /\| a \| fail → pass \| 100 → 80 \(-20\) \|/);
 });

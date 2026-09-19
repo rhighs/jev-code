@@ -61,7 +61,6 @@ const target = (tool: string, args: ToolRecord['args'], data?: Record<string, un
   if (tool === 'bash') return str(args.command);
   if (tool === 'write_files') return Array.isArray(data?.paths) ? `${data.paths.length} files` : '';
   if (tool === 'set_plan') return 'plan';
-  if (tool === 'propose') return args.kind === 'file' ? str(args.path) : 'text';
   return str(args.path);
 };
 
@@ -72,7 +71,6 @@ const body = (record: ToolRecord, streamed: string): Body => {
     return { kind: 'source', path: str(args.path), lines: head, remaining, hint: `/show ${str(args.path)}` };
   }
   if (result.ok && tool === 'edit_file') return { kind: 'diff', path: str(args.path), hunk: diffLines(str(args.old_text), str(args.new_text)) };
-  if (result.ok && tool === 'propose' && args.kind === 'file' && Array.isArray(result.data?.hunk)) return { kind: 'diff', path: str(args.path), hunk: result.data.hunk as DiffLine[] };
   if (result.ok && tool === 'write_files') {
     const { head, remaining } = clip(Array.isArray(result.data?.paths) ? result.data.paths as string[] : [], PATH_LINES);
     return { kind: 'paths', paths: head, remaining };
@@ -84,7 +82,6 @@ const body = (record: ToolRecord, streamed: string): Body => {
 const writtenPaths = (record: ToolRecord): string[] => {
   if (!record.result.ok) return [];
   if (['write_file', 'edit_file'].includes(record.tool) && typeof record.args.path === 'string') return [record.args.path];
-  if (record.tool === 'propose' && record.args.kind === 'file' && typeof record.args.path === 'string') return [record.args.path];
   if (record.tool === 'write_files' && Array.isArray(record.result.data?.paths)) return record.result.data.paths as string[];
   return [];
 };
