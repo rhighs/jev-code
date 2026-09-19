@@ -22,6 +22,24 @@ test('score rejects answers without probabilities or with levels outside the rub
   await assert.rejects(decisions(provider({ type: 'choice', choice: '3', confidence: 1, probabilities: { '3': 1 } })).score({}, 'rate', levels), DecisionError);
 });
 
+test('compatibility choices reject incomplete and non-normalized distributions', async () => {
+  await assert.rejects(decisions(provider({ type: 'choice', choice: 'a', confidence: 1, probabilities: { a: 1 } })).choose({}, 'pick', { a: 'A', b: 'B' }), DecisionError);
+  await assert.rejects(decisions(provider({ type: 'choice', choice: 'a', confidence: 1, probabilities: { a: 0.4, b: 0.4 } })).choose({}, 'pick', { a: 'A', b: 'B' }), DecisionError);
+});
+
+test('compatibility state projection omits optional undefined values without bypassing strict JSON validation', async () => {
+  let observed: EntryType | undefined;
+  const recording: DecisionProvider = {
+    decide: async <Q extends Questions>(state: EntryType, questions: Q) => {
+      observed = state;
+      return provider({ type: 'noul', noul: 1 }).decide(state, questions);
+    },
+  };
+  await decisions(recording).probability({ optional: undefined, nested: { present: true, missing: undefined } }, 'ready?');
+  assert.deepEqual(observed, { nested: { present: true } });
+  await assert.rejects(decisions(recording).probability({ invalid: Number.NaN }, 'ready?'), /JSON-compatible/);
+});
+
 test('a request queued behind the in-flight cap rejects when the shared signal aborts', async () => {
   const ctrl = new AbortController();
   const hanging: DecisionProvider = { decide: (_state, _questions, signal) => new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })) };

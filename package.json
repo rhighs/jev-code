@@ -2,8 +2,10 @@
   "name": "jev-code",
   "version": "0.1.0",
   "private": true,
-  "description": "A turn-based coding harness built from Jev decisions.",
+  "description": "Typed Jev decisions, routing, programs, and validated formal trees.",
   "type": "module",
+  "types": "./dist/index.d.ts",
+  "main": "./dist/index.js",
   "engines": {
     "node": ">=22"
   },
@@ -11,14 +13,26 @@
     "jev-code": "dist/cli.js"
   },
   "exports": {
-    ".": "./dist/index.js"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
+  "files": [
+    "dist/",
+    "docs/sdk.md",
+    "examples/router.ts",
+    "examples/dependency-tree.ts",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
-    "test": "tsx --test test/*.test.ts test/*.test.tsx"
+    "test": "tsx --test test/*.test.ts test/*.test.tsx",
+    "test:package": "tsx --test test/package-contract.contract.ts",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@typesafe-ai/sdk": "^0.6.0",

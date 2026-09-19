@@ -1,10 +1,6 @@
-import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import type { TextProgress, TextChange } from './grid.js';
-
-/** Implement this interface to replace Jev with a deterministic test driver. */
-export interface DecisionProvider {
-  decide<Q extends Questions>(state: EntryType, questions: Q, signal?: AbortSignal): Promise<SystemOneResult<Q>>;
-}
+export { DecisionError, LimitError } from './sdk/types.js';
+export type { DecisionProvider } from './sdk/types.js';
 
 export type Field = {
   description: string;
@@ -26,8 +22,6 @@ export interface ToolContext {
   signal: AbortSignal;
   resolvePath(path: string): Promise<string>;
   onOutput?: (stream: 'stdout' | 'stderr', text: string) => Promise<void>;
-  select?(instruction: string, criteria: Record<string, string>, extra: Record<string, unknown>): Promise<{ choice: string; confidence: number }>;
-  proposals?: { used: number; max: number };
   assertRequests?(count: number): void;
 }
 
@@ -107,6 +101,3 @@ interface EventMetadata {
   turn: number;
 }
 export type HarnessEvent = { [K in keyof HarnessEventData]: EventMetadata & { type: K; data: HarnessEventData[K] } }[keyof HarnessEventData];
-
-export class LimitError extends Error {}
-export class DecisionError extends Error {}

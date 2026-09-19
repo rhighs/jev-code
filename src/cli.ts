@@ -17,11 +17,6 @@ import { runDecide } from './decide.js';
 import { NO_KEY, configPath, promptSecret, readConfig, resolveApiKey, writeConfig } from './config.js';
 import { MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
 import { checkSchema, findJournal, readJournal, replayPlain } from './replay.js';
-import { spawn } from 'node:child_process';
-import { sanitizedEnv } from './env.js';
-import { providerFromConfig } from './providers/index.js';
-import { proposeTool } from './propose/tool.js';
-import { pick, providerCommand, wizard } from './providers/setup.js';
 import type { HarnessOptions } from './harness.js';
 import type { Tool } from './types.js';
 
@@ -43,7 +38,6 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
   --concurrency <n>       In-flight Jev requests shared by parallel units and grids (default: 4, max: 16)
   --search-width <n>      Candidates generated per Python unit; the best survivor is kept (default: 1, max: 8)
   --timeout-ms <n>         Total run time (default: ${DEFAULT_LIMITS.maxRunMs})
-  --max-proposals <n>      Generator proposals per run (default: ${DEFAULT_LIMITS.maxProposals})
   --tools <module>        Load additional tools exported as a tools array
   --asts <module>         Load AST adapters for this session (repeatable)
   --experimental-grid    Opt into character-grid fallback (slow/unreliable)
@@ -60,7 +54,6 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
     --json                    Print each decide answer as a decision event; failures exit 125
   login                   Enter your typesafe.ai API key and save it under ~/.config/jev-code
   logout                  Forget the saved API key
-  provider login|logout|list|models|use  Configure the generation provider behind the propose tool
   replay <run-id>         Render a saved .jev/runs or .jev/eval journal through the transcript
     --speed <x>               Pace events at x times real time (default: instant; gaps capped at 2 s)
     --plain                   Print cards as text instead of the Ink view
@@ -121,12 +114,6 @@ async function readStdin(limit: number): Promise<string> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-const openBrowser = (url: string): Promise<void> => new Promise(resolve => {
-  const child = spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [url], { stdio: 'ignore', detached: true, env: sanitizedEnv() });
-  child.on('error', () => resolve());
-  child.on('spawn', () => { child.unref(); resolve(); });
-});
-
 const KEY_PROMPT = 'Paste your typesafe.ai API key (saved to ~/.config/jev-code/config.json): ';
 
 async function ensureApiKey(interactive: boolean): Promise<void> {
@@ -154,7 +141,7 @@ async function main(): Promise<void> {
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   if (process.argv[2] === 'login') return login();
   if (process.argv[2] === 'logout') return logout();
-  if (process.argv[2] === 'provider') { process.exitCode = await providerCommand(process.argv.slice(3), { out: process.stdout, stdin: process.stdin, open: openBrowser }); return; }
+  if (process.argv[2] === 'provider') throw new Error('Unknown command: provider.');
   if (process.argv[2] === 'decide') {
     try { await ensureApiKey(false); }
     catch (error) { process.stderr.write(`decide: ${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 125; return; }
@@ -171,7 +158,7 @@ async function main(): Promise<void> {
     print: { type: 'boolean', short: 'p' },
     yes: { type: 'boolean' }, 'confirm-writes': { type: 'boolean' }, 'allow-outside': { type: 'boolean' },
     'max-turns': { type: 'string' }, 'max-requests': { type: 'string' }, 'max-steps': { type: 'string' },
-    'timeout-ms': { type: 'string' }, 'grid-batch-size': { type: 'string' }, concurrency: { type: 'string' }, 'search-width': { type: 'string' }, 'max-proposals': { type: 'string' }, tools: { type: 'string' }, json: { type: 'boolean' },
+    'timeout-ms': { type: 'string' }, 'grid-batch-size': { type: 'string' }, concurrency: { type: 'string' }, 'search-width': { type: 'string' }, tools: { type: 'string' }, json: { type: 'boolean' },
     'experimental-grid': { type: 'boolean' }, asts: { type: 'string', multiple: true }, 'no-journal': { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
     'eval-out': { type: 'string' },
   } });
@@ -199,8 +186,7 @@ async function main(): Promise<void> {
     process.stderr.write('eval runs unattended: agent Bash executes on this host without confirmation.\n');
     const width = values['search-width'];
     if (width !== undefined && !/^[1-8]$/.test(width)) throw new Error('--search-width must be 1–8.');
-    const generator = await providerFromConfig(process.env, line => process.stderr.write(`${line}\n`));
-    const records = await runEval({ ...(generator ? { generationProvider: generator } : {}), provider: new JevProvider(), out: resolve(values['eval-out'] ?? '.'), ...(only === undefined ? {} : { only }), searchWidth: width === undefined ? 1 : Number(width),
+    const records = await runEval({ provider: new JevProvider(), out: resolve(values['eval-out'] ?? '.'), ...(only === undefined ? {} : { only }), searchWidth: width === undefined ? 1 : Number(width),
       onRecord: r => process.stdout.write(`${r.task}\t${r.check.ok ? 'pass' : 'fail'}\t${r.status}\t${r.turns} turns\t${r.requests} requests\t${formatDuration(r.durationMs)}\t${r.check.reason}\n`) });
     process.exitCode = records.every(r => r.check.ok) ? 0 : 1;
     return;
@@ -221,7 +207,7 @@ async function main(): Promise<void> {
     if (!Array.isArray(module.tools)) throw new Error('Tool module must export a tools array.');
     extraTools.push(...module.tools);
   }
-  const limit = (name: 'max-turns' | 'max-requests' | 'max-steps' | 'timeout-ms' | 'grid-batch-size' | 'concurrency' | 'search-width' | 'max-proposals', fallback: number): number => {
+  const limit = (name: 'max-turns' | 'max-requests' | 'max-steps' | 'timeout-ms' | 'grid-batch-size' | 'concurrency' | 'search-width', fallback: number): number => {
     const raw = values[name];
     if (raw !== undefined && !/^\d+$/.test(raw)) throw new Error(`--${name} must be a positive integer.`);
     const value = raw === undefined ? fallback : Number(raw);
@@ -229,25 +215,15 @@ async function main(): Promise<void> {
     return value;
   };
   await ensureApiKey(tty);
-  const cfg = interactive && tty ? await readConfig() : undefined;
-  if (cfg && !cfg.generation) {
-    const io = { out: process.stderr, stdin: process.stdin, open: openBrowser };
-    const i = await pick('Configure a generation provider for propose?', ['Yes', 'Not now'], io);
-    if (i === 0) await wizard(io).catch((err: unknown) => process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`));
-    else if (i === 1) await writeConfig({ ...cfg, generation: { provider: 'none' } });
-  }
   const asts = [...await loadInstalledAsts(workspace), ...(await Promise.all((values.asts ?? []).map(module => loadAstModule(workspace, module)))).flat()];
-  const generator = await providerFromConfig(process.env, line => process.stderr.write(`${line}\n`));
-  const propose = generator ? [proposeTool(generator, new AstRegistry(asts))] : [];
   const provider = new JevProvider();
   const harnessOptions: Omit<HarnessOptions, 'onEvent' | 'authorize'> = {
-    ...(generator ? { generationProvider: generator } : {}),
-    workspace, provider, tools: [...builtInTools(), ...extraTools, ...propose],
+    workspace, provider, tools: [...builtInTools(), ...extraTools],
     experimentalGrid: values['experimental-grid'] ?? false,
     astAdapters: asts,
     maxTurns: limit('max-turns', DEFAULT_LIMITS.maxTurns), maxRequests: limit('max-requests', DEFAULT_LIMITS.maxRequests), maxGenerationSteps: limit('max-steps', DEFAULT_LIMITS.maxGenerationSteps),
     maxRunMs: limit('timeout-ms', DEFAULT_LIMITS.maxRunMs), allowOutsideWorkspace: values['allow-outside'] ?? false,
-    gridBatchSize: limit('grid-batch-size', 8), concurrency: limit('concurrency', 4), searchWidth: limit('search-width', 1), maxProposals: limit('max-proposals', DEFAULT_LIMITS.maxProposals),
+    gridBatchSize: limit('grid-batch-size', 8), concurrency: limit('concurrency', 4), searchWidth: limit('search-width', 1),
     ...(values['no-journal'] ? { journalDirectory: false as const } : {}),
   };
   if (interactive) {

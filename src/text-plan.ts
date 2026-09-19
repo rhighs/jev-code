@@ -22,7 +22,7 @@ export async function planText(decisions: Decisions, state: State, field: string
   if (field === 'cwd') return select(['.'], 'Choose the Bash working directory; . means the selected workspace.');
   if (field === 'path') {
     const candidates = [...taskFiles];
-    if (state.action !== 'write_file' && state.action !== 'propose') {
+    if (state.action !== 'write_file') {
       if (state.action === 'list_files') candidates.push('.');
       candidates.push(...files);
       return select(candidates, 'Choose an existing path named by the task or listed in the workspace.');

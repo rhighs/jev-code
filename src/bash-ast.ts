@@ -1,11 +1,12 @@
 import { spawn } from 'node:child_process';
-import type { Decisions, State } from './decisions.js';
+import { jsonState, type Decisions, type State } from './decisions.js';
 import type { GenerateOptions } from './generation.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
 import { gridCursor } from './grid.js';
 import { sanitizedEnv } from './env.js';
 import { LimitError } from './types.js';
 import { choice } from '@typesafe-ai/sdk';
+import { complete, runTree, slot, type ProgramRunOutcome } from './sdk/index.js';
 
 export type BashAst = { type: 'command'; program: string; args: string[]; redirects: Array<{ operator: '>' | '>>' | '<'; path: string }> }
   | { type: 'binary'; operator: '|' | '&&' | '||' | ';'; left: BashAst; right: BashAst }
@@ -30,6 +31,14 @@ export async function validateBashSource(source: string, signal: AbortSignal): P
     child.on('close', code => { if (signal.aborted) reject(signal.reason); else if (code === 0) resolve(); else reject(new Error(`Bash AST syntax validation failed: ${error || `exit ${code}`}`)); });
   });
 }
+
+function completedTreeValue<Value>(outcome: ProgramRunOutcome<Value>): Value {
+  if (outcome.status === 'completed') return outcome.value;
+  if (outcome.status === 'exhausted') throw new LimitError('Bash AST production selection exhausted its run budget.', { evidence: outcome.evidence });
+  if (outcome.status === 'failed') throw outcome.error;
+  throw new Error(outcome.detail);
+}
+
 export async function generateBashAst(decisions: Decisions, state: State, field: string, options: GenerateOptions): Promise<string> {
   const context = compactContext(state);
   const task = state.task as { prompt?: string; updates?: string[] } | undefined;
@@ -50,22 +59,45 @@ export async function generateBashAst(decisions: Decisions, state: State, field:
   }
   let step = 0;
   let tree: BashAst | undefined;
-  async function pick(slot: string, criteria: Record<string, string>, tokens?: string[]): Promise<string> {
+  const prepareSelection = (slot: string, criteria: Record<string, string>, tokens: string[] = [], partialAst: BashAst | null = tree ?? null) => {
     if (++step > Math.min(options.maxSteps, 96)) throw new LimitError('Bash AST production budget exhausted.');
     decisions.signal.throwIfAborted();
-    const input = { ...context, generation: { field, phase: 'bash_ast', slot, partialAst: tree ?? null, tokens: tokens ?? [] } };
+    const input = jsonState({ ...context, generation: { field, phase: 'bash_ast', slot, partialAst, tokens } });
     const instruction = `Choose a valid Bash AST production for ${slot}. Follow the objective, use real files and the shortest correct command. Arguments are literal words rendered with shell quoting. Finish when the command is complete.`;
     if (Buffer.byteLength(JSON.stringify({ state: input, questions: { selection: choice(instruction, criteria) } })) > MAX_GRID_REQUEST_BYTES) throw new LimitError('Bash AST decision exceeds the request budget.');
-    const keys = Object.keys(criteria);
-    const selected = keys.length === 1 ? keys[0]! : await decisions.choose(input, instruction, criteria);
-    const preview = tree ? renderBashAst(tree) : '';
+    return { slot, criteria, input, instruction };
+  };
+  const reportSelection = async (slot: string, selected: string, preview: string): Promise<void> => {
     await options.onText?.(field, preview, false, { replace: preview }, { decoder: 'ast', step, cursor: gridCursor(preview), bytes: Buffer.byteLength(preview), ast: { slot, production: selected, symbols: [] } });
+  };
+  async function pick(slot: string, criteria: Record<string, string>, tokens?: string[]): Promise<string> {
+    const request = prepareSelection(slot, criteria, tokens);
+    const keys = Object.keys(criteria);
+    const selected = keys.length === 1 ? keys[0]! : await decisions.choose(request.input, request.instruction, criteria);
+    const preview = tree ? renderBashAst(tree) : '';
+    await reportSelection(slot, selected, preview);
     return selected;
   }
   const plansCriteria: Record<string, string> = { compose: 'Compose a new command tree from program, argument, redirect and operator productions.' };
   plans.slice(0, 200).forEach((plan, index) => { plansCriteria[`plan_${index}`] = renderBashAst(plan); });
-  const plan = await pick('plan', plansCriteria);
-  if (plan !== 'compose') tree = plans[Number(plan.slice(5))]!;
+  const planRequest = prepareSelection('plan', plansCriteria, [], null);
+  const root = slot<State, { id: string; tree?: BashAst }>({
+    id: 'bash-plan',
+    description: 'the root Bash command plan',
+    productions: Object.entries(plansCriteria).map(([id, description]) => complete(id, description, () => ({
+      id,
+      ...(id === 'compose' ? {} : { tree: plans[Number(id.slice(5))]! }),
+    }))),
+  });
+  const planOutcome = await runTree(root, state, {
+    session: decisions.publicSession(planRequest.input),
+    state: () => planRequest.input,
+    instructions: () => planRequest.instruction,
+  });
+  decisions.signal.throwIfAborted();
+  const selectedPlan = completedTreeValue(planOutcome);
+  await reportSelection('plan', selectedPlan.id, '');
+  if (selectedPlan.id !== 'compose') tree = selectedPlan.tree!;
   else {
     const words = objective.match(/[\p{L}\p{N}_./=-]+/gu) ?? [];
     const literals = [...objective.matchAll(/"([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`/g)].map(match => match[1] ?? match[2] ?? match[3]!);

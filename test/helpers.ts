@@ -60,7 +60,7 @@ export class SlotProvider implements DecisionProvider {
   }
 }
 
-export interface Step { action: string; args?: Record<string, string>; verdict?: number; allowInvalidSyntax?: boolean; candidate?: string }
+export interface Step { action: string; args?: Record<string, string>; verdict?: number; allowInvalidSyntax?: boolean }
 export interface TestState {
   task: { turn: number; prompt: string; updates: string[] };
   generation?: { field: string; phase: string; syntax?: unknown[]; draft?: string; tokens?: Array<{ key: string; value: string }>; grid?: { columns: number; capacity: number; alphabet: Array<{ key: string; value: string }> } };
@@ -92,7 +92,6 @@ export class ScriptedProvider implements DecisionProvider {
       if (!state.generation && !state.completionCheck && !state.field) this.actions.push({ turn: state.task.turn, offered: Object.keys(question.criteria) });
       if (state.completionCheck) selected = (step.verdict ?? 1) >= 0.5 ? 'complete' : 'continue';
       if (state.generation?.phase.startsWith('plan')) selected = 'free';
-      if (state.generation?.phase === 'propose') selected = step.candidate ?? 'reject';
       if (!state.generation && state.field && !state.completionCheck && !Object.hasOwn(question.criteria, 'default') && !Object.hasOwn(question.criteria, 'custom')) {
         const value = step.args?.[state.field];
         if (value !== undefined && Object.hasOwn(question.criteria, value)) selected = value;
