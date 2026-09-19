@@ -58,7 +58,7 @@ The interactive session is a transcript of cards. Each tool call is one card: a 
 
 `decide` uses the same model on standard input. A shell script can branch on the exit code without parsing.
 
-jev-code is a hybrid. Jev is the only policy. With a generation provider configured, `write_file` asks the LLM to map a source task into meaningful subproblems and compatible code options. Jev approves the map, chooses implementations, and reviews the assembled program. Language validators check it before writing; the harness then runs applicable verification. The LLM proposes structure and code but cannot approve a plan, choose tools, write files, or end a run. `propose` remains available for explanations and other file formats. See PROVIDERS.
+jev-code is a hybrid. Jev is the only policy. With a generation provider configured, `write_file` and Python `write_files` ask the LLM to map a source task into meaningful subproblems and compatible code options. Jev approves the map, chooses implementations, and reviews the assembled program. Language validators check it before writing; the harness then runs applicable verification. The LLM proposes structure and code but cannot approve a plan, choose tools, write files, or end a run. `propose` remains available for explanations and other file formats. See PROVIDERS.
 
 ## FIRST RUN
 
@@ -165,7 +165,10 @@ Model:
 
 Use small, cheap, fast models. The generator only writes candidates; Jev does the judging. API keys are the supported path. OAuth with a consumer subscription is a convenience the vendor can withdraw; jev-code shows that in the picker label. Google OAuth is not implemented.
 
-For a source file with a registered language adapter, `write_file` uses a program map: at most eight steps, each with one to three code options explained in task terms. For Fibonacci, the decisions concern the starting pair, advancing the sequence, and printing the requested count—not choosing AST nodes. Jev can reject the map or any piece, triggering a bounded remap. Each piece is at most 2 KB, and every candidate combination considered by Jev passes the language adapter's source check. Without a provider, the existing grammar builder remains available. `write_files` still uses its existing project builder.
+For a source file with a registered language adapter, `write_file` uses a program map: at most eight steps, each with one to three code options explained in task terms. For Fibonacci, the decisions concern the starting pair, advancing the sequence, and printing the requested count—not choosing AST nodes. Jev can reject the map or any piece, triggering a bounded remap. Each piece is at most 2 KB, and every candidate combination considered by Jev passes the language adapter's source check. Without a provider, the existing grammar builders remain available. `write_files` uses maps with a destination path per step and validates the assembled Python project, including local imports. Existing single-file rewrites load the destination source (up to 16 KB) and preserve behavior unrelated to the requested change.
+
+If tool calls repeat without progress, the same provider proposes concrete next actions with paths or commands. Jev selects or rejects them; ordinary permissions still apply. Recovery cannot supply source contents directly and shares the proposal budget.
+
 
 The Python prompt “a simple python fibonaci program writing the first 10” completed in a live run on September 19, 2026: 3 turns, 13 Jev requests, about 20 seconds, and output `0 1 1 2 3 5 8 13 21 34`. This is a smoke test, not a general benchmark.
 

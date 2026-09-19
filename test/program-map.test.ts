@@ -136,3 +136,40 @@ test('mapping receives bounded recent file context when rewriting an existing fi
     recent: [{ tool: 'read_file', args: { path: 'main.py' }, result: { ok: true, output: 'a, b = 0, 1\n' + 'x'.repeat(10_000) } }],
   }, 'content', { ...options, mapper: { provider: gen, budget: { used: 0, max: 3 } } });
 });
+
+test('write_files maps cross-file work without entering grammar decisions', async () => {
+  const project = { goal: 'Print Fibonacci from a reusable module.', checks: ['main.py prints the first ten values.'], steps: [
+    { path: 'fib.py', intent: 'Provide the sequence function', requires: [], provides: ['fib.fibonacci'], options: [{ meaning: 'Build a sequence of the requested length', code: 'def fibonacci(n):\n    a, b = 0, 1\n    result = []\n    for _ in range(n):\n        result.append(a)\n        a, b = b, a + b\n    return result' }] },
+    { path: 'main.py', intent: 'Print the requested sequence', requires: ['fib.fibonacci'], provides: [], options: [{ meaning: 'Call the reusable function with ten', code: 'from fib import fibonacci\nprint(*fibonacci(10))' }] },
+  ] };
+  const policy = approved(), gen = generator(() => project);
+  const result = await generateText(new Decisions(policy, 20, new AbortController().signal), { task: { prompt: 'Create fib.py and main.py in Python.' }, action: 'write_files' }, 'files', 'manifest', { ...options, mapper: { provider: gen, budget: { used: 0, max: 3 } } });
+  const files = JSON.parse(result) as Record<string, string>;
+  assert.deepEqual(Object.keys(files), ['fib.py', 'main.py']);
+  assert.match(files['main.py']!, /from fib import fibonacci/);
+  assert.equal(gen.calls, 1);
+  assert.equal(policy.states.some(s => s.generation?.phase === 'ast'), false);
+});
+
+test('map steps reject unsafe destination paths before compilation', () => {
+  const unsafe = structuredClone(map);
+  Object.assign(unsafe.steps[0]!, { path: '../outside.py' });
+  assert.throws(() => parseMap(JSON.stringify(unsafe)), /path/i);
+});
+
+test('mapped rewrites load the actual destination source and scope the generator to its final contents', async () => {
+  let seen = false;
+  const source = 'a, b = 0, 1\n';
+  const gen: ProposalProvider = { id: 'test', model: 'test', generate: async req => {
+    const context = JSON.parse(req.current!);
+    assert.equal(context.observations.existingSource, source);
+    assert.equal(context.observations.arguments.path, 'main.py');
+    assert.match(req.constraints, /actual final contents of the destination/);
+    seen = true;
+    return [{ text: JSON.stringify(map), truncated: false }];
+  } };
+  await generateMappedProgram(adapter, new Decisions(approved(), 20, new AbortController().signal), state, 'content', {
+    ...options, mapper: { provider: gen, budget: { used: 0, max: 1 }, readSource: async path => { assert.equal(path, 'main.py'); return source; } },
+  });
+  assert.equal(seen, true);
+});

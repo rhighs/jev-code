@@ -48,7 +48,9 @@ export async function generateText(decisions: Decisions, state: State, field: st
     const registry = options.astRegistry ?? defaultAsts;
     const adapter = [registry.resolve(state), ...registry.list()].find(candidate => candidate?.generateProject && candidate.validateProject);
     if (!adapter) throw new Error('No AST adapter can generate a multi-file project.');
-    const manifest = await adapter.generateProject!(decisions, state, field, { ...options,
+    const generate = (d: Decisions, s: State, f: string, o: GenerateOptions) => options.mapper
+      ? generateMappedProgram(adapter, d, s, f, o) : adapter.generateProject!(d, s, f, o);
+    const manifest = await generate(decisions, state, field, { ...options,
       ...(options.onText ? { onText: async (name: string, value: string, done: boolean, change?: TextChange, progress?: TextProgress) => { if (!done) await options.onText!(name, value, false, change, progress); } } : {}),
     });
     decisions.signal.throwIfAborted();

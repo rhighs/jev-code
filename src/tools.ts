@@ -96,13 +96,18 @@ export async function runBash(command: string, cwd: string, timeoutMs: number, s
     let forceTimer: NodeJS.Timeout | undefined;
     let outputQueue = Promise.resolve();
     let outputError: unknown;
+    let terminationError: string | undefined;
     let outputFailed = false;
     const stdoutDecoder = new StringDecoder('utf8'), stderrDecoder = new StringDecoder('utf8');
     const terminate = (kind: NodeJS.Signals): void => {
       try {
         if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, kind);
         else child.kill(kind);
-      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ESRCH') return;
+        terminationError = `Could not terminate the command group: ${(error as NodeJS.ErrnoException).code ?? 'unknown error'}.`;
+        try { child.kill(kind); } catch { }
+      }
     };
     const stop = (): void => {
       terminate('SIGTERM');
@@ -146,9 +151,9 @@ export async function runBash(command: string, cwd: string, timeoutMs: number, s
       const truncated = stdoutBytes > stdout.length || stderrBytes > stderr.length;
       const reason = cancelled ? 'Cancelled.' : timedOut ? `Timed out after ${timeoutMs}ms.` : '';
       resolve({
-        ok: exitCode === 0 && !timedOut && !cancelled,
+        ok: exitCode === 0 && !timedOut && !cancelled && !terminationError,
         output: [stdout.toString('utf8'), stderr.length ? `stderr:\n${stderr.toString('utf8')}` : '', reason,
-          truncated ? '[output truncated]' : ''].filter(Boolean).join('\n'),
+          terminationError ?? '', truncated ? '[output truncated]' : ''].filter(Boolean).join('\n'),
         data: { exitCode, signal: exitSignal, timedOut, cancelled, truncated, stdoutBytes, stderrBytes },
       });
     });

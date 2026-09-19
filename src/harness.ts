@@ -1,3 +1,4 @@
+import { recoverAction, stalled } from './action-map.js';
 import type { ProposalProvider } from './providers/types.js';
 import { randomUUID } from 'node:crypto';
 import { mkdir, open, realpath, type FileHandle } from 'node:fs/promises';
@@ -183,7 +184,7 @@ export class Harness {
             'Choose a concrete next action. Read tool outcomes and repair failures. Update the plan when useful.',
             'Only finish after the requested work and its applicable verification have succeeded. Never invent tool results.',
             'Use blocked only when missing information or an external prerequisite prevents further progress.',
-            ...(this.options.generationProvider ? ['Use write_file for supported source languages. The generation model maps the task into meaningful program steps; you approve the map, choose implementations, and review the program. Use propose for explanations or file types without an AST adapter.'] : []),
+            ...(this.options.generationProvider ? ['Use write_file for a single source file and write_files for a multi-file Python project. The generation model maps the task into meaningful program steps; you approve the map, choose implementations, and review the program. Use propose for explanations or file types without an AST adapter.'] : []),
           ],
         };
         context.select = async (instruction, criteria, extra) => {
@@ -231,7 +232,11 @@ export class Harness {
         criteria.finish = 'All requested work is complete and applicable verification has passed; summarize the observed outcome.';
         if (records.at(-1)?.tool === 'finish' && !records.at(-1)?.result.ok) delete criteria.finish;
         criteria.blocked = 'No further useful action is possible without user information or an external prerequisite; explain it.';
-        const action = await decisions.choose(state, `Choose the next action for this coding task:\n${messages.join('\nUpdate: ')}\nUse the actual workspace and tool outcomes to decide.`, criteria);
+        const recoveryTools = [...this.registry.values()].filter(t => rewritten !== undefined && rewritten === writtenPath(earlier) ? Object.hasOwn(criteria, t.name) : true);
+        const recovery = this.options.generationProvider && stalled(records, recoveryTools)
+          ? await recoverAction({ provider: this.options.generationProvider, budget: context.proposals! }, decisions, state, recoveryTools, records)
+          : undefined;
+        const action = recovery?.tool ?? await decisions.choose(state, `Choose the next action for this coding task:\n${messages.join('\nUpdate: ')}\nUse the actual workspace and tool outcomes to decide.`, criteria);
         await emit('action', { tool: action });
         const fragments = fragmentsFrom([...messages, ...inventory.files, plan, ...recent.flatMap(record => [
           ...Object.values(record.args).filter((value): value is string => typeof value === 'string'), record.result.output,
@@ -239,7 +244,20 @@ export class Harness {
         const generationOptions = {
           maxSteps: this.options.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, fragments,
           astRegistry: this.astRegistry,
-          ...(this.options.generationProvider ? { mapper: { provider: this.options.generationProvider, budget: context.proposals! } } : {}),
+          ...(this.options.generationProvider ? { mapper: { provider: this.options.generationProvider, budget: context.proposals!, readSource: async (path: string) => {
+            let file: FileHandle | undefined;
+            try {
+              file = await open(await context.resolvePath(path), 'r');
+              const info = await file.stat();
+              if (!info.isFile() || info.size > 16_000) throw new Error('Mapped rewrites require a regular source file of at most 16000 bytes. Use a focused edit for larger files.');
+              const source = await file.readFile('utf8');
+              if (Buffer.byteLength(source) > 16_000) throw new Error('Source grew beyond the mapped rewrite limit.');
+              return source;
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+              throw error;
+            } finally { await file?.close(); }
+          } } } : {}),
           experimentalGrid: this.options.experimentalGrid ?? false,
           gridBatchSize: this.options.gridBatchSize ?? 8, concurrency: this.options.concurrency ?? 4, searchWidth: this.options.searchWidth ?? 1,
           // Patch events preserve the scored cells without duplicating the draft per batch.
@@ -295,7 +313,10 @@ export class Harness {
         const tool = this.registry.get(action)!;
         let args: ToolRecord['args'] = {};
         try {
-          args = await generateArguments(decisions, { ...state, action }, tool.fields, generationOptions);
+          const supplied = recovery?.args ?? {};
+          const fields = Object.fromEntries(Object.entries(tool.fields).filter(([name]) => !Object.hasOwn(supplied, name)));
+          const task = recovery ? { ...(state.task as Record<string, unknown>), prompt: `${messages.join('\nUpdate: ')}\nCurrent subproblem selected by Jev: ${recovery.objective}` } : state.task;
+          args = { ...supplied, ...await generateArguments(decisions, { ...state, task, action, argumentsSoFar: supplied }, fields, generationOptions) };
           signal.throwIfAborted();
           const authorized = await this.options.authorize?.(tool, args, signal) ?? true;
           signal.throwIfAborted();

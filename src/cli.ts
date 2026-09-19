@@ -204,7 +204,8 @@ async function main(): Promise<void> {
     process.stderr.write('eval runs unattended: agent Bash executes on this host without confirmation.\n');
     const width = values['search-width'];
     if (width !== undefined && !/^[1-8]$/.test(width)) throw new Error('--search-width must be 1–8.');
-    const records = await runEval({ provider: new JevProvider(), out: resolve(values['eval-out'] ?? '.'), ...(only === undefined ? {} : { only }), searchWidth: width === undefined ? 1 : Number(width),
+    const generator = await providerFromConfig(process.env, line => process.stderr.write(`${line}\n`));
+    const records = await runEval({ ...(generator ? { generationProvider: generator } : {}), provider: new JevProvider(), out: resolve(values['eval-out'] ?? '.'), ...(only === undefined ? {} : { only }), searchWidth: width === undefined ? 1 : Number(width),
       onRecord: r => process.stdout.write(`${r.task}\t${r.check.ok ? 'pass' : 'fail'}\t${r.status}\t${r.turns} turns\t${r.requests} requests\t${formatDuration(r.durationMs)}\t${r.check.reason}\n`) });
     process.exitCode = records.every(r => r.check.ok) ? 0 : 1;
     return;

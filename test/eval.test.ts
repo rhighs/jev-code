@@ -39,7 +39,7 @@ test('guessing-game checker drives a correct program to a pass', async t => {
 
 test('guessing-game checker fails on an unrecognizable feedback line and names it', async t => {
   const ws = await workspace(t);
-  await writeFile(join(ws, 'main.py'), game.replace("print('Too low')", "print('warmer')"));
+  await writeFile(join(ws, 'main.py'), game.replace("random.randint(1, 100)", "75").replace("print('Too low')", "print('warmer')"));
   const res = await check_guessing(ws);
   assert.equal(res.ok, false);
   assert.match(res.reason, /warmer/);

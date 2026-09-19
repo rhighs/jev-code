@@ -478,3 +478,24 @@ test('an identical call that failed twice removes its tool until another action 
   assert.equal(result.status, 'completed');
   assert.match(feedback[0] ?? '', /read_file .*failed 2 times/);
 });
+
+test('loop recovery uses Jev-selected routing arguments and still requires authorization', async t => {
+  const root = await workspace(t);
+  let ran = false;
+  const observed: Array<Record<string, unknown>> = [];
+  const tools: Tool[] = [
+    { name: 'inspect', description: 'Inspect evidence.', effect: 'read', fields: {}, execute: async () => ({ ok: true, output: 'unchanged' }) },
+    { name: 'advance', description: 'Verify the missing requirement.', effect: 'shell', fields: { command: { type: 'string', description: 'Command.' } }, execute: async () => { ran = true; return { ok: true, output: 'done' }; } },
+  ];
+  const base = new ScriptedProvider([{ action: 'inspect' }, { action: 'inspect' }, { action: 'option_0' }]);
+  const generationProvider: ProposalProvider = { id: 'test', model: 'test', generate: async () => [{ text: JSON.stringify([{ tool: 'advance', objective: 'Check the remaining requirement', args: { command: 'verify' } }]), truncated: false }] };
+  const result = await new Harness({ workspace: root, provider: base, generationProvider, tools, journalDirectory: false,
+    maxTurns: 3, authorize: async (tool, args) => { if (tool.name === 'advance') { observed.push(args); return false; } return true; },
+  }).run('Inspect then verify.');
+  assert.equal(result.status, 'limited');
+  assert.deepEqual(observed, [{ command: 'verify' }]);
+  assert.equal(ran, false);
+  assert.equal(result.records.at(-1)?.tool, 'advance');
+  assert.equal(result.records.at(-1)?.result.ok, false);
+  assert.ok(base.states.some(s => s.generation?.phase === 'action_map'));
+});

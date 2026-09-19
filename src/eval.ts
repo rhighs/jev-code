@@ -9,6 +9,7 @@ import { sanitizedEnv } from './env.js';
 import { DEFAULT_LIMITS, Harness } from './harness.js';
 import { formatDuration } from './timing.js';
 import { builtInTools } from './tools.js';
+import type { ProposalProvider } from './providers/types.js';
 import type { DecisionProvider, HarnessEvent } from './types.js';
 
 export interface CheckResult { ok: boolean; reason: string }
@@ -79,6 +80,7 @@ async function commit(): Promise<string | null> {
 }
 
 export interface RunEvalOptions {
+  generationProvider?: ProposalProvider;
   provider: DecisionProvider;
   out: string;
   tasksDir?: string;
@@ -99,7 +101,7 @@ export async function runEval(opts: RunEvalOptions): Promise<EvalRecord[]> {
     const ws = await mkdtemp(join(tmpdir(), `jev-eval-${task.name}-`));
     try {
       const harness = new Harness({
-        workspace: ws, provider: opts.provider, tools: builtInTools(), journalDirectory: join(resolve(opts.out), '.jev', 'eval', 'journals', task.name),
+        workspace: ws, provider: opts.provider, ...(opts.generationProvider ? { generationProvider: opts.generationProvider } : {}), tools: builtInTools(), journalDirectory: join(resolve(opts.out), '.jev', 'eval', 'journals', task.name),
         maxTurns: task.limits.maxTurns ?? DEFAULT_LIMITS.maxTurns, maxRequests: task.limits.maxRequests ?? DEFAULT_LIMITS.maxRequests,
         maxGenerationSteps: task.limits.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, maxRunMs: task.limits.maxRunMs ?? DEFAULT_LIMITS.maxRunMs,
         authorize: () => true, searchWidth: opts.searchWidth ?? 1, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}),

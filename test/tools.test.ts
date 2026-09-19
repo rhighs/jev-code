@@ -125,3 +125,17 @@ test('Bash streaming callback errors fail the command and release its resources'
   await assert.rejects(runBash('printf "output\\n"; sleep 30', root, 1000, signal, 100,
     async () => { throw new Error('Output consumer failed.'); }), /Output consumer failed/);
 });
+
+test('process-group permission errors return a failed result instead of crashing cleanup', async t => {
+  if (process.platform === 'win32') return;
+  const { root, signal } = await setup(t);
+  const kill = process.kill.bind(process);
+  t.mock.method(process, 'kill', (pid: number, sig?: string | number) => {
+    if (pid < 0) throw Object.assign(new Error('denied'), { code: 'EPERM' });
+    return kill(pid, sig);
+  });
+  const result = await runBash('exec sleep 30', root, 40, signal);
+  assert.equal(result.ok, false);
+  assert.match(result.output, /Could not terminate the command group: EPERM/);
+  assert.equal(result.data?.timedOut, true);
+});
