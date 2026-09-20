@@ -28,6 +28,13 @@ test('compatibility choices reject incomplete and non-normalized distributions',
   await assert.rejects(decisions(provider({ type: 'choice', choice: 'a', confidence: 1, probabilities: { a: 0.4, b: 0.4 } })).choose({}, 'pick', { a: 'A', b: 'B' }), DecisionError);
 });
 
+test('choices accept a distribution whose two-decimal rounding drifts from one', async () => {
+  const labels = Array.from({ length: 33 }, (_, i) => `value_${i}`);
+  const probabilities = Object.fromEntries(labels.map(l => [l, 0.03]));
+  const result = await decisions(provider({ type: 'choice', choice: 'value_4', confidence: 0.3, probabilities })).choose({}, 'pick', Object.fromEntries(labels.map(l => [l, l])));
+  assert.equal(result, 'value_4');
+});
+
 test('compatibility state projection omits optional undefined values without bypassing strict JSON validation', async () => {
   let observed: EntryType | undefined;
   const recording: DecisionProvider = {
