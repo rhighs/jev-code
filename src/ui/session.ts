@@ -1,7 +1,5 @@
 import { open } from 'node:fs/promises';
 import { stripVTControlCharacters } from 'node:util';
-import { createElement } from 'react';
-import { render } from 'ink';
 import { DEFAULT_LIMITS, Harness, type HarnessOptions } from '../harness.js';
 import { highlightCode, isInteractiveTTY, terminalColor } from '../terminal-style.js';
 import { formatDuration } from '../timing.js';
@@ -9,7 +7,6 @@ import { autoApproved, runBash } from '../tools.js';
 import { initialState, livePhase, reduce, traceItem, type Item, type SessionEvent, type TranscriptState } from '../transcript.js';
 import type { HarnessEvent, RunResult, RunStatus, Tool, ToolRecord } from '../types.js';
 import { resolveWorkspacePath } from '../workspace.js';
-import { App } from './app.js';
 
 export const COMMANDS = ['/help', '/status', '/plan', '/history', '/files', '/show', '/clear', '/cancel', '/permissions', '/paste', '/exit', '/trace'];
 const HELP = `Type a task or a follow-up. During a run, new text updates the task at the next turn.
@@ -276,17 +273,4 @@ export function createSession(opts: SessionOptions): Session {
     close,
     closed,
   };
-}
-
-export interface RunSessionOptions extends SessionOptions { stdin?: NodeJS.ReadStream; stdout?: NodeJS.WriteStream }
-
-export async function runSession(opts: RunSessionOptions): Promise<number> {
-  const stdin = opts.stdin ?? process.stdin, stdout = opts.stdout ?? process.stderr;
-  const session = createSession({ ...opts, tty: opts.tty ?? isInteractiveTTY(stdin, stdout) });
-  const app = render(createElement(App, { session }), { stdout, stdin, patchConsole: false, exitOnCtrlC: false });
-  stdin.once('end', () => session.close(0));
-  const code = await session.closed;
-  app.unmount();
-  await app.waitUntilExit();
-  return code;
 }

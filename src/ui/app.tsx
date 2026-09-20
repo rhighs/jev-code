@@ -1,13 +1,13 @@
-import { Text, useApp, useInput, useWindowSize } from 'ink';
-import { useEffect, useState, useSyncExternalStore } from 'react';
+import { render, Text, useApp, useInput, useWindowSize } from 'ink';
+import { createElement, useEffect, useState, useSyncExternalStore } from 'react';
 import type { RenderOpts } from '../render-plain.js';
-import { fitLine, paint } from '../terminal-style.js';
+import { fitLine, isInteractiveTTY, paint } from '../terminal-style.js';
 import { livePhase } from '../transcript.js';
 import { formatDuration } from '../timing.js';
 import { Approval } from './approval.js';
 import { LiveArea } from './live-area.js';
 import { Prompt } from './prompt.js';
-import { APPROVAL_DRAFT, APPROVAL_KEYS, type Snapshot, type Session } from './session.js';
+import { APPROVAL_DRAFT, APPROVAL_KEYS, createSession, type SessionOptions, type Snapshot, type Session } from './session.js';
 import { TranscriptView } from './transcript-view.js';
 
 const phase = (snap: Snapshot): string => snap.state.live ? livePhase(snap.state.live) : snap.running ? 'deciding' : 'you';
@@ -48,4 +48,17 @@ export function App({ session, footer }: { session: Session; footer?: string }) 
 function Footer({ session, text, color }: { session: Session; text: string; color: boolean }) {
   useInput((input, key) => { if (key.ctrl && input === 'c') session.close(0); });
   return <Text>{paint(text, 2, color)}</Text>;
+}
+
+export interface RunSessionOptions extends SessionOptions { stdin?: NodeJS.ReadStream; stdout?: NodeJS.WriteStream }
+
+export async function runSession(opts: RunSessionOptions): Promise<number> {
+  const stdin = opts.stdin ?? process.stdin, stdout = opts.stdout ?? process.stderr;
+  const session = createSession({ ...opts, tty: opts.tty ?? isInteractiveTTY(stdin, stdout) });
+  const app = render(createElement(App, { session }), { stdout, stdin, patchConsole: false, exitOnCtrlC: false });
+  stdin.once('end', () => session.close(0));
+  const code = await session.closed;
+  app.unmount();
+  await app.waitUntilExit();
+  return code;
 }

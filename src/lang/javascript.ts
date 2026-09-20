@@ -1,6 +1,6 @@
 import ts from 'typescript';
 import { PENDING } from '../decision-context.js';
-import { group, adapterFor, BIN, CMP, type Dialect, type Expr, type Stmt, type ValueType } from './core.js';
+import { adapterFor, CMP, exprRenderer, type Dialect, type Stmt, type ValueType } from './core.js';
 
 const keywords = new Set('break case catch class const continue debugger default delete do else enum export extends false finally for function if import in instanceof new null return super switch this throw true try typeof var void while with yield let static implements interface package private protected public await async of undefined NaN Infinity'.split(' '));
 
@@ -21,20 +21,7 @@ const annotate = (typed: boolean, type: ValueType): string => {
   return map[type] ? `: ${map[type]}` : '';
 };
 
-export const expr = (e: Expr): string => {
-  switch (e.kind) {
-    case 'hole': return PENDING;
-    case 'string': return JSON.stringify(e.value);
-    case 'number': return e.value < 0 ? `(${e.value})` : String(e.value);
-    case 'bool': return String(e.value);
-    case 'name': return e.id;
-    case 'binary': return `${group(e.left, expr(e.left))} ${BIN[e.op]} ${group(e.right, expr(e.right))}`;
-    case 'compare': return `${group(e.left, expr(e.left))} ${CMP_JS[e.op]} ${group(e.right, expr(e.right))}`;
-    case 'call': return `${e.callee}(${e.args.map(expr).join(', ')})`;
-    case 'list': return `[${e.items.map(expr).join(', ')}]`;
-    case 'index': return `${expr(e.target)}[${expr(e.index)}]`;
-  }
-};
+export const expr = exprRenderer({ list: items => `[${items.join(', ')}]`, cmp: CMP_JS });
 
 const renderer = (typed: boolean) => {
   const stmt = (s: Stmt, indent: string): string[] => {

@@ -1,10 +1,8 @@
-import { spawn } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { PENDING } from '../decision-context.js';
-import { sanitizedEnv } from '../env.js';
 import { group, adapterFor, BIN, CMP, typeOf, type Dialect, type Expr, type Program, type Stmt, type Symbol, type ValueType } from './core.js';
+import { runTool, withTempDir } from './toolchain.js';
 
 const keywords = new Set('auto break case char const continue default do double else enum extern float for goto if int long register return short signed sizeof static struct switch typedef union unsigned void volatile while inline restrict _Bool _Complex _Imaginary _Alignas _Alignof _Atomic _Generic _Noreturn _Static_assert _Thread_local bool true false NULL main printf'.split(' '));
 
@@ -87,22 +85,12 @@ const render = (program: Program): string => {
 
 const isEnoent = (err: unknown): boolean => typeof err === 'object' && err !== null && 'code' in err && err.code === 'ENOENT';
 
-const compile = (bin: string, file: string, signal: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
-  const child = spawn(bin, ['-fsyntax-only', '-Wall', '-Werror=implicit-function-declaration', '-x', 'c', file], { env: sanitizedEnv(), stdio: ['ignore', 'ignore', 'pipe'], signal, timeout: 20_000 });
-  let err = '';
-  child.on('error', reject);
-  child.stderr.on('data', (chunk: Buffer) => { err = (err + chunk.toString()).slice(-8000); });
-  child.on('close', code => {
-    if (signal.aborted) { reject(signal.reason); return; }
-    if (code !== 0) { reject(new Error(`C validation failed: ${err.trim() || `exit ${code}`}`)); return; }
-    resolve();
-  });
-});
+const compile = (bin: string, file: string, signal: AbortSignal): Promise<void> =>
+  runTool(bin, ['-fsyntax-only', '-Wall', '-Werror=implicit-function-declaration', '-x', 'c', file], { name: 'C', signal, timeout: 20_000 });
 
 const validate = async (source: string, signal: AbortSignal): Promise<void> => {
   signal.throwIfAborted();
-  const dir = await mkdtemp(join(tmpdir(), 'jev-c-'));
-  try {
+  await withTempDir('jev-c-', async dir => {
     const file = join(dir, 'main.c');
     await writeFile(file, source);
     try {
@@ -116,9 +104,7 @@ const validate = async (source: string, signal: AbortSignal): Promise<void> => {
         throw alt;
       }
     }
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+  });
 };
 
 export const cDialect: Dialect = {

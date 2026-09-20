@@ -1,5 +1,5 @@
 import type { Decisions } from './decisions.js';
-import type { PythonNode } from './python-ast.js';
+import type { PythonNode } from './python-nodes.js';
 import type { Unit } from './python-units.js';
 
 export const RUBRIC = ['does not address the purpose', 'partially addresses the purpose', 'correct but includes unneeded behavior', 'correct and minimal'];

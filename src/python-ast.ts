@@ -8,20 +8,18 @@ import { assemble, assembleProject, decompose, decomposeLayout, fillUnits, isEnt
 import { RUBRIC, wantsReturn } from './python-search.js';
 import { gridCursor } from './grid.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
-import { buildDecisionContext, PENDING, windowSource } from './decision-context.js';
+import { astDecisionState, PENDING } from './decision-context.js';
 import { sanitizedEnv } from './env.js';
 import { LimitError } from './types.js';
+import { identifierCandidates, numberCandidates, objectiveWords, phraseLiterals, quotedLiterals, stringCandidates } from './vocab.js';
 import { choice } from '@typesafe-ai/sdk';
+import { functionDef, name, node, type Builder, type PythonNode, type Scope, type Symbol, type Vocab } from './python-nodes.js';
+export type { PythonNode } from './python-nodes.js';
 
-export interface PythonNode { _type: string; [field: string]: unknown }
-export const node = (_type: string, fields: Record<string, unknown> = {}): PythonNode => ({ _type, ...fields });
-export const name = (id: string, store = false): PythonNode => node('Name', { id, ctx: node(store ? 'Store' : 'Load') });
 const keywords = new Set('False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case'.split(' '));
 const builtins = ['print', 'range', 'len', 'str', 'int', 'float', 'list', 'dict', 'set', 'sum', 'min', 'max', 'abs', 'sorted', 'enumerate', 'zip', 'input', 'open'];
 const builtinArity: Record<string, number[]> = { print: [0, 1, 2, 3], range: [1, 2, 3], len: [1], str: [0, 1], int: [0, 1], float: [0, 1], list: [0, 1], dict: [0], set: [0, 1], sum: [1, 2], min: [1, 2, 3], max: [1, 2, 3], abs: [1], sorted: [1], enumerate: [1, 2], zip: [1, 2, 3], input: [0, 1], open: [1, 2, 3] };
 const maxBlockStatements = 16;
-export interface Symbol { kind: 'builtin' | 'variable' | 'parameter' | 'function' | 'module'; arity?: number }
-export interface Scope { names: Map<string, Symbol>; parent?: Scope; function: boolean; loop: boolean }
 const symbolTable = (scope: Scope): Record<string, Symbol> => ({ ...(scope.parent ? symbolTable(scope.parent) : Object.fromEntries(builtins.map(id => [id, { kind: 'builtin' }]))), ...Object.fromEntries(scope.names) });
 const visible = (scope: Scope): string[] => [...new Set([...scope.names.keys(), ...(scope.parent ? visible(scope.parent) : builtins)])];
 
@@ -215,37 +213,20 @@ export async function checkCandidate(source: string, spec: CandidateSpec, signal
   return reason === 'ok' ? undefined : reason;
 }
 
-export interface Vocab { words: string[]; identifiers: string[]; strings: string[]; numbers: number[]; purposes: string[] }
 export interface Shared { field: string; options: GenerateOptions; objective: string; context: State; budget: { step: number }; vocab: Vocab; maxDepth: number }
 export interface StepInfo { slot: string; production: string; symbols: string[] }
 export interface BuilderInput { decisions: Decisions; render: () => Promise<string>; report: (preview: string, info: StepInfo) => Promise<void>; unit?: string; peers?: Peer[]; candidate?: number }
-export interface Builder {
-  pick(slot: string, scope: Scope, criteria: Record<string, string>, depth?: number): Promise<string>;
-  terminal(slot: string, scope: Scope, values: Array<string | number>): Promise<string | number>;
-  identifier(slot: string, scope: Scope, exclude?: string[]): Promise<string>;
-  expression(target: PythonNode, scope: Scope, depth: number, slot?: string, numberConstraint?: 'positive' | 'nonzero', calls?: number): Promise<void>;
-  block(body: PythonNode[], scope: Scope, depth: number, slot: string): Promise<void>;
-}
+
+const seeds = ['message', 'result', 'value', 'i', 'main', 'add', 'a', 'b', 'guess', 'target', 'attempts', 'randint', 'append', 'read', 'write', 'strip', 'lower'];
 
 export function vocabulary(objective: string): Vocab {
-  const words = objective.match(/[A-Za-z_][A-Za-z_0-9]*/g) ?? [];
-  const identifiers = [...new Set([...words.filter(word => /^[a-z_][a-z_0-9]*$/.test(word) && !keywords.has(word)), 'message', 'result', 'value', 'i', 'main', 'add', 'a', 'b', 'guess', 'target', 'attempts', 'randint', 'append', 'read', 'write', 'strip', 'lower'])].slice(0, 180);
-  const quoted = [...objective.matchAll(/`([^`\n]+)`|"([^"\n]+)"|'([^'\n]+)'/g)].map(match => match[1] ?? match[2] ?? match[3]!);
+  const words = objectiveWords(objective);
+  const identifiers = identifierCandidates(words, keywords, seeds);
   const files = objective.match(/\b[A-Za-z_][A-Za-z_0-9-]*\.[a-z]{1,5}\b/g) ?? [];
-  const literals: string[] = [...quoted, ...files];
+  const strings = stringCandidates([...quotedLiterals(objective), ...files, ...phraseLiterals(words)]);
   const purposes: string[] = [];
-  // Candidates are terminal values derived from the objective, never source templates.
-  for (let start = 0; start < words.length; start++) for (let count = 1; count <= 4 && start + count <= words.length; count++) {
-    const phrase = words.slice(start, start + count).join(' ');
-    purposes.push(phrase.toLowerCase());
-    if (count > 3) continue;
-    const capital = phrase[0]!.toUpperCase() + phrase.slice(1);
-    literals.push(phrase, capital, capital + '!');
-    if (count > 1) literals.push(words[start]![0]!.toUpperCase() + words[start]!.slice(1) + ', ' + words.slice(start + 1, start + count).join(' ') + '!');
-  }
-  const strings = [...new Set(literals)].slice(0, 220);
-  const numbers = [...new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 50, 100, 1000, -1, ...((objective.match(/-?\d+(?:\.\d+)?/g) ?? []).map(Number))])].filter(Number.isFinite).slice(0, 200);
-  return { words, identifiers, strings, numbers, purposes: [...new Set(purposes)].slice(0, 160) };
+  for (let start = 0; start < words.length; start++) for (let count = 1; count <= 4 && start + count <= words.length; count++) purposes.push(words.slice(start, start + count).join(' ').toLowerCase());
+  return { words, identifiers, strings, numbers: numberCandidates(objective), purposes: [...new Set(purposes)].slice(0, 160) };
 }
 
 export function createBuilder(shared: Shared, input: BuilderInput): Builder {
@@ -264,18 +245,7 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
     const questions = { selection: choice(instruction, criteria) };
     const core = { field, phase: 'ast', slot, ...(unit === undefined ? {} : { unit }), ...(candidate === undefined ? {} : { candidate }), ...(peers === undefined || !peers.length ? {} : { peers: peers.map(peer => ({ ...peer })) }), symbols, symbolTable: symbolTable(scope),
       constraints: { depth, maxDepth, inFunction: scope.function, inLoop: scope.loop, remainingSteps: options.maxSteps - budget.step } };
-    const assembleState = (values: Record<string, unknown>): State => ({
-      task: values.task, ...(values.recent === undefined ? {} : { recent: values.recent }), ...(values.plan === undefined ? {} : { plan: values.plan }),
-      generation: { ...core, partialSource: values.source, ...(values.trimmed === undefined ? {} : { trimmed: values.trimmed }) },
-    });
-    const { values, trimmed } = buildDecisionContext([
-      { key: 'task', value: { prompt: objective }, required: true },
-      { key: 'core', value: core, required: true },
-      { key: 'source', value: preview, shrink: windowSource },
-      { key: 'recent', value: context.recent ?? [] },
-      ...(typeof context.plan === 'string' && context.plan ? [{ key: 'plan', value: context.plan }] : []),
-    ], parts => Buffer.byteLength(JSON.stringify({ state: assembleState(parts), questions })), MAX_GRID_REQUEST_BYTES);
-    const state = assembleState(trimmed.length ? { ...values, trimmed } : values);
+    const state = astDecisionState({ objective, context, preview, core, questions, cap: MAX_GRID_REQUEST_BYTES });
     const selected = keys.length === 1 ? keys[0]! : await decisions.choose(state, instruction, criteria);
     await report(preview, { slot, production: selected, symbols });
     return selected;
@@ -441,9 +411,6 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
   }
   return { pick, terminal, identifier, expression, block };
 }
-
-export const functionDef = (id: string, parameters: PythonNode[], body: PythonNode[]): PythonNode =>
-  node('FunctionDef', { name: id, args: node('arguments', { posonlyargs: [], args: parameters, vararg: null, kwonlyargs: [], kw_defaults: [], kwarg: null, defaults: [] }), body, decorator_list: [], returns: null, type_comment: null, type_params: [] });
 
 /** Decomposition first, then unit bodies concurrently, then the main block; zero units is the plain single-scope path. */
 async function generate(decisions: Decisions, state: State, field: string, options: GenerateOptions, project: boolean): Promise<string> {

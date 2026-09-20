@@ -51,3 +51,20 @@ export function buildDecisionContext(parts: ContextPart[], measure: (values: Rec
   }
   return { values, trimmed };
 }
+
+export interface AstStateInput { objective: string; context: Record<string, unknown>; preview: string; core: Record<string, unknown>; questions: unknown; cap: number }
+
+export function astDecisionState({ objective, context, preview, core, questions, cap }: AstStateInput): Record<string, unknown> {
+  const assemble = (values: Record<string, unknown>): Record<string, unknown> => ({
+    task: values.task, ...(values.recent === undefined ? {} : { recent: values.recent }), ...(values.plan === undefined ? {} : { plan: values.plan }),
+    generation: { ...core, partialSource: values.source, ...(values.trimmed === undefined ? {} : { trimmed: values.trimmed }) },
+  });
+  const { values, trimmed } = buildDecisionContext([
+    { key: 'task', value: { prompt: objective }, required: true },
+    { key: 'core', value: core, required: true },
+    { key: 'source', value: preview, shrink: windowSource },
+    { key: 'recent', value: context.recent ?? [] },
+    ...(typeof context.plan === 'string' && context.plan ? [{ key: 'plan', value: context.plan }] : []),
+  ], parts => Buffer.byteLength(JSON.stringify({ state: assemble(parts), questions })), cap);
+  return assemble(trimmed.length ? { ...values, trimmed } : values);
+}

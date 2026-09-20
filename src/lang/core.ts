@@ -1,11 +1,12 @@
 import { choice } from '@typesafe-ai/sdk';
 import type { AstAdapter } from '../ast-adapters.js';
-import { buildDecisionContext, PENDING, windowSource } from '../decision-context.js';
+import { astDecisionState, PENDING } from '../decision-context.js';
 import type { Decisions, State } from '../decisions.js';
 import type { GenerateOptions } from '../generation.js';
 import { gridCursor } from '../grid.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from '../scored-grid.js';
 import { LimitError } from '../types.js';
+import { identifierCandidates, numberCandidates, objectiveWords, phraseLiterals, quotedLiterals, stringCandidates } from '../vocab.js';
 
 export type ValueType = 'string' | 'number' | 'bool' | 'list' | 'unknown';
 export type BinOp = 'add' | 'sub' | 'mul' | 'div' | 'mod' | 'concat';
@@ -65,6 +66,9 @@ export const isPending = (id: string): boolean => id === PENDING;
 const maxBlockStatements = 16;
 const maxDepth = 6;
 
+const childScope = (parent: Scope, loop: boolean, ...names: Array<[string, Symbol]>): Scope =>
+  ({ names: new Map(names), parent, function: parent.function, loop, ...(parent.returnTypes ? { returnTypes: parent.returnTypes } : {}) });
+
 const table = (scope: Scope, builtins: Record<string, Builtin>): Record<string, Symbol> => ({
   ...(scope.parent ? table(scope.parent, builtins) : Object.fromEntries(Object.entries(builtins).map(([id, b]) => [id, { kind: 'builtin', type: 'unknown', returns: b.returns } satisfies Symbol]))),
   ...Object.fromEntries(scope.names),
@@ -88,20 +92,13 @@ export function typeOf(expr: Expr, symbols: Record<string, Symbol>): ValueType {
 
 export interface Vocab { identifiers: string[]; strings: string[]; numbers: number[]; words: string[] }
 
+const seeds = ['message', 'result', 'value', 'i', 'n', 'total', 'count', 'name', 'items', 'a', 'b', 'x', 'y'];
+
 export function vocabulary(objective: string, keywords: Set<string>): Vocab {
-  const words = objective.match(/[A-Za-z_][A-Za-z_0-9]*/g) ?? [];
-  const identifiers = [...new Set([...words.filter(w => /^[a-z_][a-z_0-9]*$/.test(w) && !keywords.has(w)), 'message', 'result', 'value', 'i', 'n', 'total', 'count', 'name', 'items', 'a', 'b', 'x', 'y'])].slice(0, 180);
-  const quoted = [...objective.matchAll(/`([^`\n]+)`|"([^"\n]+)"|'([^'\n]+)'/g)].map(m => m[1] ?? m[2] ?? m[3]!);
-  const literals: string[] = [...quoted];
-  for (let start = 0; start < words.length; start++) for (let count = 1; count <= 3 && start + count <= words.length; count++) {
-    const phrase = words.slice(start, start + count).join(' ');
-    const capital = phrase[0]!.toUpperCase() + phrase.slice(1);
-    literals.push(phrase, capital, capital + '!');
-    if (count > 1) literals.push(words[start]![0]!.toUpperCase() + words[start]!.slice(1) + ', ' + words.slice(start + 1, start + count).join(' ') + '!');
-  }
-  const strings = [...new Set(literals)].slice(0, 220);
-  const numbers = [...new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 50, 100, 1000, -1, ...((objective.match(/-?\d+(?:\.\d+)?/g) ?? []).map(Number))])].filter(Number.isFinite).slice(0, 200);
-  return { identifiers, strings, numbers, words };
+  const words = objectiveWords(objective);
+  const identifiers = identifierCandidates(words, keywords, seeds);
+  const strings = stringCandidates([...quotedLiterals(objective), ...phraseLiterals(words)]);
+  return { identifiers, strings, numbers: numberCandidates(objective), words };
 }
 
 export async function generateProgram(dialect: Dialect, decisions: Decisions, state: State, field: string, options: GenerateOptions): Promise<string> {
@@ -126,18 +123,8 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
     const questions = { selection: choice(instruction, criteria) };
     const core = { field, phase: 'ast', slot, symbols, symbolTable: table(scope, builtins), language: dialect.id,
       constraints: { depth, maxDepth, inFunction: scope.function, inLoop: scope.loop, remainingSteps: options.maxSteps - step } };
-    const assemble = (values: Record<string, unknown>): State => ({
-      task: values.task, ...(values.recent === undefined ? {} : { recent: values.recent }), ...(values.plan === undefined ? {} : { plan: values.plan }),
-      generation: { ...core, partialSource: values.source, ...(values.trimmed === undefined ? {} : { trimmed: values.trimmed }) },
-    });
-    const { values, trimmed } = buildDecisionContext([
-      { key: 'task', value: { prompt: objective }, required: true },
-      { key: 'core', value: core, required: true },
-      { key: 'source', value: preview, shrink: windowSource },
-      { key: 'recent', value: context.recent ?? [] },
-      ...(typeof context.plan === 'string' && context.plan ? [{ key: 'plan', value: context.plan }] : []),
-    ], parts => Buffer.byteLength(JSON.stringify({ state: assemble(parts), questions })), MAX_GRID_REQUEST_BYTES);
-    const selected = keys.length === 1 ? keys[0]! : await decisions.choose(assemble(trimmed.length ? { ...values, trimmed } : values), instruction, criteria);
+    const state = astDecisionState({ objective, context, preview, core, questions, cap: MAX_GRID_REQUEST_BYTES });
+    const selected = keys.length === 1 ? keys[0]! : await decisions.choose(state, instruction, criteria);
     await options.onText?.(field, preview, false, { replace: preview }, { decoder: 'ast', step, cursor: gridCursor(preview), bytes: Buffer.byteLength(preview), ast: { slot, production: selected, symbols } });
     return selected;
   }
@@ -173,6 +160,23 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
 
   const fits = (expect: ValueType | undefined, actual: ValueType): boolean => expect === undefined || expect === 'unknown' || actual === expect || (!typed && actual === 'unknown');
 
+  type Call = Extract<Expr, { kind: 'call' }>;
+
+  async function callTo(callable: string[], scope: Scope): Promise<Call> {
+    const selected = await pick('callee', scope, Object.fromEntries(callable.map((id, i) => [`name_${i}`, id])));
+    return { kind: 'call', callee: callable[Number(selected.slice(5))]!, args: [] };
+  }
+
+  async function fillCall(call: Call, symbol: Symbol, scope: Scope, depth: number, calls: number): Promise<void> {
+    const counts = symbol.arity !== undefined ? [symbol.arity] : builtins[call.callee]?.arity ?? [0, 1, 2];
+    const count = counts.length === 1 ? counts[0]! : Number(await pick('argument_count', scope, Object.fromEntries(counts.map(c => [String(c), `${c} arguments.`]))));
+    for (let i = 0; i < count; i++) {
+      call.args.push(PENDING_EXPR);
+      const paramType = symbol.kind === 'builtin' ? builtins[call.callee]?.params?.[i] : 'number';
+      await expression(e => { call.args[i] = e; }, scope, depth + 1, `argument_${i}`, typed ? paramType ?? 'number' : paramType, calls);
+    }
+  }
+
   async function expression(set: (e: Expr) => void, scope: Scope, depth: number, slot = 'expression', expect?: ValueType, calls = 0, avoid?: string, nonzero = false): Promise<Expr> {
     const symbols = table(scope, builtins);
     const namesForValue = Object.entries(symbols).filter(([, s]) => s.kind !== 'builtin' && s.kind !== 'function').map(([id]) => id).filter(id => id !== avoid && fits(expect, symbols[id]!.type));
@@ -198,20 +202,10 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
       const selected = await pick('reference', scope, Object.fromEntries(namesForValue.map((id, i) => [`name_${i}`, id])));
       expr = { kind: 'name', id: namesForValue[Number(selected.slice(5))]! };
     } else if (production === 'call') {
-      const selected = await pick('callee', scope, Object.fromEntries(callable.map((id, i) => [`name_${i}`, id])));
-      const callee = callable[Number(selected.slice(5))]!;
-      const symbol = symbols[callee]!;
-      const counts = symbol.arity !== undefined ? [symbol.arity] : builtins[callee]?.arity ?? [0, 1, 2];
-      const args: Expr[] = [];
-      expr = { kind: 'call', callee, args };
-      set(expr);
-      const count = counts.length === 1 ? counts[0]! : Number(await pick('argument_count', scope, Object.fromEntries(counts.map(c => [String(c), `${c} arguments.`]))));
-      for (let i = 0; i < count; i++) {
-        args.push(PENDING_EXPR);
-        const paramType = symbol.kind === 'builtin' ? builtins[callee]?.params?.[i] : 'number';
-        await expression(e => { args[i] = e; }, scope, depth + 1, `argument_${i}`, typed ? paramType ?? 'number' : paramType, calls + 1);
-      }
-      return expr;
+      const call = await callTo(callable, scope);
+      set(call);
+      await fillCall(call, symbols[call.callee]!, scope, depth, calls + 1);
+      return call;
     } else if (production === 'binary' || production === 'compare' || production === 'concat') {
       const ops = production === 'binary' ? { add: 'addition +', sub: 'subtraction -', mul: 'multiplication *', div: 'division /', mod: 'remainder %' }
         : production === 'compare' ? { eq: 'equal', ne: 'not equal', lt: 'less than', le: 'less or equal', gt: 'greater than', ge: 'greater or equal' } : { concat: 'join' };
@@ -272,18 +266,9 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
         put(node);
         if (production === 'expr') {
           const callable = Object.entries(symbols).filter(([, s]) => s.kind === 'function' || (s.kind === 'builtin' && s.returns === 'void')).map(([id]) => id);
-          const selected = await pick('callee', scope, Object.fromEntries(callable.map((id, i) => [`name_${i}`, id])));
-          const callee = callable[Number(selected.slice(5))]!;
-          const args: Expr[] = [];
-          const call: Expr = { kind: 'call', callee, args };
+          const call = await callTo(callable, scope);
           node.value = call;
-          const counts = symbols[callee]!.arity !== undefined ? [symbols[callee]!.arity!] : builtins[callee]?.arity ?? [0, 1, 2];
-          const count = counts.length === 1 ? counts[0]! : Number(await pick('argument_count', scope, Object.fromEntries(counts.map(c => [String(c), `${c} arguments.`]))));
-          for (let i = 0; i < count; i++) {
-            args.push(PENDING_EXPR);
-            const paramType = symbols[callee]!.kind === 'builtin' ? builtins[callee]?.params?.[i] : 'number';
-            await expression(e => { args[i] = e; }, scope, depth + 1, `argument_${i}`, typed ? paramType ?? 'number' : paramType, 1);
-          }
+          await fillCall(call, symbols[call.callee]!, scope, depth, 1);
         } else await expression(e => { node.value = e; }, scope, depth + 1, 'printed');
       } else if (production === 'assign') {
         const existing = Object.entries(symbols).filter(([, s]) => s.kind === 'variable' && !s.readonly).map(([id]) => id);
@@ -331,21 +316,21 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
         put(node);
         await expression(e => { node.start = e; }, scope, depth + 1, 'start', 'number');
         await expression(e => { node.stop = e; }, scope, depth + 1, 'stop', 'number');
-        await block(nested, { names: new Map([[id, { kind: 'variable', type: 'number', readonly: true }]]), parent: scope, function: scope.function, loop: true, ...(scope.returnTypes ? { returnTypes: scope.returnTypes } : {}) }, depth + 1, 'loop_body');
+        await block(nested, childScope(scope, true, [id, { kind: 'variable', type: 'number', readonly: true }]), depth + 1, 'loop_body');
       } else if (production === 'foreach') {
         const id = await identifier('loop_variable', scope, Object.keys(symbols));
         const nested: Stmt[] = [];
         const node: Stmt = { kind: 'foreach', id, iterable: PENDING_EXPR, body: nested, type: 'unknown' };
         put(node);
         await expression(e => { node.iterable = e; }, scope, depth + 1, 'iterable', 'list');
-        await block(nested, { names: new Map([[id, { kind: 'variable', type: 'unknown', readonly: true }]]), parent: scope, function: scope.function, loop: true, ...(scope.returnTypes ? { returnTypes: scope.returnTypes } : {}) }, depth + 1, 'loop_body');
+        await block(nested, childScope(scope, true, [id, { kind: 'variable', type: 'unknown', readonly: true }]), depth + 1, 'loop_body');
       } else {
         const nested: Stmt[] = [];
         const orelse: Stmt[] = [];
         const node: Extract<Stmt, { kind: 'if' | 'while' }> = production === 'if' ? { kind: 'if', test: PENDING_EXPR, body: nested, orelse } : { kind: 'while', test: PENDING_EXPR, body: nested };
         put(node);
         await expression(e => { node.test = e; }, scope, depth + 1, 'condition', 'bool');
-        const inner = (): Scope => ({ names: new Map(), parent: scope, function: scope.function, loop: production === 'while' || scope.loop, ...(scope.returnTypes ? { returnTypes: scope.returnTypes } : {}) });
+        const inner = (): Scope => childScope(scope, production === 'while' || scope.loop);
         const ended = await block(nested, inner(), depth + 1, production === 'if' ? 'if_body' : 'loop_body');
         if (production === 'if' && await pick('else_branch', scope, { no: 'No else branch is required.', yes: 'Add an else branch.' }) === 'yes' && await block(orelse, inner(), depth + 1, 'else_body') && ended) return true;
       }
@@ -375,6 +360,33 @@ export const escapeDoubleQuoted = (value: string): string => JSON.stringify(valu
 
 export const BIN: Record<BinOp, string> = { add: '+', sub: '-', mul: '*', div: '/', mod: '%', concat: '+' };
 export const CMP: Record<CmpOp, string> = { eq: '==', ne: '!=', lt: '<', le: '<=', gt: '>', ge: '>=' };
+
+export interface ExprSyntax {
+  list: (items: string[]) => string;
+  str?: (value: string) => string;
+  bin?: Record<BinOp, string>;
+  cmp?: Record<CmpOp, string>;
+  index?: (e: Extract<Expr, { kind: 'index' }>, expr: (e: Expr) => string) => string;
+}
+
+export const exprRenderer = (syntax: ExprSyntax): ((e: Expr) => string) => {
+  const { list, str = JSON.stringify, bin = BIN, cmp = CMP } = syntax;
+  const expr = (e: Expr): string => {
+    switch (e.kind) {
+      case 'hole': return PENDING;
+      case 'string': return str(e.value);
+      case 'number': return e.value < 0 ? `(${e.value})` : String(e.value);
+      case 'bool': return String(e.value);
+      case 'name': return e.id;
+      case 'binary': return `${group(e.left, expr(e.left))} ${bin[e.op]} ${group(e.right, expr(e.right))}`;
+      case 'compare': return `${group(e.left, expr(e.left))} ${cmp[e.op]} ${group(e.right, expr(e.right))}`;
+      case 'call': return `${e.callee}(${e.args.map(expr).join(', ')})`;
+      case 'list': return list(e.items.map(expr));
+      case 'index': return syntax.index ? syntax.index(e, expr) : `${expr(e.target)}[${expr(e.index)}]`;
+    }
+  };
+  return expr;
+};
 
 export const hasHole = (e: Expr): boolean => e.kind === 'hole' || (e.kind === 'binary' || e.kind === 'compare' ? hasHole(e.left) || hasHole(e.right)
   : e.kind === 'call' ? e.args.some(hasHole) : e.kind === 'list' ? e.items.some(hasHole) : e.kind === 'index' ? hasHole(e.target) || hasHole(e.index) : false);

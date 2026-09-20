@@ -227,7 +227,7 @@ async function main(): Promise<void> {
     ...(values['no-journal'] ? { journalDirectory: false as const } : {}),
   };
   if (interactive) {
-    const { runSession } = await import('./ui/session.js');
+    const { runSession } = await import('./ui/app.js');
     process.exitCode = await runSession({ harness: harnessOptions, model: process.env.TYPESAFE_DEFAULT_MODEL ?? 'jev-latest', initialPrompt: prompt,
       yes: values.yes ?? false, confirmWrites: values['confirm-writes'] ?? false,
       ...(jsonOut ? { onEvent: createPrinter(process.stderr, jsonOut).onEvent } : {}),

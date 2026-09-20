@@ -42,6 +42,15 @@ const boundedArgs = (args: ToolRecord['args']): ToolRecord['args'] => Object.fro
   Object.entries(args).map(([key, value]) => [key, typeof value === 'string' ? trim(value, 3000) : value]),
 );
 
+const failKey = (record: ToolRecord): string => `${record.tool}\0${JSON.stringify(record.args)}`;
+
+const writtenPath = (record: ToolRecord | undefined): string | undefined => {
+  if (!record?.result.ok) return undefined;
+  if (record.tool === 'write_file' && typeof record.args.path === 'string') return record.args.path;
+  if (record.tool === 'write_files' && Array.isArray(record.result.data?.paths)) return [...record.result.data.paths as string[]].sort().join(', ');
+  return undefined;
+};
+
 export class Harness {
   private readonly astRegistry: AstRegistry;
   private readonly registry = new Map<string, Tool>();
@@ -109,6 +118,33 @@ export class Harness {
     this.conversation.length = 0;
     this.observations.length = 0;
     this.pendingInputs.length = 0;
+  }
+
+  private actionCriteria(records: ToolRecord[]): { criteria: Record<string, string>; feedback?: string } {
+    const criteria = Object.fromEntries([...this.registry.values()].map(tool => [tool.name, tool.description]));
+    let feedback: string | undefined;
+    const previous = records.at(-1), earlier = records.at(-2);
+    if (previous && earlier && this.registry.get(previous.tool)?.effect === 'read' && previous.tool === earlier.tool &&
+        JSON.stringify(previous.args) === JSON.stringify(earlier.args) && previous.result.ok === earlier.result.ok && previous.result.output === earlier.result.output) {
+      delete criteria[previous.tool];
+      feedback = 'The last two reads returned the same unchanged result. Choose another action that advances the task; the repeated read tool is unavailable for this turn.';
+    }
+    const failures = new Map<string, number>();
+    for (const record of records) if (!record.result.ok && this.registry.has(record.tool)) failures.set(failKey(record), (failures.get(failKey(record)) ?? 0) + 1);
+    if (previous && !previous.result.ok && (failures.get(failKey(previous)) ?? 0) >= 2) {
+      const repeated = [...new Set(records.filter(record => (failures.get(failKey(record)) ?? 0) >= 2).map(record => record.tool))];
+      for (const tool of repeated) delete criteria[tool];
+      feedback = `${previous.tool} ${JSON.stringify(previous.args)} failed ${failures.get(failKey(previous))} times: ${trim(previous.result.output, 200)}. The same call will fail again; ${repeated.join(', ')} unavailable for this turn. Use the workspace listing, another action, or finish with what is known.`;
+    }
+    const rewritten = writtenPath(previous);
+    if (rewritten !== undefined && rewritten === writtenPath(earlier)) {
+      const runnable = [...this.registry.values()].some(tool => tool.effect === 'shell');
+      for (const tool of this.registry.values()) if (runnable ? tool.effect !== 'shell' : tool.effect === 'write' && tool.name !== 'set_plan') delete criteria[tool.name];
+      feedback = runnable
+        ? `The last two actions rewrote ${rewritten} without running it. Run the program now and use its output; only shell tools are available for this turn.`
+        : `The last two actions rewrote ${rewritten} without running or reading it. Run or inspect the current file before rewriting; write tools are unavailable for this turn.`;
+    }
+    return feedback === undefined ? { criteria } : { criteria, feedback };
   }
 
   async run(prompt: string, externalSignal?: AbortSignal): Promise<RunResult> {
@@ -183,35 +219,8 @@ export class Harness {
           ],
         };
         await emit('turn', { files: inventory.files.length, plan });
-        const criteria = Object.fromEntries([...this.registry.values()].map(tool => [tool.name, tool.description]));
-        const previous = records.at(-1), earlier = records.at(-2);
-        if (previous && earlier && this.registry.get(previous.tool)?.effect === 'read' && previous.tool === earlier.tool &&
-            JSON.stringify(previous.args) === JSON.stringify(earlier.args) && previous.result.ok === earlier.result.ok && previous.result.output === earlier.result.output) {
-          delete criteria[previous.tool];
-          state.progressFeedback = 'The last two reads returned the same unchanged result. Choose another action that advances the task; the repeated read tool is unavailable for this turn.';
-        }
-        const failures = new Map<string, number>();
-        const failKey = (record: ToolRecord): string => `${record.tool}\0${JSON.stringify(record.args)}`;
-        for (const record of records) if (!record.result.ok && this.registry.has(record.tool)) failures.set(failKey(record), (failures.get(failKey(record)) ?? 0) + 1);
-        if (previous && !previous.result.ok && (failures.get(failKey(previous)) ?? 0) >= 2) {
-          const repeated = [...new Set(records.filter(record => (failures.get(failKey(record)) ?? 0) >= 2).map(record => record.tool))];
-          for (const tool of repeated) delete criteria[tool];
-          state.progressFeedback = `${previous.tool} ${JSON.stringify(previous.args)} failed ${failures.get(failKey(previous))} times: ${trim(previous.result.output, 200)}. The same call will fail again; ${repeated.join(', ')} unavailable for this turn. Use the workspace listing, another action, or finish with what is known.`;
-        }
-        const writtenPath = (record: ToolRecord | undefined): string | undefined => {
-          if (!record?.result.ok) return undefined;
-          if (record.tool === 'write_file' && typeof record.args.path === 'string') return record.args.path;
-          if (record.tool === 'write_files' && Array.isArray(record.result.data?.paths)) return [...record.result.data.paths as string[]].sort().join(', ');
-          return undefined;
-        };
-        const rewritten = writtenPath(previous);
-        if (rewritten !== undefined && rewritten === writtenPath(earlier)) {
-          const runnable = [...this.registry.values()].some(tool => tool.effect === 'shell');
-          for (const tool of this.registry.values()) if (runnable ? tool.effect !== 'shell' : tool.effect === 'write' && tool.name !== 'set_plan') delete criteria[tool.name];
-          state.progressFeedback = runnable
-            ? `The last two actions rewrote ${rewritten} without running it. Run the program now and use its output; only shell tools are available for this turn.`
-            : `The last two actions rewrote ${rewritten} without running or reading it. Run or inspect the current file before rewriting; write tools are unavailable for this turn.`;
-        }
+        const { criteria, feedback } = this.actionCriteria(records);
+        if (feedback !== undefined) state.progressFeedback = feedback;
         criteria.finish = 'All requested work is complete and applicable verification has passed; summarize the observed outcome.';
         if (records.at(-1)?.tool === 'finish' && !records.at(-1)?.result.ok) delete criteria.finish;
         criteria.blocked = 'No further useful action is possible without user information or an external prerequisite; explain it.';
@@ -224,6 +233,11 @@ export class Harness {
         );
         const action = selection.value as string;
         await emit('action', { tool: action });
+        const fail = async (output: string, args: ToolRecord['args'] = {}): Promise<void> => {
+          const record: ToolRecord = { turn, tool: action, args, result: { ok: false, output } };
+          records.push(record);
+          await emit('tool_end', record);
+        };
         const fragments = fragmentsFrom([...messages, ...inventory.files, plan, ...recent.flatMap(record => [
           ...Object.values(record.args).filter((value): value is string => typeof value === 'string'), record.result.output,
         ])]);
@@ -253,16 +267,12 @@ export class Harness {
               : await decisions.probability(checkState, instruction);
             const accepted = typeof verdict === 'string' ? verdict === 'complete' : verdict >= this.options.completionThreshold!;
             if (this.pendingInputs.length) {
-              const record: ToolRecord = { turn, tool: action, args: {}, result: { ok: false, output: 'New user instructions arrived. Apply them before ending the run.' } };
-              records.push(record);
-              await emit('tool_end', record);
+              await fail('New user instructions arrived. Apply them before ending the run.');
               continue;
             }
             if (!accepted) {
               completionRejections++;
-              const record: ToolRecord = { turn, tool: 'finish', args: {}, result: { ok: false, output: `Completion rejected (${completionRejections}/3): ${typeof verdict === 'number' ? `satisfaction probability ${verdict}` : 'the completion check selected continue'}. Make a concrete implementation change or resolve a verification failure; repeating a successful command or revising the plan does not establish progress.` } };
-              records.push(record);
-              await emit('tool_end', record);
+              await fail(`Completion rejected (${completionRejections}/3): ${typeof verdict === 'number' ? `satisfaction probability ${verdict}` : 'the completion check selected continue'}. Make a concrete implementation change or resolve a verification failure; repeating a successful command or revising the plan does not establish progress.`);
               if (completionRejections >= 3) {
                 status = 'limited';
                 summary = `${completionSummary(records)}\nStopped after 3 rejected completion checks without an implementation change. Jev could not establish completion; successful tools were not treated as proof of the entire task.`;
@@ -272,9 +282,7 @@ export class Harness {
             }
           }
           if (this.pendingInputs.length) {
-            const record: ToolRecord = { turn, tool: action, args: {}, result: { ok: false, output: 'New user instructions arrived. Apply them before ending the run.' } };
-            records.push(record);
-            await emit('tool_end', record);
+            await fail('New user instructions arrived. Apply them before ending the run.');
             continue;
           }
           status = action === 'finish' ? 'completed' : 'blocked';
@@ -290,15 +298,11 @@ export class Harness {
           const authorized = await this.options.authorize?.(tool, args, signal) ?? true;
           signal.throwIfAborted();
           if (this.pendingInputs.length) {
-            const record: ToolRecord = { turn, tool: action, args, result: { ok: false, output: 'New user instructions arrived before execution. Reconsider this action using the updated task.' } };
-            records.push(record);
-            await emit('tool_end', record);
+            await fail('New user instructions arrived before execution. Reconsider this action using the updated task.', args);
             continue;
           }
           if (!authorized) {
-            const record: ToolRecord = { turn, tool: action, args, result: { ok: false, output: 'Host declined this tool call. Choose another action or explain the blocker.' } };
-            records.push(record);
-            await emit('tool_end', record);
+            await fail('Host declined this tool call. Choose another action or explain the blocker.', args);
             continue;
           }
           await emit('tool_start', { tool: action, args });
@@ -311,9 +315,7 @@ export class Harness {
           await emit('tool_end', record);
         } catch (error) {
           if (signal.aborted || error instanceof DecisionError || (error instanceof LimitError && decisions.exhausted)) throw error;
-          const record: ToolRecord = { turn, tool: action, args, result: { ok: false, output: error instanceof Error ? error.message : String(error) } };
-          records.push(record);
-          await emit('tool_end', record);
+          await fail(error instanceof Error ? error.message : String(error), args);
         }
         } finally {
           const timing = { durationMs: Math.round(performance.now() - turnStarted), elapsedMs: Math.round(performance.now() - started), requests: decisions.requests - turnRequests };

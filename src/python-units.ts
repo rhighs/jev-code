@@ -1,5 +1,5 @@
 import type { Decisions } from './decisions.js';
-import { functionDef, node, type Builder, type PythonNode, type Scope, type Vocab } from './python-ast.js';
+import { functionDef, node, type Builder, type PythonNode, type Scope, type Vocab } from './python-nodes.js';
 import { searchUnit, type SearchHooks } from './python-search.js';
 
 export interface Peer { name: string; arity: number; purpose: string; module?: string }

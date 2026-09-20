@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { PENDING } from '../decision-context.js';
 import { sanitizedEnv } from '../env.js';
-import { group, adapterFor, BIN, CMP, type BinOp, type CmpOp, type Dialect, type Expr, type Program, type Stmt } from './core.js';
+import { adapterFor, BIN, CMP, exprRenderer, type BinOp, type CmpOp, type Dialect, type Expr, type Program, type Stmt } from './core.js';
 
 const keywords = new Set('and break do else elseif end false for function goto if in local nil not or repeat return then true until while print ipairs pairs tostring tonumber string table math'.split(' '));
 
@@ -17,20 +17,10 @@ const str = (v: string): string => JSON.stringify(v).replace(/\\u([0-9a-fA-F]{4}
 
 const prefix = (e: Expr): string => e.kind === 'name' || e.kind === 'call' || e.kind === 'index' || e.kind === 'hole' ? expr(e) : `(${expr(e)})`;
 
-export const expr = (e: Expr): string => {
-  switch (e.kind) {
-    case 'hole': return PENDING;
-    case 'string': return str(e.value);
-    case 'number': return e.value < 0 ? `(${e.value})` : String(e.value);
-    case 'bool': return String(e.value);
-    case 'name': return e.id;
-    case 'binary': return `${group(e.left, expr(e.left))} ${BIN_LUA[e.op]} ${group(e.right, expr(e.right))}`;
-    case 'compare': return `${group(e.left, expr(e.left))} ${CMP_LUA[e.op]} ${group(e.right, expr(e.right))}`;
-    case 'call': return `${e.callee}(${e.args.map(expr).join(', ')})`;
-    case 'list': return `{${e.items.map(expr).join(', ')}}`;
-    case 'index': return `${prefix(e.target)}[(${expr(e.index)}) + 1]`;
-  }
-};
+export const expr: (e: Expr) => string = exprRenderer({
+  list: items => `{${items.join(', ')}}`, str, bin: BIN_LUA, cmp: CMP_LUA,
+  index: (e, expr) => `${prefix(e.target)}[(${expr(e.index)}) + 1]`,
+});
 
 const stmt = (s: Stmt, indent: string): string[] => {
   const inner = (body: Stmt[]): string[] => body.length ? body.flatMap(b => stmt(b, indent + '  ')) : [`${indent}  ${PENDING}`];

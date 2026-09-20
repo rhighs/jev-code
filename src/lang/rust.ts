@@ -1,30 +1,15 @@
-import { spawn } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { PENDING } from '../decision-context.js';
-import { sanitizedEnv } from '../env.js';
-import { group, adapterFor, BIN, CMP, type Dialect, type Expr, type Program, type Stmt, type ValueType } from './core.js';
+import { adapterFor, exprRenderer, type Dialect, type Program, type Stmt, type ValueType } from './core.js';
+import { runTool, withTempDir } from './toolchain.js';
 
 const keywords = new Set('as break const continue crate else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while async await dyn abstract become box do final macro override priv typeof unsized virtual yield try gen union macro_rules raw safe main println'.split(' '));
 
 const types: Partial<Record<ValueType, string>> = { number: 'i64', string: '&str', bool: 'bool' };
 const annotate = (type: ValueType): string => types[type] ? `: ${types[type]}` : '';
 
-const expr = (e: Expr): string => {
-  switch (e.kind) {
-    case 'hole': return PENDING;
-    case 'string': return JSON.stringify(e.value);
-    case 'number': return e.value < 0 ? `(${e.value})` : String(e.value);
-    case 'bool': return String(e.value);
-    case 'name': return e.id;
-    case 'binary': return `${group(e.left, expr(e.left))} ${BIN[e.op]} ${group(e.right, expr(e.right))}`;
-    case 'compare': return `${group(e.left, expr(e.left))} ${CMP[e.op]} ${group(e.right, expr(e.right))}`;
-    case 'call': return `${e.callee}(${e.args.map(expr).join(', ')})`;
-    case 'list': return `vec![${e.items.map(expr).join(', ')}]`;
-    case 'index': return `${expr(e.target)}[${expr(e.index)}]`;
-  }
-};
+const expr = exprRenderer({ list: items => `vec![${items.join(', ')}]` });
 
 const stmt = (s: Stmt, indent: string): string[] => {
   const inner = (body: Stmt[]): string[] => body.length ? body.flatMap(b => stmt(b, indent + '  ')) : [`${indent}  ${PENDING};`];
@@ -53,23 +38,11 @@ const render = (program: Program): string => {
 
 const validate = async (source: string, signal: AbortSignal): Promise<void> => {
   signal.throwIfAborted();
-  const dir = await mkdtemp(join(tmpdir(), 'jev-rust-'));
-  try {
+  await withTempDir('jev-rust-', async dir => {
     await writeFile(join(dir, 'main.rs'), source);
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn('rustc', ['--edition', '2021', '--crate-type', 'bin', '--emit=metadata', '-o', join(dir, 'out'), 'main.rs'], { cwd: dir, env: sanitizedEnv(), stdio: ['ignore', 'ignore', 'pipe'], signal, timeout: 30_000 });
-      let err = '';
-      child.on('error', (reason: NodeJS.ErrnoException) => reject(reason.code === 'ENOENT' ? new Error('Rust validation needs rustc on PATH.') : reason));
-      child.stderr.on('data', (chunk: Buffer) => { err = (err + chunk.toString()).slice(-8000); });
-      child.on('close', code => {
-        if (signal.aborted) { reject(signal.reason); return; }
-        if (code !== 0) { reject(new Error(`Rust validation failed: ${err.trim() || `exit ${code}`}`)); return; }
-        resolve();
-      });
-    });
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+    const args = ['--edition', '2021', '--crate-type', 'bin', '--emit=metadata', '-o', join(dir, 'out'), 'main.rs'];
+    await runTool('rustc', args, { name: 'Rust', signal, timeout: 30_000, cwd: dir, missing: 'Rust validation needs rustc on PATH.' });
+  });
 };
 
 const features: Dialect['features'] = { functions: true, while: true, range: true, foreach: false, list: false, index: false, compareStrings: false, concat: false };
