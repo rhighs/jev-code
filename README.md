@@ -43,17 +43,11 @@ jev-code ast install module | ast list | ast remove id
 
 ## EXAMPLE
 
-A live run. Jev builds `stats.py`, reads a numeric data file, computes a summary, runs the program, and reports the observed result.
+A live run. Jev builds `greet.py` one grammar production at a time, reads it back, rewrites it until the names match the task, runs it, and reports the output.
 
 <p align="center">
-  <img src="docs/media/session.gif" alt="A jev-code session building and running a Python statistics module" width="920">
+  <img src="docs/media/session.gif" alt="A jev-code session building and running greet.py" width="920">
 </p>
-
-Play the same recording in your terminal:
-
-```bash
-asciinema play docs/media/session.cast
-```
 
 ## INSTALL
 
