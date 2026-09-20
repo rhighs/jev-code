@@ -253,7 +253,6 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
 
   async function terminal(slot: string, scope: Scope, values: Array<string | number>): Promise<string | number> {
     const criteria: Record<string, string> = Object.fromEntries(values.map((value, index) => [`value_${index}`, JSON.stringify(value)]));
-    const numeric = slot === 'number';
     if (slot === 'string') criteria.custom = 'Compose a different terminal value from valid token choices, staying in AST generation.';
     const selected = await pick(slot, scope, criteria);
     if (selected !== 'custom') return values[Number(selected.slice(6))]!;
