@@ -14,6 +14,7 @@ import {
 } from './types.js';
 
 const ROUNDING_STEP = 0.01;
+const MAX_DISTRIBUTION_DRIFT = 0.1;
 const MAX_ALTERNATIVES = 4;
 
 export interface DecisionSessionOptions extends RunResourceOptions {
@@ -64,7 +65,7 @@ const assertDistribution = (
     probabilities[label] = probability;
     total += probability;
   }
-  if (Math.abs(total - 1) > ROUNDING_STEP * labels.length / 2 + 1e-9) invalid(message);
+  if (Math.abs(total - 1) > Math.min(ROUNDING_STEP * labels.length / 2, MAX_DISTRIBUTION_DRIFT) + 1e-9) invalid(message);
   return probabilities;
 };
 

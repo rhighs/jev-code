@@ -33,6 +33,8 @@ test('choices accept a distribution whose two-decimal rounding drifts from one',
   const probabilities = Object.fromEntries(labels.map(l => [l, 0.03]));
   const result = await decisions(provider({ type: 'choice', choice: 'value_4', confidence: 0.3, probabilities })).choose({}, 'pick', Object.fromEntries(labels.map(l => [l, l])));
   assert.equal(result, 'value_4');
+  const zeros = Object.fromEntries(labels.map(l => [l, 0]));
+  await assert.rejects(decisions(provider({ type: 'choice', choice: 'value_4', confidence: 0.3, probabilities: zeros })).choose({}, 'pick', Object.fromEntries(labels.map(l => [l, l]))), DecisionError);
 });
 
 test('compatibility state projection omits optional undefined values without bypassing strict JSON validation', async () => {
