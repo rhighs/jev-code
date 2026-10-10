@@ -37,17 +37,20 @@ jev-code decide --true "statement" [--threshold p] [--lines]
 jev-code decide --score "criteria" [--lines]
 jev-code decide --spec file.json
 jev-code replay run-id [--speed x] [--plain]
+jev-code --resume run-id|last
 jev-code login | logout
 jev-code ast install module | ast list | ast remove id
 ```
 
 ## EXAMPLE
 
-A live run. Jev builds `greet.py` one grammar rule at a time, reads it back, fixes the names, runs it, and reports the output.
+A live run. Jev builds `hello.py` one grammar rule at a time, runs it with `python3`, and reports the observed output.
 
 <p align="center">
-  <img src="docs/media/session.gif" alt="A jev-code session building and running greet.py" width="920">
+  <img src="docs/media/session.gif" alt="A jev-code session building and running hello.py" width="920">
 </p>
+
+The recording is a real `--print` run with a saved API key, not a scripted demo. The asciicast is committed at [`docs/media/session.cast`](docs/media/session.cast); play it with `asciinema play docs/media/session.cast`.
 
 ## INSTALL
 
@@ -61,6 +64,8 @@ Works on macOS and Linux. Uses your Node.js 22+ if you have it, otherwise instal
 ## DESCRIPTION
 
 Jev does not write text. It picks one option from a list, or gives a probability, or gives a score. jev-code turns coding into a chain of such picks. It builds a program as a syntax tree, one grammar rule at a time, for the languages listed below. It builds shell commands the same way. Then it runs the result and shows what happened.
+
+Independent questions share one request: a helper's name, arity, and purpose, sibling arguments, and independent sub-expressions batch into a wave, each question with its own criteria. String candidates are enriched from the task, so a task-derived literal resolves in one pick. A helper body that fails its static check is regenerated once in place with the reason in state. A failed run attributes the failure to the recorded Python decision and replays its retained runner-up alternatives when the pick was a near-tie, bounded to two repair cycles per write target. Interrupted runs continue from their journal with `--resume`.
 
 The session is a list of cards. Each tool call is one card: a file write, an edit, or a command. A pane under the cards shows the file while Jev builds it. A strip shows the current slot, the chosen rule, and its confidence. Before a shell command runs, press one key: `y` allows it once, `n` denies it, `a` allows that tool for the whole session.
 
@@ -86,6 +91,7 @@ jev-code
 | `jev-code --json --print "task"` | Emit one JSON event per line on stdout. |
 | `jev-code decide ...` | Make one Jev decision over stdin. See DECIDE. |
 | `jev-code replay <run-id>` | Replay a saved run as cards. |
+| `jev-code --resume <run-id\|last>` | Continue an interrupted run from its journal, without a prompt. |
 | `jev-code login` | Enter the API key and save it. |
 | `jev-code logout` | Remove the saved API key. |
 | `jev-code ast install <module>` | Install a language adapter from a local path or npm. |
@@ -274,6 +280,8 @@ git diff | jev-code decide --true "safe to commit" && git commit -am wip
 ## LIMITS
 
 Jev has a 32k context and picks from short lists. Small programs finish. Larger ones can run out of request budget before they pass. `docs/guide.md` records the current eval results. Shell commands run on your machine; confirm each one unless you pass `--yes`.
+
+Requests are size-checked before they are sent: an over-budget decision compacts the state first, and a single decision that still exceeds the platform's token budget retries once after compaction, then fails that decision only. Three consecutive over-budget action decisions end the run as `limited`. A run that stops before completion prints a `--resume <run-id>` hint; resume continues at the next turn, carries turns and request usage over, and never replays a journaled tool effect. Repair and alternative replay are Python-only in this pass.
 
 ## SEE ALSO
 

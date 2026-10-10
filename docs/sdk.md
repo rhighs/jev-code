@@ -54,6 +54,32 @@ Decision state must be JSON-compatible. Responses are checked for the exact answ
 `DecisionSession.fork()` shares limits, usage, deadline, and concurrency with the parent session. Use it to isolate cancellation for sibling work without creating a fresh request budget.
 Decision observers use the same `eventTimeoutMs` policy as program observers (5 seconds by default) and are raced against session cancellation and deadlines.
 
+## Batch independent questions
+
+`DecisionSession.chooseWave` answers several independent questions in one provider request. Each question carries its own instruction and criteria; the caller guarantees the dependency rule, so no question's criteria may depend on a sibling answer (ask dependent positions separately or after the wave). Every question must offer 2–255 labels; a question with fewer than two labels is the caller's to resolve host-side, and passing one throws.
+
+```typescript
+import { DecisionSession, JevProvider } from 'jev-code';
+
+const decisions = new DecisionSession(new JevProvider());
+
+const wave = await decisions.chooseWave(
+  { ticket: { subject: 'Refund for duplicate charge' } },
+  {
+    kind: { instruction: 'Choose the ticket kind.', criteria: { bug: 'A defect report.', question: 'A usage question.', task: 'A work item.' } },
+    priority: { instruction: 'Choose the priority.', criteria: { low: 'No urgency.', high: 'Blocks users.' } },
+  },
+);
+
+console.log(wave.value.kind.choice, wave.value.priority.alternatives[0]);
+```
+
+One `chooseWave` call is one request. `WaveDecisionResult.value` maps each question key to a `WaveChoice` with the chosen label, confidence, its own probability, the full distribution, and the ranked `alternatives` (up to four, highest probability first). Every question is validated independently, and an invalid or missing answer rejects with `DecisionError`. `WaveQuestion` is the `{ instruction, criteria }` question shape.
+
+The compatibility harness uses the same wave path for its batched generation questions: it resolves single-label questions host-side (no request, no event), and every question that reaches Jev emits one `decision` event carrying the shared `wave` id and a per-question `decisionId`, with `nearTie` carrying the canonical near-tie flag. `NEAR_TIE_GAP` (0.1) and `isNearTie(alternatives, chosen)` define that flag: true when the top two probabilities are within the inclusive gap, or when the chosen label is not the probability argmax. `waveFailureKind(error)` classifies a wave failure as `'bisect'` (HTTP 422 or an invalid response, so the offending question can be isolated) or `'fatal'` (everything else).
+
+`DecisionSession` accepts an optional `runContext` for run-scoped state (recorded decision paths, retained alternatives, the within-run unit cache, and the serializer worker). `Harness.run` creates one per run and disposes it at the end; direct library callers default to a process-scoped context and should close it with `closeDefaultRunContext()` when done, or create and dispose their own with `createRunContext()`.
+
 ## Route typed values
 
 A router contains two to 255 named routes. Route values are returned as data and never invoked by the router, so the application remains responsible for authorization and effects.
