@@ -2,12 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import { Decisions } from '../src/decisions.js';
-import { generatePythonAst } from '../src/python-ast.js';
+import { createBuilder, generatePythonAst, vocabulary, type Shared } from '../src/python-ast.js';
+import { node, type Builder, type PythonNode, type Scope } from '../src/python-nodes.js';
+import { fillUnits, type Unit, type UnitCheck, type UnitRepair } from '../src/python-units.js';
 import { attemptScope, createRunContext } from '../src/run-context.js';
 import { LimitError, type DecisionProvider } from '../src/types.js';
 import { SlotProvider, type SlotEntry } from './helpers.js';
 
-interface UnitState { generation: { slot: string; unit?: string; peers?: Array<{ name: string; arity: number; purpose: string }>; partialSource: string } }
+interface UnitState { generation: { slot: string; unit?: string; peers?: Array<{ name: string; arity: number; purpose: string }>; partialSource: string; repair?: { reason: string; symbol?: string; snippet?: string } } }
 type Hold = (state: UnitState, signal?: AbortSignal) => Promise<void> | void;
 
 class GateProvider implements DecisionProvider {
@@ -48,6 +50,8 @@ const main: SlotEntry[] = [
   { slot: 'module_body', answer: 'finish' },
 ];
 const withTimeout = <T>(promise: Promise<T>, ms = 8000): Promise<T> => Promise.race([promise, new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms))]);
+const stubUnit = (name: string): Unit => ({ name, arity: 0, purpose: 'helper', params: [], def: node('Module', { body: [] }), body: [] });
+const rootScope = (): Scope => ({ names: new Map(), function: false, loop: false });
 
 test('zero units keeps the single-scope path: same source and same slots after the count pick', async () => {
   const provider = new GateProvider([
@@ -94,14 +98,120 @@ test('a unit calling a peer is constrained to the peer arity', async () => {
   assert.ok(callee.keys.length > 0);
 });
 
-test('one failing unit aborts the other in-flight unit and nothing is produced', async () => {
-  const provider = new GateProvider([...decomposition, { unit: 'shout', slot: 'function_body', answer: 'return' }], async (s, signal) => {
-    if (s.generation.unit !== 'shout' || s.generation.slot !== 'function_body') return;
-    await new Promise<void>(resolve => signal?.addEventListener('abort', () => resolve(), { once: true }));
-  });
-  const events: boolean[] = [];
-  await assert.rejects(withTimeout(generatePythonAst(decisions(provider), state, 'content', { ...options, onText: async (_f, _t, done) => { events.push(done); } })), /no entry for .*greet/);
-  assert.ok(!events.includes(true));
+test('a unit whose static check fails twice aborts the other in-flight unit and nothing is produced', async () => {
+  const units = [stubUnit('greet'), stubUnit('shout')];
+  const aborted: string[] = [];
+  let checks = 0;
+  const makeBuilder = (unit: Unit, fork: Decisions): Builder => ({
+    block: async (): Promise<void> => {
+      if (unit.name !== 'shout') return;
+      await new Promise<void>(resolve => fork.signal.addEventListener('abort', () => resolve(), { once: true }));
+      aborted.push(unit.name);
+    },
+  }) as unknown as Builder;
+  const check: UnitCheck = {
+    render: async unit => `def ${unit.name}():\n    pass\n`,
+    check: async unit => {
+      if (unit.name !== 'greet') return undefined;
+      checks++;
+      return checks === 1 ? { reason: 'return' } : { reason: 'arity', symbol: 'shout' };
+    },
+  };
+  await assert.rejects(withTimeout(fillUnits(units, decisions(new SlotProvider([])), makeBuilder, rootScope, check)), /static check failed twice.*return then arity/);
+  assert.equal(checks, 2, 'one retryable failure retries exactly once before the abort');
+  assert.deepEqual(aborted, ['shout'], 'the in-flight unit is aborted by the second failure');
+});
+
+test('a fatal generation error is not retried by the static check path', async () => {
+  let checks = 0;
+  const makeBuilder = (): Builder => ({ block: async () => { throw new Error('provider exploded'); } }) as unknown as Builder;
+  await assert.rejects(fillUnits([stubUnit('solo')], decisions(new SlotProvider([])), makeBuilder, rootScope, { render: async () => '', check: async () => { checks++; return undefined; } }), /provider exploded/);
+  assert.equal(checks, 0, 'fatal errors never reach the static check');
+});
+
+test('a compile failure retries with the source snippet and the reason and no criteria change', async () => {
+  const repairs: Array<UnitRepair | undefined> = [];
+  const makeBuilder = (_unit: Unit, _fork: Decisions, _candidate?: number, _body?: PythonNode[], repair?: UnitRepair): Builder => {
+    repairs.push(repair);
+    return { block: async () => {} } as unknown as Builder;
+  };
+  const source = 'def solo():\n    return (\n';
+  let checks = 0;
+  const check: UnitCheck = { render: async () => source, check: async () => { checks++; return checks === 1 ? { reason: 'compile' } : undefined; } };
+  await fillUnits([stubUnit('solo')], decisions(new SlotProvider([])), makeBuilder, rootScope, check);
+  assert.equal(repairs.length, 2, 'one retry in place');
+  assert.equal(repairs[0], undefined);
+  assert.deepEqual(repairs[1], { reason: 'compile', snippet: source });
+});
+
+test('a width-1 unit that fails its static check retries once with the reason and narrowed criteria', async () => {
+  const prompt = 'Write a Python helper get_greeting(name) that returns the greeting text, then print it.';
+  const provider = new GateProvider([
+    { slot: 'unit_count', answer: '1' },
+    { slot: 'unit_0_name', answer: { value: 'get_greeting' } }, { slot: 'unit_0_arity', answer: '1' },
+    { slot: 'unit_0_purpose', answer: { value: 'returns the greeting' } }, { slot: 'unit_0_parameter_0', answer: { value: 'name' } },
+    // The first attempt has no return, so the wants-return static check fails.
+    { unit: 'get_greeting', slot: 'function_body', answer: 'pass', once: true },
+    { unit: 'get_greeting', slot: 'function_body', answer: 'finish', once: true },
+    // The retry is narrowed to the single return production.
+    { unit: 'get_greeting', slot: 'function_body', answer: 'return' },
+    { unit: 'get_greeting', slot: 'expression', answer: 'string' },
+    { unit: 'get_greeting', slot: 'string', answer: { value: 'greeting' } },
+    { slot: 'module_body', answer: 'expr', once: true }, { slot: 'expression', answer: 'call' }, { slot: 'callee', answer: { value: 'print' }, once: true }, { slot: 'argument_count', answer: '1' },
+    { slot: 'argument_0', answer: 'string' }, { slot: 'string', answer: { value: 'greeting' } },
+    { slot: 'module_body', answer: 'finish' },
+  ]);
+  const source = await generatePythonAst(decisions(provider), { task: { prompt, turn: 1, updates: [] } }, 'content', options);
+  assert.equal(source, "def get_greeting(name):\n    return 'greeting'\nprint('greeting')\n");
+
+  const bodyQuestions = provider.criteria.filter(c => c.unit === 'get_greeting' && c.slot === 'function_body');
+  assert.equal(bodyQuestions.length, 2, 'the forced-return retry pick is host-derived and asks nothing');
+  assert.ok(bodyQuestions[0]!.keys.includes('pass') && bodyQuestions[0]!.keys.includes('return'));
+
+  const retry = provider.seen.find(s => s.generation.unit === 'get_greeting' && s.generation.slot === 'expression');
+  assert.equal(retry?.generation.repair?.reason, 'return');
+  assert.equal(retry?.generation.repair?.symbol, undefined);
+  assert.deepEqual(provider.seen.map(s => s.generation.slot), ['unit_count', 'unit_0_name', 'unit_0_arity', 'unit_0_purpose', 'unit_0_parameter_0',
+    'function_body', 'function_body', 'expression', 'string',
+    'module_body', 'expression', 'callee', 'argument_count', 'argument_0', 'string', 'module_body']);
+});
+
+test('retry narrowing applies the reason table: arity forbids the peer, undefined drops the name, compile keeps criteria', async () => {
+  const objective = 'shout the greet message';
+  const context = createRunContext();
+  const shared: Shared = { field: 'content', options: { ...options, context }, objective, context: {}, budget: { step: 0 }, vocab: vocabulary(objective), maxDepth: 8 };
+  const peers = [{ name: 'greet', arity: 1, purpose: 'greet' }];
+  const scope: Scope = { names: new Map([['message', { kind: 'variable' }]]), parent: { names: new Map([['greet', { kind: 'function', arity: 1 }]]), function: false, loop: false }, function: true, loop: false };
+  const record = (script: SlotEntry[]) => {
+    const inner = new SlotProvider(script);
+    const seen: Array<{ slot: string; keys: string[]; values: unknown[]; repair?: { reason: string; symbol?: string; snippet?: string } }> = [];
+    const provider: DecisionProvider = { decide: async (input, questions, signal) => {
+      const generation = (input as { generation: { slot: string; repair?: { reason: string; symbol?: string; snippet?: string } } }).generation;
+      const question = questions.selection;
+      if (question?.type === 'choice') seen.push({ slot: generation.slot, keys: Object.keys(question.criteria), values: Object.values(question.criteria), ...(generation.repair === undefined ? {} : { repair: generation.repair }) });
+      return inner.decide(input, questions, signal);
+    } };
+    return { provider, seen };
+  };
+  const script: SlotEntry[] = [{ slot: 'function_body', answer: 'return' }, { slot: 'expression', answer: 'call' }, { slot: 'callee', answer: { value: 'print' } }, { slot: 'argument_count', answer: '0' }];
+
+  const arity = record(script);
+  await createBuilder(shared, { decisions: decisions(arity.provider), unit: 'shout', peers, repair: { reason: 'arity', symbol: 'greet' }, render: async () => '', report: async () => {} }).block([], scope, 1, 'function_body');
+  const callee = arity.seen.find(entry => entry.slot === 'callee')!;
+  assert.ok(callee.values.includes('print'));
+  assert.ok(!callee.values.includes('greet'), `the offending peer call is forbidden: ${callee.values.join(', ')}`);
+
+  const undefinedName = record(script);
+  await createBuilder(shared, { decisions: decisions(undefinedName.provider), unit: 'shout', peers, repair: { reason: 'undefined', symbol: 'message' }, render: async () => '', report: async () => {} }).block([], scope, 1, 'function_body');
+  const reference = undefinedName.seen.find(entry => entry.slot === 'expression')!;
+  assert.ok(!reference.keys.includes('name'), `the undefined name is not offered: ${reference.keys.join(', ')}`);
+
+  const compile = record(script);
+  await createBuilder(shared, { decisions: decisions(compile.provider), unit: 'shout', peers, repair: { reason: 'compile', snippet: 'def shout():\n    return (' }, render: async () => '', report: async () => {} }).block([], scope, 1, 'function_body');
+  const compileExpression = compile.seen.find(entry => entry.slot === 'expression')!;
+  assert.equal(compileExpression.repair?.snippet, 'def shout():\n    return (');
+  assert.ok(compileExpression.keys.includes('name') && compileExpression.keys.includes('call'), 'compile changes no criteria');
+  await context.dispose();
 });
 
 test('the shared request budget holds across forks and surfaces LimitError', async () => {

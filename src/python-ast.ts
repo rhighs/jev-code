@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Decisions, State } from './decisions.js';
 import type { GenerateOptions } from './generation.js';
-import { assemble, assembleProject, decompose, decomposeLayout, fillUnits, isEntry, peersOf, type Peer, type Unit } from './python-units.js';
+import { assemble, assembleProject, decompose, decomposeLayout, fillUnits, isEntry, peersOf, type Peer, type Unit, type UnitCheck, type UnitRepair } from './python-units.js';
 import { RUBRIC, wantsReturn } from './python-search.js';
 import { gridCursor } from './grid.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
@@ -184,8 +184,8 @@ export async function validatePythonProject(files: Record<string, string>, signa
 const checkBridge = String.raw`
 import ast, json, sys, builtins
 spec = json.load(sys.stdin)
-def done(reason):
-    print(json.dumps(reason)); sys.exit(0)
+def done(reason, symbol=None):
+    print(json.dumps(json.dumps({'reason': reason, 'symbol': symbol} if symbol else {'reason': reason}))); sys.exit(0)
 try:
     tree = ast.parse(spec['source'])
     compile(tree, '<candidate>', 'exec')
@@ -200,23 +200,41 @@ for n in ast.walk(fn):
     elif isinstance(n, ast.FunctionDef): defined.add(n.name); defined.update(a.arg for a in n.args.args)
     elif isinstance(n, ast.ExceptHandler) and n.name: defined.add(n.name)
 for n in ast.walk(fn):
-    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in defined: done('undefined')
+    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in defined: done('undefined', n.id)
 for n in ast.walk(fn):
-    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in spec['peers'] and (len(n.args) != spec['peers'][n.func.id] or n.keywords): done('arity')
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in spec['peers'] and (len(n.args) != spec['peers'][n.func.id] or n.keywords): done('arity', n.func.id)
 if spec['wantsReturn'] and not any(isinstance(n, ast.Return) and n.value is not None for n in ast.walk(fn)): done('return')
 done('ok')
 `;
 
 export interface CandidateSpec { name: string; params: string[]; peers: Record<string, number>; wantsReturn: boolean }
+export interface CandidateDiagnosis { reason: 'compile' | 'undefined' | 'arity' | 'return'; symbol?: string }
+const candidateReasons = new Set<string>(['compile', 'undefined', 'arity', 'return']);
+
+/**
+ * Static only: compile, undefined names, peer arity, missing return. Nothing is executed.
+ * Returns the first reason plus the offending symbol when the check knows one; undefined when the
+ * candidate passes.
+ */
+export async function diagnoseCandidate(source: string, spec: CandidateSpec, signal: AbortSignal): Promise<CandidateDiagnosis | undefined> {
+  const raw = await runPythonJson({ source, ...spec }, signal, 512, checkBridge);
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { throw new Error(`Python candidate check returned an invalid result: ${raw}`); }
+  if (!parsed || typeof parsed !== 'object') throw new Error(`Python candidate check returned an invalid result: ${raw}`);
+  const result = parsed as { reason?: unknown; symbol?: unknown };
+  if (result.reason === 'ok') return undefined;
+  if (typeof result.reason !== 'string' || !candidateReasons.has(result.reason)) throw new Error(`Python candidate check returned an invalid reason: ${raw}`);
+  return { reason: result.reason as CandidateDiagnosis['reason'], ...(typeof result.symbol === 'string' ? { symbol: result.symbol } : {}) };
+}
+
 /** Static only: compile, undefined names, peer arity, missing return. Nothing is executed. */
 export async function checkCandidate(source: string, spec: CandidateSpec, signal: AbortSignal): Promise<string | undefined> {
-  const reason = await runPythonJson({ source, ...spec }, signal, 16, checkBridge);
-  return reason === 'ok' ? undefined : reason;
+  return (await diagnoseCandidate(source, spec, signal))?.reason;
 }
 
 export interface Shared { field: string; options: GenerateOptions; objective: string; context: State; budget: { step: number }; vocab: Vocab; maxDepth: number }
 export interface StepInfo { slot: string; production: string; symbols: string[] }
-export interface BuilderInput { decisions: Decisions; render: () => Promise<string>; report: (preview: string, info: StepInfo) => Promise<void>; unit?: string; peers?: Peer[]; candidate?: number }
+export interface BuilderInput { decisions: Decisions; render: () => Promise<string>; report: (preview: string, info: StepInfo) => Promise<void>; unit?: string; peers?: Peer[]; candidate?: number; repair?: UnitRepair }
 
 const seeds = ['message', 'result', 'value', 'i', 'main', 'add', 'a', 'b', 'guess', 'target', 'attempts', 'randint', 'append', 'read', 'write', 'strip', 'lower'];
 
@@ -231,11 +249,16 @@ export function vocabulary(objective: string): Vocab {
 }
 
 export function createBuilder(shared: Shared, input: BuilderInput): Builder {
-  const { decisions, render, report, unit, peers, candidate } = input;
+  const { decisions, render, report, unit, peers, candidate, repair } = input;
   const { field, options, objective, context, budget, vocab, maxDepth } = shared;
   const { words, identifiers, strings, numbers } = vocab;
   const runContext = options.context ?? decisions.runContext;
   const pathScope = attemptScope(field, unit, candidate);
+  // Retry narrowing: `arity` forbids the offending peer call; `undefined` keeps the offending
+  // name out of every reference-shaped pick; `return` forces a return; `compile` changes no
+  // criteria and only carries the failed snippet in state.
+  const referenceForbidden = new Set<string>(repair?.reason === 'undefined' && repair.symbol !== undefined ? [repair.symbol] : []);
+  const calleeForbidden = new Set<string>(repair?.reason === 'arity' && repair.symbol !== undefined ? [repair.symbol] : []);
   // A regenerated attempt starts a fresh decision path; its previous entries are invalidated.
   runContext.beginAttempt(pathScope);
 
@@ -249,6 +272,7 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
     const symbols = visible(scope);
     const questions = { selection: choice(instruction, criteria) };
     const core = { field, phase: 'ast', slot, ...(unit === undefined ? {} : { unit }), ...(candidate === undefined ? {} : { candidate }), ...(peers === undefined || !peers.length ? {} : { peers: peers.map(peer => ({ ...peer })) }), symbols, symbolTable: symbolTable(scope),
+      ...(repair === undefined ? {} : { repair: { reason: repair.reason, ...(repair.symbol === undefined ? {} : { symbol: repair.symbol }), ...(repair.snippet === undefined ? {} : { snippet: repair.snippet }) } }),
       constraints: { depth, maxDepth, inFunction: scope.function, inLoop: scope.loop, remainingSteps: options.maxSteps - budget.step } };
     const state = astDecisionState({ objective, context, preview, core, questions, cap: MAX_GRID_REQUEST_BYTES });
     const selected = keys.length === 1 ? keys[0]!
@@ -280,18 +304,23 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
   }
 
   async function identifier(slot: string, scope: Scope, exclude: string[] = []): Promise<string> {
-    const value = String(await terminal(slot, scope, identifiers.filter(value => !exclude.includes(value))));
+    const value = String(await terminal(slot, scope, identifiers.filter(value => !exclude.includes(value) && !referenceForbidden.has(value))));
     if (!/^[A-Za-z_][A-Za-z_0-9]*$/.test(value) || keywords.has(value) || exclude.includes(value)) throw new Error(`Invalid Python identifier: ${value}`);
     return value;
   }
 
   async function expression(target: PythonNode, scope: Scope, depth: number, slot = 'expression', numberConstraint?: 'positive' | 'nonzero', calls = 0): Promise<void> {
     const table = symbolTable(scope);
-    const namesForValue = visible(scope).filter(id => !['builtin', 'function'].includes(table[id]!.kind));
+    const namesForValue = visible(scope).filter(id => !['builtin', 'function'].includes(table[id]!.kind) && !referenceForbidden.has(id));
+    // Direct callees come from the symbol table; members have a defined receiver.
+    const calleeNames = visible(scope).filter(id => !calleeForbidden.has(id) && !referenceForbidden.has(id));
+    const receiverNames = visible(scope).filter(id => !referenceForbidden.has(id));
+    const callees: Record<string, string> = Object.fromEntries(calleeNames.map((value, index) => [`name_${index}`, value]));
+    if (receiverNames.length) callees.member = 'Call an attribute or method of an already defined object or module.';
     const criteria: Record<string, string> = { string: 'A literal string.', number: 'A numeric literal.', boolean: 'True, False or None.' };
     if (namesForValue.length) criteria.name = 'Reference an already defined variable, parameter or module.';
     if (depth < maxDepth) Object.assign(criteria, { binary: 'Combine two expressions with arithmetic.', compare: 'Compare two expressions.', attribute: 'Read an attribute from a defined object.', subscript: 'Index a defined object.' });
-    if (depth < maxDepth && calls < 2) criteria.call = 'Call a function, such as print, with arguments.';
+    if (depth < maxDepth && calls < 2 && Object.keys(callees).length) criteria.call = 'Call a function, such as print, with arguments.';
     if (depth < maxDepth && !slot.startsWith('element_') && !slot.startsWith('argument_')) criteria.list = 'A list of expressions.';
     const production = await pick(slot, scope, criteria, depth);
     if (production === 'string') { Object.assign(target, node('Constant', { value: String(await terminal('string', scope, strings)), kind: null })); }
@@ -311,17 +340,13 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
       const func = node('Hole');
       const args: PythonNode[] = [];
       Object.assign(target, node('Call', { func, args, keywords: [] }));
-      // Direct callees come from the symbol table; members have a defined receiver.
-      const names = visible(scope);
-      const callees: Record<string, string> = Object.fromEntries(names.map((value, index) => [`name_${index}`, value]));
-      callees.member = 'Call an attribute or method of an already defined object or module.';
       const selected = await pick('callee', scope, callees);
       let arity: number | undefined, counts = [0, 1, 2, 3];
       if (selected === 'member') {
-        const receiver = await pick('receiver', scope, Object.fromEntries(names.map((value, index) => [`name_${index}`, value])), 0, 'leaf');
-        Object.assign(func, node('Attribute', { value: name(names[Number(receiver.slice(5))]!), attr: await identifier('method_name', scope), ctx: node('Load') }));
+        const receiver = await pick('receiver', scope, Object.fromEntries(receiverNames.map((value, index) => [`name_${index}`, value])), 0, 'leaf');
+        Object.assign(func, node('Attribute', { value: name(receiverNames[Number(receiver.slice(5))]!), attr: await identifier('method_name', scope), ctx: node('Load') }));
       } else {
-        const id = names[Number(selected.slice(5))]!;
+        const id = calleeNames[Number(selected.slice(5))]!;
         Object.assign(func, name(id));
         const symbol = table[id];
         arity = symbol?.arity;
@@ -364,8 +389,10 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
       if (scope.function) criteria.return = 'Return a value from this function.';
       if (scope.loop) { criteria.break = 'Break from the enclosing loop.'; criteria.continue = 'Continue the enclosing loop.'; }
       if (depth < maxDepth) Object.assign(criteria, { function: 'Define a named function.', if: 'Conditional statement.', for: 'For loop over an iterable.', while: 'While loop.', import: 'Import a Python standard library module.' });
+      // A `return` retry forces the first statement of the unit body to return a value.
+      const forcedReturn = repair?.reason === 'return' && scope.function && slot === 'function_body' && !body.length;
       const statement = node('Hole'); body.push(statement);
-      const production = await pick(slot, scope, criteria, depth);
+      const production = await pick(slot, scope, forcedReturn ? { return: criteria.return ?? 'Return a value from this function.' } : criteria, depth);
       if (production === 'finish') { body.pop(); return; }
       if (production === 'expr' || production === 'assign' || production === 'return') {
         const value = node('Hole');
@@ -441,14 +468,22 @@ async function generate(decisions: Decisions, state: State, field: string, optio
       : { names: new Map(units.filter(u => !isEntry(u)).map(u => [u.name, { kind: 'function' as const, arity: u.arity }])), function: false, loop: false };
     const width = options.searchWidth ?? 1;
     const defOf = (unit: Unit, body?: PythonNode[]): PythonNode => body === undefined ? unit.def : functionDef(unit.name, unit.params.map(p => node('arg', { arg: p, annotation: null, type_comment: null })), body);
-    await fillUnits(units, decisions, (unit, fork, candidate, body) => createBuilder(shared, {
-      decisions: fork, unit: unit.name, peers: peersOf(unit, peers), ...(candidate === undefined ? {} : { candidate }),
+    const specOf = (unit: Unit): CandidateSpec => ({ name: unit.name, params: unit.params, peers: Object.fromEntries(peersOf(unit, peers).filter(p => p.name !== unit.name).map(p => [p.name, p.arity])), wantsReturn: wantsReturn(unit.purpose) });
+    const unitCheck: UnitCheck = {
+      render: (unit, body) => unparsePython(node('Module', { body: [defOf(unit, body)], type_ignores: [] }), decisions.signal, options.maxBytes),
+      check: async (unit, source) => {
+        const diagnosis = await diagnoseCandidate(source, specOf(unit), decisions.signal);
+        return diagnosis === undefined ? undefined : { reason: diagnosis.reason, ...(diagnosis.symbol === undefined ? {} : { symbol: diagnosis.symbol }) };
+      },
+    };
+    await fillUnits(units, decisions, (unit, fork, candidate, body, repair) => createBuilder(shared, {
+      decisions: fork, unit: unit.name, peers: peersOf(unit, peers), ...(candidate === undefined ? {} : { candidate }), ...(repair === undefined ? {} : { repair }),
       render: () => previewOf(node('Module', { body: [defOf(unit, body)], type_ignores: [] })),
       report: options.onText ? async (_preview, info) => emit(await assembled(), info, unit.name) : async () => {},
-    }), parentFor, width > 1 ? {
+    }), parentFor, unitCheck, width > 1 ? {
       width,
       render: (unit, body) => unparsePython(node('Module', { body: [defOf(unit, body)], type_ignores: [] }), decisions.signal, options.maxBytes),
-      check: (unit, source) => checkCandidate(source, { name: unit.name, params: unit.params, peers: Object.fromEntries(peersOf(unit, peers).filter(p => p.name !== unit.name).map(p => [p.name, p.arity])), wantsReturn: wantsReturn(unit.purpose) }, decisions.signal),
+      check: (unit, source) => checkCandidate(source, specOf(unit), decisions.signal),
       score: async (unit, d, source, candidate) => (await d.score({
         task: { prompt: objective },
         generation: { field, phase: 'search', slot: 'candidate_score', unit: unit.name, candidate, spec: { name: unit.name, arity: unit.arity, purpose: unit.purpose, params: unit.params }, peers: peersOf(unit, peers).map(p => ({ ...p })), candidateSource: source },

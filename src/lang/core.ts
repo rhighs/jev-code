@@ -66,6 +66,23 @@ export const isPending = (id: string): boolean => id === PENDING;
 const maxBlockStatements = 16;
 const maxDepth = 6;
 
+/**
+ * Conservative production bans for the one JS/TS narrowed retry. TypeScript reports syntax
+ * failures as expected-token diagnostics; a token that a production family always emits
+ * identifies that family for the retry. Unmatched diagnostics stay message-only: they reach the
+ * model through the decision state and no production is dropped.
+ */
+const bannedProductions = (syntax: ReadonlyArray<{ message?: unknown }>): Set<string> => {
+  const banned = new Set<string>();
+  const expects = (message: string, token: string): boolean => message.includes(`'${token}' expected`) || message.includes(`'${token}' or`);
+  for (const diagnostic of syntax) {
+    const message = typeof diagnostic.message === 'string' ? diagnostic.message : '';
+    if (expects(message, '(') || expects(message, ')') || expects(message, ',')) { banned.add('call'); banned.add('list'); }
+    if (expects(message, '{') || expects(message, '}')) for (const label of ['if', 'while', 'range', 'foreach', 'function']) banned.add(label);
+  }
+  return banned;
+};
+
 const childScope = (parent: Scope, loop: boolean, ...names: Array<[string, Symbol]>): Scope =>
   ({ names: new Map(names), parent, function: parent.function, loop, ...(parent.returnTypes ? { returnTypes: parent.returnTypes } : {}) });
 
@@ -109,22 +126,29 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
   const { builtins, features, typed } = dialect;
   const program: Program = { body: [] };
   let step = 0;
+  const hint = (state.generation && typeof state.generation === 'object' ? state.generation : {}) as Record<string, unknown>;
+  const syntax = Array.isArray(hint.syntax) ? hint.syntax as Array<{ message?: unknown }> : [];
+  const banned = bannedProductions(syntax);
 
   const render = (): string => dialect.render(program);
 
   async function pick(slot: string, scope: Scope, criteria: Record<string, string>, depth = 0): Promise<string> {
     decisions.signal.throwIfAborted();
     if (++step > options.maxSteps) throw new LimitError(`${dialect.name} AST production budget exhausted (${options.maxSteps}).`);
-    const keys = Object.keys(criteria);
+    // A retry drops matching productions; a slot left with no alternatives keeps its criteria.
+    const allowed = banned.size ? Object.fromEntries(Object.entries(criteria).filter(([key]) => !banned.has(key))) : criteria;
+    const offered = Object.keys(allowed).length ? allowed : criteria;
+    const keys = Object.keys(offered);
     if (!keys.length) throw new Error(`No valid ${dialect.name} AST production for ${slot}.`);
     const preview = render();
     const instruction = `Choose the next valid ${dialect.name} AST production for ${slot}. The rendered source marks the slot being filled with ${PENDING}. Satisfy the objective with the smallest sufficient program. Complete the current slot only; do not add unrequested behavior.`;
     const symbols = visible(scope, builtins);
-    const questions = { selection: choice(instruction, criteria) };
+    const questions = { selection: choice(instruction, offered) };
     const core = { field, phase: 'ast', slot, symbols, symbolTable: table(scope, builtins), language: dialect.id,
+      ...(syntax.length ? { syntax, ...(typeof hint.reason === 'string' ? { reason: hint.reason } : {}) } : {}),
       constraints: { depth, maxDepth, inFunction: scope.function, inLoop: scope.loop, remainingSteps: options.maxSteps - step } };
     const state = astDecisionState({ objective, context, preview, core, questions, cap: MAX_GRID_REQUEST_BYTES });
-    const selected = keys.length === 1 ? keys[0]! : await decisions.choose(state, instruction, criteria);
+    const selected = keys.length === 1 ? keys[0]! : await decisions.choose(state, instruction, offered);
     await options.onText?.(field, preview, false, { replace: preview }, { decoder: 'ast', step, cursor: gridCursor(preview), bytes: Buffer.byteLength(preview), ast: { slot, production: selected, symbols } });
     return selected;
   }

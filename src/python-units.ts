@@ -55,9 +55,25 @@ export type UnitSearch = Omit<SearchHooks, 'generate' | 'render' | 'check' | 'sc
   report(unit: Unit, candidate: Parameters<SearchHooks['report']>[0]): Promise<void>;
 };
 
+/** A retryable static-check failure: the reason, the offending symbol when known, and a compile snippet. */
+export interface UnitRepair { reason: string; symbol?: string; snippet?: string }
+
+/** Per-unit static check used by the width-1 path, where search hooks do not run. */
+export interface UnitCheck {
+  render(unit: Unit, body: PythonNode[]): Promise<string>;
+  /** Retryable diagnosis for a rendered unit body; undefined when the body passes. */
+  check(unit: Unit, source: string): Promise<UnitRepair | undefined>;
+}
+
 export type UnitStartHook = (unit: Unit) => void;
 
-export async function fillUnits(units: Unit[], decisions: Decisions, makeBuilder: (unit: Unit, fork: Decisions, candidate?: number, body?: PythonNode[]) => Builder, parentFor: (unit: Unit) => Scope, search?: UnitSearch, onUnitStart?: UnitStartHook): Promise<void> {
+/**
+ * Width 1: generate the body, run the per-unit static check before assembly, and retry once in
+ * place with the reason (and symbol) in state and criteria narrowed by the failure kind. A second
+ * retryable failure aborts the pool; fatal errors (provider, limit, render) never retry.
+ * Width > 1 keeps the search-hooks path, where static failures are handled by candidate pruning.
+ */
+export async function fillUnits(units: Unit[], decisions: Decisions, makeBuilder: (unit: Unit, fork: Decisions, candidate?: number, body?: PythonNode[], repair?: UnitRepair) => Builder, parentFor: (unit: Unit) => Scope, check?: UnitCheck, search?: UnitSearch, onUnitStart?: UnitStartHook): Promise<void> {
   const controller = new AbortController();
   const scopeFor = (unit: Unit): Scope => ({ names: new Map(unit.params.map(p => [p, { kind: 'parameter' as const }])), parent: parentFor(unit), function: true, loop: false });
   const outcomes = await Promise.allSettled(units.map(async unit => {
@@ -71,7 +87,18 @@ export async function fillUnits(units: Unit[], decisions: Decisions, makeBuilder
           render: body => search.render(unit, body), check: source => search.check(unit, source),
           score: (d, source, candidate) => search.score(unit, d, source, candidate), report: candidate => search.report(unit, candidate),
         });
-      } else await makeBuilder(unit, fork).block(unit.body, scopeFor(unit), 1, 'function_body');
+        return;
+      }
+      await makeBuilder(unit, fork).block(unit.body, scopeFor(unit), 1, 'function_body');
+      if (!check) return;
+      const source = await check.render(unit, unit.body);
+      const first = await check.check(unit, source);
+      if (first === undefined) return;
+      unit.body.length = 0;
+      const repair: UnitRepair = { reason: first.reason, ...(first.symbol === undefined ? {} : { symbol: first.symbol }), ...(first.reason === 'compile' ? { snippet: source.slice(0, 1200) } : {}) };
+      await makeBuilder(unit, decisions.fork(controller.signal), undefined, undefined, repair).block(unit.body, scopeFor(unit), 1, 'function_body');
+      const second = await check.check(unit, await check.render(unit, unit.body));
+      if (second !== undefined) throw new Error(`Unit ${unit.name}: static check failed twice (${first.reason} then ${second.reason}); the write is aborted.`);
     } catch (err) { controller.abort(err); throw err; }
   }));
   const failure = outcomes.find(o => o.status === 'rejected');

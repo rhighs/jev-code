@@ -4,7 +4,7 @@ import type { TextProgress, TextChange } from './grid.js';
 import type { RunContext } from './run-context.js';
 import { compactContext, generateScoredGrid } from './scored-grid.js';
 import ts from 'typescript';
-import { AstRegistry } from './ast-adapters.js';
+import { AstRegistry, type AstAdapter } from './ast-adapters.js';
 import { planText } from './text-plan.js';
 import { gridCursor } from './grid.js';
 import { LimitError } from './types.js';
@@ -34,14 +34,27 @@ export interface GenerateOptions {
   onText?: (field: string, value: string, done: boolean, change?: TextChange, progress?: TextProgress) => Promise<void>;
 }
 
-export function syntaxFeedback(state: State, field: string, text: string): Array<{ message: string; offset: number }> {
-  const args = state.argumentsSoFar as Record<string, unknown> | undefined;
-  if (field !== 'content' || typeof args?.path !== 'string' || !/\.(?:[cm]?[jt]sx?)$/.test(args.path) || !text) return [];
-  return (ts.transpileModule(text, { fileName: args.path, reportDiagnostics: true, compilerOptions: {
+const tsDiagnostics = (fileName: string, text: string): Array<{ message: string; offset: number }> =>
+  (ts.transpileModule(text, { fileName, reportDiagnostics: true, compilerOptions: {
     target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext,
   } }).diagnostics ?? []).filter(diagnostic => diagnostic.category === ts.DiagnosticCategory.Error)
     .slice(0, 5).map(diagnostic => ({ message: ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'), offset: diagnostic.start ?? text.length }));
+
+export function syntaxFeedback(state: State, field: string, text: string): Array<{ message: string; offset: number }> {
+  const args = state.argumentsSoFar as Record<string, unknown> | undefined;
+  if (field !== 'content' || typeof args?.path !== 'string' || !/\.(?:[cm]?[jt]sx?)$/.test(args.path) || !text) return [];
+  return tsDiagnostics(args.path, text);
 }
+
+/** JS/TS single-file diagnostics for the one narrowed retry; other dialects keep current behavior. */
+const repairDiagnostics = (adapter: AstAdapter, state: State, source: string): Array<{ message: string; offset: number }> => {
+  if (adapter.id !== 'javascript' && adapter.id !== 'typescript') return [];
+  const args = state.argumentsSoFar as Record<string, unknown> | undefined;
+  const path = typeof args?.path === 'string' && /\.(?:[cm]?[jt]sx?)$/.test(args.path) ? args.path : adapter.id === 'typescript' ? 'main.ts' : 'main.js';
+  return tsDiagnostics(path, source);
+};
+
+const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
 export async function generateText(decisions: Decisions, state: State, field: string, description: string, options: GenerateOptions): Promise<string> {
   if (field === 'command' && !options.experimentalGrid) return generateBashAst(decisions, state, field, options);
@@ -61,15 +74,31 @@ export async function generateText(decisions: Decisions, state: State, field: st
   }
   const adapter = field === 'content' ? (options.astRegistry ?? defaultAsts).resolve(state) : undefined;
   if (adapter) {
-    const source = await adapter.generate(decisions, state, field, { ...options,
-      ...(options.onText ? { onText: async (name: string, value: string, done: boolean, change?: TextChange, progress?: TextProgress) => { if (!done) await options.onText!(name, value, false, change, progress); } } : {}),
-    });
-    decisions.signal.throwIfAborted();
-    if (typeof source !== 'string' || (!source && !options.allowEmpty) || Buffer.byteLength(source) > options.maxBytes) throw new LimitError(`AST adapter ${adapter.id} returned source outside its byte/size constraints.`);
-    await adapter.validate(source, decisions.signal);
-    decisions.signal.throwIfAborted();
-    await options.onText?.(field, source, true, { replace: source }, { decoder: 'ast', step: 0, cursor: gridCursor(source), bytes: Buffer.byteLength(source) });
-    return source;
+    const forward = options.onText ? { onText: async (name: string, value: string, done: boolean, change?: TextChange, progress?: TextProgress) => { if (!done) await options.onText!(name, value, false, change, progress); } } : {};
+    const attempt = async (attemptState: State): Promise<{ source: string; failure?: unknown }> => {
+      const source = await adapter.generate(decisions, attemptState, field, { ...options, ...forward });
+      decisions.signal.throwIfAborted();
+      if (typeof source !== 'string' || (!source && !options.allowEmpty) || Buffer.byteLength(source) > options.maxBytes) throw new LimitError(`AST adapter ${adapter.id} returned source outside its byte/size constraints.`);
+      try { await adapter.validate(source, decisions.signal); } catch (failure) { return { source, failure }; }
+      decisions.signal.throwIfAborted();
+      return { source };
+    };
+    const first = await attempt(state);
+    let accepted = first.source;
+    if (first.failure !== undefined) {
+      decisions.signal.throwIfAborted();
+      const syntax = repairDiagnostics(adapter, state, first.source);
+      if (!syntax.length) throw first.failure;
+      // One narrowed retry: the diagnostics ride in generation.syntax, which lang/core.ts consumes
+      // to drop matching productions, and stay in the decision state for the model.
+      const generation = state.generation && typeof state.generation === 'object' ? state.generation as Record<string, unknown> : {};
+      const retryState: State = { ...state, generation: { ...generation, field, syntax, reason: errorText(first.failure) } };
+      const second = await attempt(retryState);
+      if (second.failure !== undefined) throw new Error(`AST adapter ${adapter.id} source failed validation after one narrowed retry: ${errorText(second.failure)}`, { cause: second.failure });
+      accepted = second.source;
+    }
+    await options.onText?.(field, accepted, true, { replace: accepted }, { decoder: 'ast', step: 0, cursor: gridCursor(accepted), bytes: Buffer.byteLength(accepted) });
+    return accepted;
   }
   const ws = state.workspace as { files?: string[] } | undefined;
   const plan = await planText(decisions, compactContext(state), field, Array.isArray(ws?.files) ? ws.files : []);
