@@ -3,11 +3,13 @@ import test from 'node:test';
 import { Decisions } from '../src/decisions.js';
 import { checkCandidate, generatePythonAst } from '../src/python-ast.js';
 import { wantsReturn } from '../src/python-search.js';
+import { createRunContext } from '../src/run-context.js';
 import type { DecisionProvider } from '../src/types.js';
 import { SlotProvider, type SlotEntry } from './helpers.js';
 
 const options = { maxSteps: 200, maxBytes: 8000, allowEmpty: false, fragments: [] };
-const decisions = (provider: DecisionProvider, max = 200) => new Decisions(provider, max, new AbortController().signal);
+// Each run gets its own context: parity here means both paths start with an empty unit cache.
+const decisions = (provider: DecisionProvider, max = 200) => new Decisions(provider, max, new AbortController().signal, undefined, 4, undefined, createRunContext());
 const prompt = 'Write a Python helper get_greeting(name) that returns the greeting text, then print it.';
 const state = { task: { prompt, turn: 1, updates: [] } };
 const decomposition: SlotEntry[] = [

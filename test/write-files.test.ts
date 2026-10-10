@@ -8,6 +8,8 @@ import { promisify } from 'node:util';
 import { Decisions } from '../src/decisions.js';
 import { Harness } from '../src/harness.js';
 import { generatePythonProject, validatePythonProject } from '../src/python-ast.js';
+import { loadUnitCache, type UnitCacheEntry } from '../src/python-units.js';
+import { createRunContext, type RunContext } from '../src/run-context.js';
 import { completionSummary } from '../src/summary.js';
 import { builtInTools, toolContext } from '../src/tools.js';
 import { resolveWorkspacePath } from '../src/workspace.js';
@@ -16,6 +18,9 @@ import { SlotProvider, type SlotEntry } from './helpers.js';
 const run = promisify(execFile);
 const signal = new AbortController().signal;
 const options = { maxSteps: 300, maxBytes: 8000, allowEmpty: false, fragments: [] };
+// Each test gets its own run context so within-run unit reuse cannot leak between tests.
+const scoped = (provider: SlotProvider): Decisions => new Decisions(provider, 300, signal, undefined, 4, undefined, createRunContext());
+const inContext = (provider: SlotProvider, context: RunContext): Decisions => new Decisions(provider, 300, signal, undefined, 4, undefined, context);
 
 async function workspace(t: test.TestContext): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'jev-files-'));
@@ -45,7 +50,7 @@ const returnString = (unit: string): SlotEntry[] => [
 test('helper module and main assemble with the derived import at module level inside a guarded main.py', async t => {
   const root = await workspace(t);
   const provider = new SlotProvider([...layout, { slot: 'unit_0_module', answer: 'module_0' }, { slot: 'unit_1_module', answer: 'module_0' }, ...returnString('greet'), ...returnString('shout'), ...mainBlock]);
-  const manifest = JSON.parse(await generatePythonProject(new Decisions(provider, 300, signal), state, 'files', options)) as Record<string, string>;
+  const manifest = JSON.parse(await generatePythonProject(scoped(provider), state, 'files', options)) as Record<string, string>;
   assert.deepEqual(Object.keys(manifest).sort(), ['greeter/__init__.py', 'greeter/helper.py', 'main.py']);
   assert.equal(manifest['greeter/__init__.py'], '');
   assert.match(manifest['greeter/helper.py']!, /^def greet\(name\):\n    return 'greet'\n\ndef shout\(name\):\n    return 'shout'\n$/);
@@ -70,7 +75,7 @@ test('two package units calling each other across modules get body-level imports
     { slot: 'module_body', answer: 'expr', once: true }, { slot: 'expression', answer: 'call' }, { slot: 'callee', answer: { value: 'print' }, once: true }, { slot: 'argument_count', answer: '1' },
     { slot: 'argument_0', answer: 'call', once: true }, { slot: 'callee', answer: { value: 'greet' } }, { slot: 'argument_0', answer: 'string' }, { slot: 'string', answer: { value: 'shout' } }, { slot: 'module_body', answer: 'finish' },
   ]);
-  const manifest = JSON.parse(await generatePythonProject(new Decisions(provider, 300, signal), state, 'files', options)) as Record<string, string>;
+  const manifest = JSON.parse(await generatePythonProject(scoped(provider), state, 'files', options)) as Record<string, string>;
   assert.match(manifest['greeter/helper.py']!, /def greet\(name\):\n    from greeter\.main import shout\n    if name == 'shout':\n        return shout\(name\)\n    return name\n/);
   assert.match(manifest['greeter/main.py']!, /def shout\(name\):\n    from greeter\.helper import greet\n    return greet\('greet'\)\n/);
   assert.doesNotMatch(manifest['greeter/helper.py']!, /^from/m);
@@ -81,7 +86,7 @@ test('two package units calling each other across modules get body-level imports
 
 test('unit module candidates exclude entry units as peers of package units', async t => {
   const provider = new SlotProvider([...layout, { slot: 'unit_0_module', answer: 'main' }, { slot: 'unit_1_module', answer: 'module_0' }, ...returnString('greet'), ...returnString('shout'), ...mainBlock]);
-  const manifest = JSON.parse(await generatePythonProject(new Decisions(provider, 300, signal), state, 'files', options)) as Record<string, string>;
+  const manifest = JSON.parse(await generatePythonProject(scoped(provider), state, 'files', options)) as Record<string, string>;
   assert.match(manifest['main.py']!, /^def greet\(name\):\n    return 'greet'\nif __name__ == '__main__':\n    print\(greet\('greet'\)\)\n$/);
   const shout = provider.states.find(s => s.generation?.unit === 'shout' && s.generation.slot === 'function_body') as { generation: { peers?: Array<{ name: string }> } };
   assert.deepEqual(shout.generation.peers?.map(p => p.name), ['shout']);
@@ -93,6 +98,36 @@ test('unit module candidates exclude entry units as peers of package units', asy
     assert.equal((await run('python3', ['main.py'], { cwd: root })).stdout, 'greet\n');
     assert.equal((await run('python3', ['-c', 'import main'], { cwd: root })).stdout, '');
   });
+});
+
+test('a second write to the same project target reuses validated units and revalidates the manifest', async t => {
+  const runContext = createRunContext();
+  t.after(() => runContext.dispose());
+  const first = new SlotProvider([...layout, { slot: 'unit_0_module', answer: 'module_0' }, { slot: 'unit_1_module', answer: 'module_0' }, ...returnString('greet'), ...returnString('shout'), ...mainBlock]);
+  const manifest = JSON.parse(await generatePythonProject(inContext(first, runContext), state, 'files', options)) as Record<string, string>;
+
+  const second = new SlotProvider([...mainBlock]);
+  const again = JSON.parse(await generatePythonProject(inContext(second, runContext), state, 'files', options)) as Record<string, string>;
+  assert.deepEqual(again, manifest);
+  assert.equal(second.calls, mainBlock.length, 'only the main block asks on reuse');
+  assert.ok(second.states.every(entry => entry.generation?.unit === undefined), 'no unit decisions are asked on reuse');
+  assert.ok(!second.states.some(entry => entry.generation?.slot === 'unit_count'), 'decomposition is skipped on reuse');
+  await validatePythonProject(again, signal);
+});
+
+test('a reused project whose assembled result fails validation invalidates its bodies and fails the write', async t => {
+  const runContext = createRunContext();
+  t.after(() => runContext.dispose());
+  const first = new SlotProvider([...layout, { slot: 'unit_0_module', answer: 'module_0' }, { slot: 'unit_1_module', answer: 'module_0' }, ...returnString('greet'), ...returnString('shout'), ...mainBlock]);
+  await generatePythonProject(inContext(first, runContext), state, 'files', options);
+
+  const entry = loadUnitCache(runContext, 'files', prompt)!;
+  entry.layout = { pkg: 'random', modules: ['helper'] };
+
+  const second = new SlotProvider([...mainBlock]);
+  await assert.rejects(generatePythonProject(inContext(second, runContext), state, 'files', options), /shadows an installed module/);
+  const after = runContext.units.get('files') as UnitCacheEntry;
+  assert.ok(after.units.every(unit => unit.body === undefined), 'every cached body is invalidated for the next attempt');
 });
 
 test('validation is static: unresolved imports and syntax errors write nothing, top-level code never runs', async t => {

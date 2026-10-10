@@ -3,9 +3,9 @@ import test from 'node:test';
 import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import { Decisions } from '../src/decisions.js';
 import { createBuilder, generatePythonAst, vocabulary, type Shared } from '../src/python-ast.js';
-import { node, type Builder, type PythonNode, type Scope } from '../src/python-nodes.js';
-import { fillUnits, type Unit, type UnitCheck, type UnitRepair } from '../src/python-units.js';
-import { attemptScope, createRunContext } from '../src/run-context.js';
+import { functionDef, node, type Builder, type PythonNode, type Scope } from '../src/python-nodes.js';
+import { commitRepairedUnit, dependentNames, fillUnits, loadUnitCache, saveUnitCache, unitFromCached, unitToCached, type Unit, type UnitCacheEntry, type UnitCheck, type UnitRepair } from '../src/python-units.js';
+import { attemptScope, createRunContext, type RunContext } from '../src/run-context.js';
 import { LimitError, type DecisionProvider } from '../src/types.js';
 import { SlotProvider, type SlotEntry } from './helpers.js';
 
@@ -32,7 +32,9 @@ class GateProvider implements DecisionProvider {
 }
 
 const options = { maxSteps: 200, maxBytes: 8000, allowEmpty: false, fragments: [] };
-const decisions = (provider: DecisionProvider, max = 200) => new Decisions(provider, max, new AbortController().signal);
+// Each test gets its own run context so within-run unit reuse cannot leak between tests.
+const decisions = (provider: DecisionProvider, max = 200) => new Decisions(provider, max, new AbortController().signal, undefined, 4, undefined, createRunContext());
+const inContext = (provider: DecisionProvider, context: RunContext): Decisions => new Decisions(provider, 200, new AbortController().signal, undefined, 4, undefined, context);
 const prompt = 'Write Python helper functions greet(name) and shout(name), then print greet.';
 const state = { task: { prompt, turn: 1, updates: [] } };
 const decomposition: SlotEntry[] = [
@@ -280,16 +282,156 @@ test('unit forks record their decision paths in the shared run context', async (
 test('regenerating a unit invalidates its previous decision path entries', async () => {
   const context = createRunContext();
   const scope = attemptScope('content', 'greet');
-  const run = (): Promise<string> => generatePythonAst(
+  const run = (turn = 1, updates: string[] = []): Promise<string> => generatePythonAst(
     new Decisions(new GateProvider([...decomposition, ...bodies, ...main]), 200, new AbortController().signal, undefined, 4, undefined, context),
-    state, 'content', options);
+    { task: { prompt, turn, updates } }, 'content', options);
   await run();
   const first = context.pathFor(scope).map(entry => entry.decisionId);
   assert.equal(first.length, 3);
-  await run();
+  // A changed task text clears the reuse cache, so the unit is regenerated with a fresh path.
+  await run(2, ['Rewrite both helpers.']);
   const second = context.pathFor(scope);
   assert.equal(second.length, 3);
   assert.ok(second.every(entry => !first.includes(entry.decisionId)));
   for (const id of first) assert.equal(context.decisionEntry(id), undefined, 'invalidated entries are no longer resolvable');
+  await context.dispose();
+});
+
+const returnsString = (name: string): SlotEntry[] => [
+  { unit: name, slot: 'function_body', answer: 'return' }, { unit: name, slot: 'expression', answer: 'string' }, { unit: name, slot: 'string', answer: { value: name } },
+];
+
+test('a second write to the same path reuses validated units with no requests for them', async () => {
+  const context = createRunContext();
+  const first = new GateProvider([...decomposition, ...bodies, ...main]);
+  const source = await generatePythonAst(inContext(first, context), { ...state, argumentsSoFar: { path: 'main.py' } }, 'content', options);
+
+  const second = new GateProvider([...main]);
+  const again = await generatePythonAst(inContext(second, context), { ...state, argumentsSoFar: { path: 'main.py' } }, 'content', options);
+  assert.equal(again, source);
+  assert.deepEqual(second.seen.map(entry => entry.generation.slot), ['module_body', 'expression', 'callee', 'argument_count', 'argument_0', 'callee', 'argument_0', 'string', 'module_body']);
+  assert.ok(second.seen.every(entry => entry.generation.unit === undefined), 'no unit decisions are asked on reuse');
+  assert.equal(second.criteria.length, main.length, 'only the main block asks');
+
+  const entry = loadUnitCache(context, 'main.py', prompt)!;
+  assert.deepEqual(entry.units.map(unit => [unit.name, unit.body !== undefined]), [['greet', true], ['shout', true]]);
+  await context.dispose();
+});
+
+test('a changed task text clears the cached units and regenerates the whole tree', async () => {
+  const context = createRunContext();
+  const first = new GateProvider([...decomposition, ...bodies, ...main]);
+  await generatePythonAst(inContext(first, context), { ...state, argumentsSoFar: { path: 'main.py' } }, 'content', options);
+  assert.equal((context.units.get('main.py') as UnitCacheEntry | undefined)?.task, prompt);
+
+  const changed = 'Write Python helper functions greet(name) and shout(name), then print a different greeting.';
+  const second = new GateProvider([...decomposition, ...bodies, ...main]);
+  await generatePythonAst(inContext(second, context), { task: { prompt: changed, turn: 2, updates: [] }, argumentsSoFar: { path: 'main.py' } }, 'content', options);
+  assert.ok(second.seen.some(entry => entry.generation.slot === 'unit_count'), 'the changed task regenerates the decomposition');
+  assert.ok(second.seen.some(entry => entry.generation.unit === 'greet' && entry.generation.slot === 'function_body'), 'unit bodies regenerate');
+  assert.equal((context.units.get('main.py') as UnitCacheEntry | undefined)?.task, changed, 'the entry now holds the new task text');
+  assert.equal(loadUnitCache(context, 'main.py', prompt), undefined, 'a lookup for another task clears the entry');
+  assert.equal(context.units.has('main.py'), false);
+  await context.dispose();
+});
+
+test('whitespace-only task edits keep the cached units', async () => {
+  const context = createRunContext();
+  const first = new GateProvider([...decomposition, ...bodies, ...main]);
+  await generatePythonAst(inContext(first, context), { ...state, argumentsSoFar: { path: 'main.py' } }, 'content', options);
+
+  const second = new GateProvider([...main]);
+  const cosmetic = `  ${prompt.replace(' ', '   ')}  `;
+  await generatePythonAst(inContext(second, context), { task: { prompt: cosmetic, turn: 1, updates: [] }, argumentsSoFar: { path: 'main.py' } }, 'content', options);
+  assert.ok(!second.seen.some(entry => entry.generation.unit === 'greet'), 'cosmetic whitespace keeps reuse');
+  await context.dispose();
+});
+
+test('a cached unit that fails revalidation is regenerated instead of reused', async () => {
+  const context = createRunContext();
+  const first = new GateProvider([...decomposition, ...bodies, ...main]);
+  await generatePythonAst(inContext(first, context), { ...state, argumentsSoFar: { path: 'main.py' } }, 'content', options);
+
+  const entry = loadUnitCache(context, 'main.py', prompt)!;
+  entry.units.find(unit => unit.name === 'greet')!.body = [node('Return', { value: node('Name', { id: 'missing', ctx: node('Load') }) })];
+
+  const second = new GateProvider([...bodies.filter(item => item.unit === 'greet'), ...main]);
+  const source = await generatePythonAst(inContext(second, context), { ...state, argumentsSoFar: { path: 'main.py' } }, 'content', options);
+  assert.ok(second.seen.some(entry => entry.generation.unit === 'greet' && entry.generation.slot === 'function_body'), 'the invalid cached unit is regenerated');
+  assert.ok(!second.seen.some(entry => entry.generation.unit === 'shout'), 'the valid cached unit is reused');
+  assert.match(source, /def greet\(name\):\n    return 'greet'/);
+  await context.dispose();
+});
+
+test('a committed repair invalidates the units that call or are called by the repaired unit', async () => {
+  const context = createRunContext();
+  const call = (id: string): PythonNode[] => [node('Expr', { value: node('Call', { func: node('Name', { id, ctx: node('Load') }), args: [], keywords: [] }) })];
+  const synthetic = (name: string, body: PythonNode[]): Unit => ({ name, arity: 0, purpose: name, params: [], def: functionDef(name, [], body), body });
+  const caller = synthetic('caller', call('repaired'));
+  const repaired = synthetic('repaired', call('helper'));
+  const helper = synthetic('helper', []);
+  const unrelated = synthetic('unrelated', []);
+  const units = [caller, repaired, helper, unrelated];
+  saveUnitCache(context, 'main.py', { task: 'task text', units: units.map(unit => unitToCached(unit, true)) });
+
+  assert.deepEqual(dependentNames(repaired, units), ['caller', 'helper'], 'callers and callees are both dependents');
+  assert.deepEqual(commitRepairedUnit(context, 'main.py', repaired, units), ['caller', 'helper']);
+  const entry = loadUnitCache(context, 'main.py', 'task text')!;
+  const bodyOf = (name: string) => entry.units.find(unit => unit.name === name)!.body;
+  assert.notEqual(bodyOf('repaired'), undefined, 'the repaired body is committed to the cache');
+  assert.equal(bodyOf('caller'), undefined, 'the caller is invalidated');
+  assert.equal(bodyOf('helper'), undefined, 'the callee is invalidated');
+  assert.notEqual(bodyOf('unrelated'), undefined, 'unrelated units stay validated');
+  assert.deepEqual(commitRepairedUnit(context, 'other.py', repaired, units), [], 'no entry means no invalidation');
+  await context.dispose();
+});
+
+test('a failed write keeps its validated units and the rewrite regenerates only the failed unit', async () => {
+  const context = createRunContext();
+  let greetDone!: () => void;
+  const greetFinished = new Promise<void>(resolve => { greetDone = resolve; });
+  const first = new SlotProvider([...decomposition, ...bodies.filter(item => item.unit === 'greet'), ...main]);
+  const failing: DecisionProvider = {
+    decide: async <Q extends Questions>(input: EntryType, questions: Q, signal?: AbortSignal) => {
+      const generation = (input as unknown as UnitState).generation;
+      if (generation.unit === 'shout') { await greetFinished; throw new Error('provider exploded'); }
+      const result = await first.decide(input, questions, signal);
+      if (generation.unit === 'greet' && generation.slot === 'string') greetDone();
+      return result;
+    },
+  };
+  await assert.rejects(generatePythonAst(inContext(failing, context), { ...state, argumentsSoFar: { path: 'main.py' } }, 'content', options), /provider exploded/);
+
+  const entry = loadUnitCache(context, 'main.py', prompt)!;
+  assert.deepEqual(entry.units.map(unit => [unit.name, unit.body !== undefined]), [['greet', true], ['shout', false]], 'the validated unit survives the failed write');
+
+  const second = new GateProvider([...bodies.filter(item => item.unit === 'shout'), ...main]);
+  const source = await generatePythonAst(inContext(second, context), { ...state, argumentsSoFar: { path: 'main.py' } }, 'content', options);
+  assert.ok(!second.seen.some(entry => entry.generation.slot === 'unit_count'), 'the rewrite skips decomposition');
+  assert.ok(!second.seen.some(entry => entry.generation.unit === 'greet'), 'the validated unit is reused');
+  assert.ok(second.seen.some(entry => entry.generation.unit === 'shout' && entry.generation.slot === 'function_body'), 'the failed unit is regenerated');
+  assert.match(source, /def greet\(name\):\n    return 'greet'/);
+  assert.match(source, /def shout\(name\):\n    return name/);
+  await context.dispose();
+});
+
+test('a committed repair makes the next rewrite regenerate the caller and reuse the rest', async () => {
+  const context = createRunContext();
+  const greetCalls: SlotEntry[] = [
+    { unit: 'greet', slot: 'function_body', answer: 'return' }, { unit: 'greet', slot: 'expression', answer: 'call' }, { unit: 'greet', slot: 'callee', answer: { value: 'shout' } },
+  ];
+  const first = new GateProvider([...decomposition, ...greetCalls, ...returnsString('shout'), ...main]);
+  const source = await generatePythonAst(inContext(first, context), { ...state, argumentsSoFar: { path: 'main.py' } }, 'content', options);
+
+  const entry = loadUnitCache(context, 'main.py', prompt)!;
+  const units = entry.units.map(unitFromCached);
+  assert.deepEqual(commitRepairedUnit(context, 'main.py', units.find(unit => unit.name === 'shout')!, units), ['greet'], 'the caller is invalidated');
+
+  const second = new GateProvider([...greetCalls, ...main]);
+  const again = await generatePythonAst(inContext(second, context), { ...state, argumentsSoFar: { path: 'main.py' } }, 'content', options);
+  assert.equal(again, source);
+  assert.ok(second.seen.some(entry => entry.generation.unit === 'greet'), 'the caller is regenerated');
+  assert.ok(!second.seen.some(entry => entry.generation.unit === 'shout'), 'the repaired unit is reused');
+  assert.ok(!second.seen.some(entry => entry.generation.slot === 'unit_count'), 'decomposition is skipped');
   await context.dispose();
 });

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Decisions, State } from './decisions.js';
 import type { GenerateOptions } from './generation.js';
-import { assemble, assembleProject, decompose, decomposeLayout, fillUnits, isEntry, peersOf, type Peer, type Unit, type UnitCheck, type UnitRepair } from './python-units.js';
+import { assemble, assembleProject, cachedPeer, decompose, decomposeLayout, dropUnitCache, fillUnits, invalidateCachedBodies, isEntry, loadUnitCache, normalizeUnitTask, peersOf, saveUnitCache, unitFromCached, unitToCached, type Layout, type Peer, type Unit, type UnitCheck, type UnitRepair } from './python-units.js';
 import { RUBRIC, wantsReturn } from './python-search.js';
 import { gridCursor } from './grid.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
@@ -444,6 +444,12 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
   return { pick, terminal, identifier, expression, block };
 }
 
+/** Unit-cache write target: the concrete path when known, else the generation field. */
+export function unitCacheTarget(state: State, field: string): string {
+  const path = (state.argumentsSoFar as Record<string, unknown> | undefined)?.path;
+  return typeof path === 'string' && path ? path : field;
+}
+
 /** Decomposition first, then unit bodies concurrently, then the main block; zero units is the plain single-scope path. */
 async function generate(decisions: Decisions, state: State, field: string, options: GenerateOptions, project: boolean): Promise<string> {
   const task = state.task as { prompt?: string; updates?: string[] } | undefined;
@@ -458,8 +464,31 @@ async function generate(decisions: Decisions, state: State, field: string, optio
   const peers: Peer[] = [];
   const runContext = options.context ?? decisions.runContext;
   const root = createBuilder(shared, { decisions, peers, render: () => previewOf(tree), report: (preview, info) => emit(preview, info) });
-  const layout = project ? await decomposeLayout(root, rootScope) : undefined;
-  const units = await decompose(root, rootScope, shared.vocab, peers, layout);
+  const target = unitCacheTarget(state, field);
+  const taskText = normalizeUnitTask(objective);
+  const cached = loadUnitCache(runContext, target, taskText);
+  let layout: Layout | undefined;
+  let units: Unit[];
+  let pending: Unit[];
+  let reused = false;
+  if (cached !== undefined && (project ? cached.layout !== undefined : cached.layout === undefined)) {
+    // Within-run reuse: restore the validated unit tree, then revalidate each unit before trusting it.
+    reused = true;
+    layout = cached.layout;
+    peers.push(...cached.units.map(cachedPeer));
+    units = [];
+    pending = [];
+    for (const item of cached.units) {
+      const unit = unitFromCached(item);
+      units.push(unit);
+      if (item.body === undefined) pending.push(unit);
+    }
+  } else {
+    if (cached !== undefined) dropUnitCache(runContext, target);
+    layout = project ? await decomposeLayout(root, rootScope) : undefined;
+    units = await decompose(root, rootScope, shared.vocab, peers, layout);
+    pending = units;
+  }
   if (units.length) {
     for (const unit of units) rootScope.names.set(unit.name, { kind: 'function', arity: unit.arity });
     (tree.body as PythonNode[]).push(...units.map(unit => unit.def));
@@ -476,23 +505,38 @@ async function generate(decisions: Decisions, state: State, field: string, optio
         return diagnosis === undefined ? undefined : { reason: diagnosis.reason, ...(diagnosis.symbol === undefined ? {} : { symbol: diagnosis.symbol }) };
       },
     };
-    await fillUnits(units, decisions, (unit, fork, candidate, body, repair) => createBuilder(shared, {
-      decisions: fork, unit: unit.name, peers: peersOf(unit, peers), ...(candidate === undefined ? {} : { candidate }), ...(repair === undefined ? {} : { repair }),
-      render: () => previewOf(node('Module', { body: [defOf(unit, body)], type_ignores: [] })),
-      report: options.onText ? async (_preview, info) => emit(await assembled(), info, unit.name) : async () => {},
-    }), parentFor, unitCheck, width > 1 ? {
-      width,
-      render: (unit, body) => unparsePython(node('Module', { body: [defOf(unit, body)], type_ignores: [] }), decisions.signal, options.maxBytes),
-      check: (unit, source) => checkCandidate(source, specOf(unit), decisions.signal),
-      score: async (unit, d, source, candidate) => (await d.score({
-        task: { prompt: objective },
-        generation: { field, phase: 'search', slot: 'candidate_score', unit: unit.name, candidate, spec: { name: unit.name, arity: unit.arity, purpose: unit.purpose, params: unit.params }, peers: peersOf(unit, peers).map(p => ({ ...p })), candidateSource: source },
-      }, `Rate how well this candidate body for ${unit.name} fulfils its purpose: ${unit.purpose}. Judge correctness for the objective and minimality; unrequested behavior lowers the level.`, RUBRIC)).expected,
-      report: async (unit, c) => options.onText?.(field, c.source, false, { replace: c.source }, {
-        decoder: 'search', step: shared.budget.step, cursor: gridCursor(c.source), bytes: Buffer.byteLength(c.source),
-        ast: { slot: 'candidate', production: c.kept ? 'kept' : 'dropped', symbols: [], unit: unit.name, candidate: c.index, kept: c.kept, ...(c.reason === undefined ? {} : { reason: c.reason }) },
-      }),
-    } : undefined, unit => runContext.invalidateUnitAttempts(field, unit.name));
+    const validated = new Set<string>();
+    if (reused) {
+      // A cached unit that fails its check is regenerated in this attempt instead of being reused.
+      for (const unit of units) {
+        if (pending.includes(unit)) continue;
+        const source = await unitCheck.render(unit, unit.body);
+        if ((await unitCheck.check(unit, source)) === undefined) validated.add(unit.name);
+        else { unit.body.length = 0; pending.push(unit); }
+      }
+    }
+    try {
+      await fillUnits(pending, decisions, (unit, fork, candidate, body, repair) => createBuilder(shared, {
+        decisions: fork, unit: unit.name, peers: peersOf(unit, peers), ...(candidate === undefined ? {} : { candidate }), ...(repair === undefined ? {} : { repair }),
+        render: () => previewOf(node('Module', { body: [defOf(unit, body)], type_ignores: [] })),
+        report: options.onText ? async (_preview, info) => emit(await assembled(), info, unit.name) : async () => {},
+      }), parentFor, unitCheck, width > 1 ? {
+        width,
+        render: (unit, body) => unparsePython(node('Module', { body: [defOf(unit, body)], type_ignores: [] }), decisions.signal, options.maxBytes),
+        check: (unit, source) => checkCandidate(source, specOf(unit), decisions.signal),
+        score: async (unit, d, source, candidate) => (await d.score({
+          task: { prompt: objective },
+          generation: { field, phase: 'search', slot: 'candidate_score', unit: unit.name, candidate, spec: { name: unit.name, arity: unit.arity, purpose: unit.purpose, params: unit.params }, peers: peersOf(unit, peers).map(p => ({ ...p })), candidateSource: source },
+        }, `Rate how well this candidate body for ${unit.name} fulfils its purpose: ${unit.purpose}. Judge correctness for the objective and minimality; unrequested behavior lowers the level.`, RUBRIC)).expected,
+        report: async (unit, c) => options.onText?.(field, c.source, false, { replace: c.source }, {
+          decoder: 'search', step: shared.budget.step, cursor: gridCursor(c.source), bytes: Buffer.byteLength(c.source),
+          ast: { slot: 'candidate', production: c.kept ? 'kept' : 'dropped', symbols: [], unit: unit.name, candidate: c.index, kept: c.kept, ...(c.reason === undefined ? {} : { reason: c.reason }) },
+        }),
+      } : undefined, unit => runContext.invalidateUnitAttempts(field, unit.name), unit => validated.add(unit.name));
+    } finally {
+      // A failed write keeps every unit that validated before the failure; only the rest regenerate.
+      saveUnitCache(runContext, target, { task: taskText, ...(layout === undefined ? {} : { layout: structuredClone(layout) }), units: units.map(unit => unitToCached(unit, validated.has(unit.name))) });
+    }
   }
   await root.block(tree.body as PythonNode[], rootScope, 0, 'module_body');
   if (layout) {
@@ -501,11 +545,21 @@ async function generate(decisions: Decisions, state: State, field: string, optio
     for (const [path, module] of Object.entries(files)) manifest[path] = (module.body as PythonNode[]).length ? await unparsePython(module, decisions.signal, options.maxBytes) : '';
     const text = JSON.stringify(manifest);
     if (Buffer.byteLength(text) > options.maxBytes) throw new LimitError('Python project exceeds its byte budget.');
+    if (reused) {
+      // Reused units skip per-attempt checks, so revalidate the assembled project before returning it.
+      try { await validatePythonProject(manifest, decisions.signal); }
+      catch (error) { invalidateCachedBodies(runContext, target); throw error; }
+    }
     await options.onText?.(field, text, true, { replace: text }, { decoder: 'ast', step: shared.budget.step, cursor: gridCursor(text), bytes: Buffer.byteLength(text) });
     return text;
   }
   if (units.length) assemble(tree, units);
   const source = await unparsePython(tree, decisions.signal, options.maxBytes);
+  if (reused) {
+    // Reused units skip per-attempt checks, so revalidate the assembled source before returning it.
+    try { await validatePythonSource(source, decisions.signal); }
+    catch (error) { invalidateCachedBodies(runContext, target); throw error; }
+  }
   await options.onText?.(field, source, true, { replace: source }, { decoder: 'ast', step: shared.budget.step, cursor: gridCursor(source), bytes: Buffer.byteLength(source) });
   return source;
 }
