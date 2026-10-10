@@ -160,8 +160,17 @@ export class Decisions {
       } else if (result.type === 'score') {
         await this.onDecision({ choice: String(Math.round(result.value.expected)), confidence: result.metadata.confidence,
           model: result.metadata.model, options: [...result.metadata.alternatives], ...identity(currentState) });
-      } else {
+      } else if (result.type === 'many-choice') {
         await this.onDecision({ questions: result.metadata.questions, model: result.metadata.model });
+      } else {
+        // A raw-session wave result: one event per answered question, all sharing one allocated wave
+        // id so transcript accounting counts the single request once. The facade's own chooseWave
+        // path emits its richer events (decisionId, wave) and does not pass through here.
+        const wave = this.runContext.allocateWaveId();
+        for (const [slot, answer] of Object.entries(result.value)) {
+          await this.onDecision({ choice: answer.choice, confidence: answer.confidence, model: result.metadata.model,
+            options: [...answer.alternatives], ...identity(currentState), slot, wave });
+        }
       }
     });
   }

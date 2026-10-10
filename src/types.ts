@@ -42,11 +42,27 @@ export interface Tool {
   execute(args: ToolArgs, context: ToolContext): Promise<ToolResult>;
 }
 
+/** How a runtime repair rebuilt the failing file(s); journaled on tool_end.repair. */
+export type RepairKind = 'unit-replay' | 'candidate-reuse' | 'module-substitution' | 'unit-regeneration' | 'module-regeneration' | 'none';
+
+/** Journaled repair metadata on a tool_end record: what was rebuilt, from which decision, and why. */
+export interface ToolRepairRecord {
+  kind: RepairKind;
+  target: string;
+  decisionId?: number;
+  forced?: string;
+  notes?: string[];
+  /** Repair cycle within the failure (1-based); absent on the repair write itself. */
+  cycle?: number;
+}
+
 export interface ToolRecord extends Record<string, unknown> {
   turn: number;
   tool: string;
   args: ToolArgs;
   result: ToolResult;
+  /** Present when this record is a repair rebuild or the retry of a repaired failure. */
+  repair?: ToolRepairRecord;
 }
 
 export type RunStatus = 'completed' | 'blocked' | 'limited' | 'cancelled' | 'error';

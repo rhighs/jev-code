@@ -134,7 +134,7 @@ export function unitToCached(unit: Unit, validated: boolean): CachedUnit {
  * rewrites of the same task, and an entry from another objective is dropped instead of reused.
  */
 export function loadUnitCache(context: RunContext, target: string, task: string): UnitCacheEntry | undefined {
-  const stored = context.units.get(target) as UnitCacheEntry | undefined;
+  const stored = context.units.get(target);
   if (stored === undefined) return undefined;
   if (stored.task !== task) { context.units.delete(target); return undefined; }
   return stored;
@@ -150,7 +150,7 @@ export function dropUnitCache(context: RunContext, target: string): void {
 
 /** Mark cached bodies as pending regeneration (all units when `names` is omitted); returns the affected names. */
 export function invalidateCachedBodies(context: RunContext, target: string, names?: Iterable<string>): string[] {
-  const entry = context.units.get(target) as UnitCacheEntry | undefined;
+  const entry = context.units.get(target);
   if (entry === undefined) return [];
   const wanted = names === undefined ? undefined : new Set(names);
   const affected: string[] = [];
@@ -164,8 +164,12 @@ export function invalidateCachedBodies(context: RunContext, target: string, name
 }
 
 export type UnitStartHook = (unit: Unit) => void;
-/** Called once per unit whose body passed its final static check, so it may be cached for reuse. */
-export type UnitValidatedHook = (unit: Unit) => void;
+/**
+ * Called once per unit whose body passed its final static check, so it may be cached for reuse.
+ * At search width > 1 the kept candidate index is reported, so line maps and repair resolve to the
+ * body that was actually written.
+ */
+export type UnitValidatedHook = (unit: Unit, candidate?: number) => void;
 
 /**
  * Width 1: generate the body, run the per-unit static check before assembly, and retry once in
@@ -181,13 +185,15 @@ export async function fillUnits(units: Unit[], decisions: Decisions, makeBuilder
       onUnitStart?.(unit);
       const fork = decisions.fork(controller.signal);
       if (search && search.width > 1) {
+        let keptCandidate: number | undefined;
         try {
-          await searchUnit(unit, fork, {
+          const candidates = await searchUnit(unit, fork, {
             width: search.width,
             generate: (candidateFork, body, candidate) => makeBuilder(unit, candidateFork, candidate, body).block(body, scopeFor(unit), 1, 'function_body'),
             render: body => search.render(unit, body), check: source => search.check(unit, source),
             score: (d, source, candidate) => search.score(unit, d, source, candidate), report: candidate => search.report(unit, candidate),
           });
+          keptCandidate = candidates.find(candidate => candidate.kept)?.index;
         } catch (err) {
           // All-dropped search failures get their own retry path: one in-place regeneration with the
           // drop reasons in state; a second failure aborts the pool like any other retryable failure.
@@ -196,8 +202,10 @@ export async function fillUnits(units: Unit[], decisions: Decisions, makeBuilder
           await makeBuilder(unit, decisions.fork(controller.signal), undefined, undefined, { reason: 'search', snippet: err.message.slice(0, 1200) }).block(unit.body, scopeFor(unit), 1, 'function_body');
           const reason = await search.check(unit, await search.render(unit, unit.body));
           if (reason !== undefined) throw err;
+          onUnitValidated?.(unit);
+          return;
         }
-        onUnitValidated?.(unit);
+        onUnitValidated?.(unit, keptCandidate);
         return;
       }
       await makeBuilder(unit, fork).block(unit.body, scopeFor(unit), 1, 'function_body');
@@ -258,7 +266,7 @@ export function dependentNames(unit: Unit, units: readonly Unit[]): string[] {
  * exactly that dependency set. A no-op without a cache entry; returns the invalidated dependent names.
  */
 export function commitRepairedUnit(context: RunContext, target: string, repaired: Unit, units: readonly Unit[]): string[] {
-  const entry = context.units.get(target) as UnitCacheEntry | undefined;
+  const entry = context.units.get(target);
   if (entry === undefined) return [];
   const cached = entry.units.find(candidate => candidate.name === repaired.name);
   if (cached !== undefined) cached.body = clone(repaired.body);
@@ -384,17 +392,24 @@ const fieldOf = (slot: LineSlot): string => slot.field ?? (slot.scope === undefi
 
 /**
  * The recorded path for one unit attempt: the recorded scope while it still has entries, else the
- * first non-empty candidate scope (search width > 1 records each candidate under its own scope).
+ * kept search candidate's scope, else the first non-empty candidate scope (search width > 1 records
+ * each candidate under its own scope). Scanning from zero is only a fallback for unknown targets;
+ * resolving through the kept candidate keeps repair on the body that was actually written.
  */
 export function unitAttemptPath(context: RunContext, field: string, unit: string, scope?: string): { scope?: string; entries: readonly DecisionPathEntry[] } {
-  if (scope !== undefined) {
-    const entries = context.pathFor(scope);
-    if (entries.length) return { scope, entries };
-  }
-  for (let candidate = 0; candidate < 8; candidate++) {
-    const candidateScope = attemptScope(field, unit, candidate);
+  const attemptAt = (candidateScope: string | undefined): { scope: string; entries: readonly DecisionPathEntry[] } | undefined => {
+    if (candidateScope === undefined) return undefined;
     const entries = context.pathFor(candidateScope);
-    if (entries.length) return { scope: candidateScope, entries };
+    return entries.length ? { scope: candidateScope, entries } : undefined;
+  };
+  const recorded = attemptAt(scope);
+  if (recorded !== undefined) return recorded;
+  const kept = context.keptCandidate(field, unit);
+  const keptAttempt = attemptAt(kept === undefined ? undefined : attemptScope(field, unit, kept));
+  if (keptAttempt !== undefined) return keptAttempt;
+  for (let candidate = 0; candidate < 8; candidate++) {
+    const candidateAttempt = attemptAt(attemptScope(field, unit, candidate));
+    if (candidateAttempt !== undefined) return candidateAttempt;
   }
   return { entries: [] };
 }

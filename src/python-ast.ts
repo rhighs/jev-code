@@ -4,13 +4,13 @@ import { dirname, join } from 'node:path';
 import type { Decisions, State } from './decisions.js';
 import type { GenerateOptions } from './generation.js';
 import { PythonWorker, spawnPerCallBridge, type PythonBridge } from './python-worker.js';
-import { assemble, assembleProject, cachedPeer, commitRepairedUnit, decompose, decomposeLayout, dropUnitCache, ENTRY, fillUnits, invalidateCachedBodies, isEntry, loadUnitCache, normalizeUnitTask, peersOf, saveUnitCache, unitAttemptPath, unitFromCached, unitToCached, type FailureAttribution, type Layout, type Peer, type Unit, type UnitCacheEntry, type UnitCheck, type UnitRepair, type WaveBuilder, type WaveQuestion } from './python-units.js';
+import { assemble, assembleProject, cachedPeer, commitRepairedUnit, decompose, decomposeLayout, dropUnitCache, ENTRY, fillUnits, invalidateCachedBodies, isEntry, loadUnitCache, normalizeUnitTask, peersOf, saveUnitCache, unitAttemptPath, unitFromCached, unitToCached, type FailureAttribution, type Layout, type Peer, type Unit, type UnitCheck, type UnitRepair, type WaveBuilder, type WaveQuestion } from './python-units.js';
 import { RUBRIC, wantsReturn } from './python-search.js';
 import { gridCursor } from './grid.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
 import { astDecisionState, PENDING } from './decision-context.js';
 import { attemptScope, defaultRunContext, type DecisionKind, type DecisionPathEntry, type LineSlot, type RunContext } from './run-context.js';
-import { LimitError } from './types.js';
+import { LimitError, type RepairKind } from './types.js';
 import { identifierCandidates, numberCandidates, objectiveWords, phraseLiterals, quotedLiterals, stringCandidates, stringPieces, stringTokenPieces } from './vocab.js';
 import { anyMemberFits, BUILTINS, builtinCallable, fits, memberCriteria, moduleMembers, type PythonType } from './python-symbols.js';
 import { choice } from '@typesafe-ai/sdk';
@@ -136,14 +136,16 @@ export function vocabulary(objective: string): Vocab {
   const strings = stringCandidates([...quotedLiterals(objective), ...files, ...phraseLiterals(words)]);
   const purposes: string[] = [];
   for (let start = 0; start < words.length; start++) for (let count = 1; count <= 4 && start + count <= words.length; count++) purposes.push(words.slice(start, start + count).join(' ').toLowerCase());
-  return { words, identifiers, strings, numbers: numberCandidates(objective), purposes: [...new Set(purposes)].slice(0, 160) };
+  // The custom-string piece list is objective-derived and constant per generate; building it here
+  // keeps it out of createBuilder, which runs once per attempt, candidate, and retry.
+  return { words, identifiers, strings, numbers: numberCandidates(objective), purposes: [...new Set(purposes)].slice(0, 160),
+    pieces: stringPieces(objective, words, identifiers) };
 }
 
 export function createBuilder(shared: Shared, input: BuilderInput): WaveBuilder {
   const { decisions, render, report, unit, peers, candidate, repair, replay } = input;
   const { field, options, objective, context, budget, vocab, maxDepth } = shared;
-  const { words, identifiers, strings, numbers } = vocab;
-  const pieces = stringPieces(objective, words, identifiers);
+  const { words, identifiers, strings, numbers, pieces } = vocab;
   const runContext = options.context ?? decisions.runContext;
   const pathScope = attemptScope(field, unit, candidate);
   // Retry narrowing: `arity` forbids the offending peer call; `undefined` keeps the offending
@@ -510,7 +512,7 @@ export function unitCacheTarget(state: State, field: string): string {
 
 /** Runtime-repair outcome, readable by the caller that requested the repair. */
 export interface RepairOutcome {
-  kind: 'unit-replay' | 'candidate-reuse' | 'module-substitution' | 'unit-regeneration' | 'module-regeneration' | 'none';
+  kind: RepairKind;
   decisionId?: number;
   forced?: string;
   notes: string[];
@@ -547,9 +549,12 @@ function recordFileLines(context: RunContext, key: string, target: string, field
   const map = new Map<number, LineSlot>();
   for (let line = 1; line <= lines.length; line++) {
     const span = spans.find(candidate => line >= candidate.start && line <= candidate.end);
+    // Search width > 1 records each candidate under its own scope; the line map points at the
+    // kept candidate so attribution and repair follow the body that was written.
+    const kept = span === undefined ? undefined : context.keptCandidate(field, span.unit);
     map.set(line, span === undefined
       ? { slot: 'module_body', scope: attemptScope(field), target, field }
-      : { slot: 'function_body', unit: span.unit, scope: attemptScope(field, span.unit), target, field });
+      : { slot: 'function_body', unit: span.unit, scope: kept === undefined ? attemptScope(field, span.unit) : attemptScope(field, span.unit, kept), target, field });
   }
   context.recordLineMap(key, map);
   context.recordSource(key, source);
@@ -573,7 +578,7 @@ async function generate(decisions: Decisions, state: State, field: string, optio
   runContext.recordGenerationTask(target, taskText, project);
   const attribution = repair?.attribution;
   // Repair trusts the cached entry directly: the failure names the exact generation being repaired.
-  const cached = attribution === undefined ? loadUnitCache(runContext, target, taskText) : runContext.units.get(target) as UnitCacheEntry | undefined;
+  const cached = attribution === undefined ? loadUnitCache(runContext, target, taskText) : runContext.units.get(target);
   // A cache-less repair is only possible for a single file whose whole program is module statements.
   if (attribution !== undefined && cached === undefined && project) throw new Error(`No validated unit tree for ${target}; runtime repair is unavailable.`);
   const repairWithoutTree = attribution !== undefined && cached === undefined;
@@ -667,7 +672,7 @@ async function generate(decisions: Decisions, state: State, field: string, optio
       }
       // Retained validated search candidates are repair candidates; revalidate before reuse.
       for (const candidate of runContext.candidatesFor(target, unit.name)) {
-        const body = structuredClone(candidate) as PythonNode[];
+        const body = structuredClone(candidate);
         try {
           const source = await unitCheck.render(unit, body);
           if ((await unitCheck.check(unit, source)) === undefined) return { kind: 'candidate', body };
@@ -718,7 +723,10 @@ async function generate(decisions: Decisions, state: State, field: string, optio
             ast: { slot: 'candidate', production: c.kept ? 'kept' : 'dropped', symbols: [], unit: unit.name, candidate: c.index, kept: c.kept, ...(c.reason === undefined ? {} : { reason: c.reason }) },
           });
         },
-      } : undefined, unit => runContext.invalidateUnitAttempts(field, unit.name), unit => validated.add(unit.name));
+      } : undefined, unit => runContext.invalidateUnitAttempts(field, unit.name), (unit, candidate) => {
+        if (candidate !== undefined) runContext.recordKeptCandidate(field, unit.name, candidate);
+        validated.add(unit.name);
+      });
     } finally {
       // A failed write keeps every unit that validated before the failure; only the rest regenerate.
       saveUnitCache(runContext, target, { task: taskText, ...(layout === undefined ? {} : { layout: structuredClone(layout) }), units: units.map(unit => unitToCached(unit, validated.has(unit.name))) });
@@ -810,7 +818,7 @@ async function generate(decisions: Decisions, state: State, field: string, optio
  * of scope.
  */
 export async function repairPythonFailure(decisions: Decisions, context: RunContext, attribution: FailureAttribution, options: GenerateOptions): Promise<PythonRepairResult | undefined> {
-  const entry = context.units.get(attribution.target) as UnitCacheEntry | undefined;
+  const entry = context.units.get(attribution.target);
   const recorded = context.generationTaskFor(attribution.target);
   const task = entry?.task ?? recorded?.task;
   if (task === undefined) return undefined;

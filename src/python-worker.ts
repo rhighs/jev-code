@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import type { Socket } from 'node:net';
 import { StringDecoder } from 'node:string_decoder';
 import { sanitizedEnv } from './env.js';
 import type { RunContextWorker } from './run-context.js';
@@ -230,8 +231,9 @@ const validationError = (detail: string): Error => new Error(`Python AST validat
 const setRef = (child: ChildProcess, ref: boolean): void => {
   if (ref) child.ref(); else child.unref();
   for (const stream of [child.stdin, child.stdout, child.stderr]) {
-    const handle = stream as unknown as { ref?: () => void; unref?: () => void } | null;
-    if (ref) handle?.ref?.(); else handle?.unref?.();
+    // Child stdio pipes are net.Socket instances; a single downcast keeps ref/unref typed.
+    const handle = stream as Socket | null;
+    if (ref) handle?.ref(); else handle?.unref();
   }
 };
 
@@ -289,6 +291,9 @@ export class PythonWorker implements PythonBridge, RunContextWorker {
     call.signal.throwIfAborted();
     if (this.fallback) return runOneShot(this.spawner, operation, payload, call, this.timeoutMs);
     const child = await this.ensureChild();
+    // dispose() may have raced the spawn: never send after disposal and never fall back to a
+    // one-shot child for a disposed worker.
+    if (this.disposed) throw new PythonWorkerDisposedError();
     if (child === undefined) return runOneShot(this.spawner, operation, payload, call, this.timeoutMs);
     return this.send(child, operation, payload, call);
   }
@@ -345,6 +350,12 @@ export class PythonWorker implements PythonBridge, RunContextWorker {
       // A spawn failure can emit a second error event; keep it observed so it cannot throw.
       child.on('error', () => { /* the fallback reports the failure */ });
       this.fallback = true;
+      return undefined;
+    }
+    if (this.disposed) {
+      // dispose() ran while the handshake was in flight: the child was never attached, so kill it
+      // here instead of leaving an orphaned python3 alive for the process lifetime.
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
       return undefined;
     }
     this.attach(child);

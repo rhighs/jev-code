@@ -8,7 +8,7 @@ import { promisify } from 'node:util';
 import { Decisions } from '../src/decisions.js';
 import { Harness } from '../src/harness.js';
 import { generatePythonProject, validatePythonProject } from '../src/python-ast.js';
-import { loadUnitCache, type UnitCacheEntry } from '../src/python-units.js';
+import { loadUnitCache } from '../src/python-units.js';
 import { createRunContext, type RunContext } from '../src/run-context.js';
 import { completionSummary } from '../src/summary.js';
 import { builtInTools, toolContext } from '../src/tools.js';
@@ -126,7 +126,7 @@ test('a reused project whose assembled result fails validation invalidates its b
 
   const second = new SlotProvider([...mainBlock]);
   await assert.rejects(generatePythonProject(inContext(second, runContext), state, 'files', options), /shadows an installed module/);
-  const after = runContext.units.get('files') as UnitCacheEntry;
+  const after = runContext.units.get('files')!;
   assert.ok(after.units.every(unit => unit.body === undefined), 'every cached body is invalidated for the next attempt');
 });
 

@@ -61,6 +61,8 @@ export const MAX_DECISION_REQUEST_BYTES = 24_000;
 
 /** Per-key clamps applied when a decision state exceeds the byte cap. */
 export interface DecisionCompaction {
+  /** Clips the carried task text: the prompt, the newest updates, and each update's length. */
+  task?: { prompt: number; updates: number; keep?: number };
   history?: { keep: number; output: number };
   recent?: { keep: number; args: number; output: number; data?: number };
   observations?: { keep: number; args: number; output: number; data?: number };
@@ -97,6 +99,17 @@ export const COMPLETION_COMPACTION: DecisionCompaction = {
   observations: { keep: 8, args: 1024, output: 2000 },
   conversation: { prompt: 600, summary: 800 },
   plan: 1000,
+};
+
+/**
+ * Action-select profile: the task text rides in both the action state and the instruction built
+ * from it, so a long but legal prompt can exceed the cap on its own. The action decision degrades
+ * by clipping the carried task text instead of ending the run; the completion check and the
+ * field/plan selects keep their stricter profiles (an over-budget completion stays a size failure).
+ */
+export const ACTION_COMPACTION: DecisionCompaction = {
+  ...DECISION_COMPACTION,
+  task: { prompt: 4000, updates: 2000, keep: 8 },
 };
 
 /**
@@ -175,6 +188,17 @@ export function compactDecisionState(state: Record<string, unknown>, profile: De
     compacted[key] = next;
     trimmed.push(key);
   };
+  const taskProfile = profile.task;
+  if (taskProfile !== undefined && typeof state.task === 'object' && state.task !== null && !Array.isArray(state.task)) {
+    const task = state.task as Record<string, unknown>;
+    const next: Record<string, unknown> = { ...task };
+    if (typeof task.prompt === 'string') next.prompt = clipText(task.prompt, taskProfile.prompt);
+    if (Array.isArray(task.updates)) {
+      const keep = taskProfile.keep ?? task.updates.length;
+      next.updates = (task.updates as readonly unknown[]).slice(-keep).map(update => clipText(update, taskProfile.updates));
+    }
+    replace('task', next);
+  }
   if (profile.history !== undefined && Array.isArray(state.history)) {
     replace('history', oneLineRecords((state.history as readonly unknown[]).slice(-profile.history.keep), profile.history.output));
   }

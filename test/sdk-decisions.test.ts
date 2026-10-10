@@ -17,6 +17,8 @@ import {
 } from '../src/sdk/index.js';
 import { createDecisionSession } from '../src/sdk/decisions.js';
 import { RunResources } from '../src/sdk/resources.js';
+import { Decisions } from '../src/decisions.js';
+import type { DecisionEventData } from '../src/types.js';
 
 const responseProvider = (answer: unknown): DecisionProvider => ({
   decide: async <Q extends Questions>(_state: EntryType, questions: Q) => ({
@@ -296,6 +298,8 @@ test('near-tie uses the inclusive runner-up gap and the argmax deviation rule', 
   assert.equal(isNearTie(ranked(0.9, 0.1), 'a'), false);
   assert.equal(isNearTie(ranked(0.5, 0.5), 'a'), true, 'a tied top is a near-tie');
   assert.equal(isNearTie([], 'a'), false);
+  assert.equal(isNearTie([{ label: 'a', probability: 1 }], 'a'), false, 'a single alternative has no runner-up to tie with');
+  assert.equal(isNearTie([{ label: 'a', probability: 0.3 }], 'a'), false, 'a lone low-probability pick is still decided');
 });
 
 test('direct sessions share the process default run context until it is explicitly closed', async () => {
@@ -334,4 +338,35 @@ test('explicit run contexts isolate concurrent direct callers and survive sessio
   assert.equal(right.isDisposed, false);
   assert.equal((await rightSession.probability({}, 'still?')).value, 1);
   await right.dispose();
+});
+
+test('a wave through the public session emits one decision event per answered question', async () => {
+  const waveProvider: DecisionProvider = {
+    decide: async <Q extends Questions>(_state: EntryType, questions: Q) => {
+      const entries = Object.entries(questions as Record<string, { criteria?: Record<string, string> }>);
+      return {
+        model: 'wave-observer', usage: { input_tokens: 1, output_tokens: 0 },
+        answers: Object.fromEntries(entries.map(([key, question]) => {
+          const labels = Object.keys(question.criteria ?? {});
+          return [key, { type: 'choice', choice: labels[0]!, confidence: 1,
+            probabilities: Object.fromEntries(labels.map((label, index) => [label, index === 0 ? 1 : 0])) }];
+        })),
+      } as unknown as SystemOneResult<Q>;
+    },
+  };
+  const events: DecisionEventData[] = [];
+  const context = createRunContext();
+  const decisions = new Decisions(waveProvider, 10, new AbortController().signal, async data => { events.push(data); }, 4, undefined, context);
+  const result = await decisions.publicSession({ task: { prompt: 'Answer both.' } }).chooseWave({}, {
+    first: { instruction: 'First.', criteria: { a: 'A.', b: 'B.' } },
+    second: { instruction: 'Second.', criteria: { c: 'C.', d: 'D.' } },
+  });
+
+  assert.deepEqual(Object.keys(result.value), ['first', 'second']);
+  assert.equal(events.length, 2, 'one event per answered question instead of one bogus questions event');
+  assert.deepEqual(events.map(event => [event.slot, event.choice]), [['first', 'a'], ['second', 'c']]);
+  assert.ok(events.every(event => event.questions === undefined && event.options?.length === 2), `per-question options: ${JSON.stringify(events)}`);
+  assert.equal(new Set(events.map(event => event.wave)).size, 1, 'both questions share one allocated wave id');
+  assert.equal(decisions.requests, 1, 'the raw wave counts as one request');
+  await context.dispose();
 });

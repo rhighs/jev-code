@@ -1,3 +1,5 @@
+import type { PythonNode } from './python-nodes.js';
+import type { UnitCacheEntry } from './python-units.js';
 import type { DecisionAlternative } from './sdk/types.js';
 import type { DecisionEventData } from './types.js';
 
@@ -79,6 +81,14 @@ export interface DecisionSeed {
   kind?: DecisionKind;
 }
 
+/** Mutable parts of a recorded decision entry, captured so a failed repair can undo its consumption. */
+export interface DecisionSnapshot {
+  decisionId: number;
+  chosen: string;
+  answer?: string;
+  alternatives: DecisionAlternative[];
+}
+
 export interface LineSlot {
   slot: string;
   unit?: string;
@@ -118,15 +128,17 @@ export const attemptScope = (field: string, unit?: string, candidate?: number): 
  * closeDefaultRunContext(); no other module-level state exists.
  */
 export class RunContext {
-  /** Validated unit bodies and symbols for within-run reuse, keyed by (path, normalized task text). */
-  readonly units = new Map<string, unknown>();
+  /** Validated unit tree for within-run reuse, keyed by write target; the task text lives in the entry. */
+  readonly units = new Map<string, UnitCacheEntry>();
   /** Per-written-file line-to-slot maps for runtime-failure attribution. */
   readonly lines = new Map<string, Map<number, LineSlot>>();
 
   private readonly paths = new Map<string, DecisionPathEntry[]>();
   private readonly byId = new Map<number, DecisionPathEntry>();
   private readonly sources = new Map<string, string>();
-  private readonly candidates = new Map<string, unknown[]>();
+  /** Validated-but-dropped search candidate bodies retained as repair candidates, keyed by (target, unit). */
+  private readonly candidates = new Map<string, PythonNode[][]>();
+  private readonly keptCandidates = new Map<string, number>();
   private readonly generationTasks = new Map<string, { task: string; project: boolean }>();
   private readonly waveBisections = new Map<string, number>();
   private readonly waveBlacklist = new Set<string>();
@@ -187,6 +199,22 @@ export class RunContext {
     this.assertActive();
     const prefix = `${field}${SEPARATOR}${unit}${SEPARATOR}`;
     for (const scope of [...this.paths.keys()]) if (scope.startsWith(prefix)) this.invalidateScope(scope);
+    this.keptCandidates.delete(`${field}${SEPARATOR}${unit}`);
+  }
+
+  /**
+   * The search candidate whose body was kept for one (field, unit) at width > 1. Recorded when a
+   * unit validates so the line map can resolve repair through the body that was actually written
+   * instead of scanning candidate scopes from zero.
+   */
+  recordKeptCandidate(field: string, unit: string, candidate: number): void {
+    this.assertActive();
+    this.keptCandidates.set(`${field}${SEPARATOR}${unit}`, candidate);
+  }
+
+  keptCandidate(field: string, unit: string): number | undefined {
+    this.assertActive();
+    return this.keptCandidates.get(`${field}${SEPARATOR}${unit}`);
   }
 
   recordDecision(scope: string, entry: DecisionPathEntry): void {
@@ -259,8 +287,11 @@ export class RunContext {
   }
 
   /**
-   * Move the line map and source recorded under a generation field to the concrete written path
-   * (single-file writes know the path only after the tool runs). A no-op when they are the same.
+   * Move everything recorded under a generation field to the concrete written path (single-file
+   * writes know the path only after the tool runs). The line map, source, unit cache, generation
+   * task, and retained candidates are all re-keyed and each line slot's `target` follows, so two
+   * files written through the same body field can never share a cache entry or a repair target.
+   * A no-op when they are the same.
    */
   adoptWrittenFile(from: string, to: string): void {
     this.assertActive();
@@ -268,6 +299,7 @@ export class RunContext {
     const lines = this.lines.get(from);
     if (lines !== undefined) {
       this.lines.delete(from);
+      for (const slot of lines.values()) if (slot.target === from) slot.target = to;
       this.lines.set(to, lines);
     }
     const source = this.sources.get(from);
@@ -275,17 +307,71 @@ export class RunContext {
       this.sources.delete(from);
       this.sources.set(to, source);
     }
+    const units = this.units.get(from);
+    if (units !== undefined) {
+      this.units.delete(from);
+      this.units.set(to, units);
+    }
+    const task = this.generationTasks.get(from);
+    if (task !== undefined) {
+      this.generationTasks.delete(from);
+      this.generationTasks.set(to, task);
+    }
+    const prefix = `${from}${SEPARATOR}`;
+    for (const key of [...this.candidates.keys()]) {
+      if (!key.startsWith(prefix)) continue;
+      const bodies = this.candidates.get(key)!;
+      this.candidates.delete(key);
+      this.candidates.set(`${to}${key.slice(from.length)}`, bodies);
+    }
+  }
+
+  /**
+   * Snapshot every recorded decision entry (chosen label, answer, retained alternatives). A repair
+   * rebuild consumes alternatives as it commits; when its write never reaches disk the caller
+   * restores the snapshot so the next repair replays the same runner-up instead of a stale one.
+   */
+  snapshotDecisions(): DecisionSnapshot[] {
+    this.assertActive();
+    return [...this.byId.values()].map(entry => ({ decisionId: entry.decisionId, chosen: entry.chosen,
+      ...(entry.answer === undefined ? {} : { answer: entry.answer }), alternatives: [...entry.alternatives] }));
+  }
+
+  /** Restore entries captured by snapshotDecisions(); entries invalidated since are left invalid. */
+  restoreDecisions(snapshot: readonly DecisionSnapshot[]): void {
+    this.assertActive();
+    for (const item of snapshot) {
+      const entry = this.byId.get(item.decisionId);
+      if (entry === undefined) continue;
+      entry.chosen = item.chosen;
+      if (item.answer === undefined) delete entry.answer;
+      else entry.answer = item.answer;
+      entry.alternatives = [...item.alternatives];
+    }
+  }
+
+  /**
+   * Replace a file's recorded source and line map, or clear them when undefined. Used to undo the
+   * run-context records of a repair generation whose write failed, so a later repair is not
+   * blocked by a source that never reached disk.
+   */
+  restoreFile(path: string, source: string | undefined, lines: ReadonlyMap<number, LineSlot> | undefined): void {
+    this.assertActive();
+    if (source === undefined) this.sources.delete(path);
+    else this.sources.set(path, source);
+    if (lines === undefined) this.lines.delete(path);
+    else this.lines.set(path, new Map(lines));
   }
 
   /** Retain validated-but-dropped search candidates for one (target, unit) as repair candidates. */
-  retainCandidates(target: string, unit: string, bodies: readonly unknown[]): void {
+  retainCandidates(target: string, unit: string, bodies: readonly PythonNode[][]): void {
     this.assertActive();
     if (!bodies.length) return;
     const key = `${target}${SEPARATOR}${unit}`;
     this.candidates.set(key, [...(this.candidates.get(key) ?? []), ...bodies]);
   }
 
-  candidatesFor(target: string, unit: string): readonly unknown[] {
+  candidatesFor(target: string, unit: string): readonly PythonNode[][] {
     this.assertActive();
     return this.candidates.get(`${target}${SEPARATOR}${unit}`) ?? [];
   }
@@ -335,6 +421,7 @@ export class RunContext {
     this.lines.clear();
     this.sources.clear();
     this.candidates.clear();
+    this.keptCandidates.clear();
     this.generationTasks.clear();
     this.waveBisections.clear();
     this.waveBlacklist.clear();

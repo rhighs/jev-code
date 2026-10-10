@@ -218,6 +218,31 @@ test('the field wave excludes number fields, which keep their own decision', asy
   assert.equal(decisions.requests, 2);
 });
 
+test('a field wave rejected by the provider journals the skipped question through the note hook', async () => {
+  const notes: string[] = [];
+  // A wave containing `mode` is rejected (422); the plain single-question shape succeeds.
+  const provider: DecisionProvider = { decide: async (_input, questions) => {
+    if (Object.keys(questions).includes('mode')) throw Object.assign(new Error('Jev rejected the request (422).'), { status: 422 });
+    const answers = Object.fromEntries(Object.entries(questions).map(([key, question]) => {
+      const labels = Object.keys((question as { criteria?: Record<string, string> }).criteria ?? {});
+      const choice = labels.includes('true') ? 'true' : labels.includes('fast') ? 'fast' : labels[0]!;
+      return [key, { type: 'choice', choice, confidence: 1,
+        probabilities: Object.fromEntries(labels.map(label => [label, label === choice ? 1 : 0])) }];
+    }));
+    return { model: 'field-wave', usage: { input_tokens: 1, output_tokens: 0 }, answers } as never;
+  } };
+  const decisions = new Decisions(provider, 100, new AbortController().signal);
+  const args = await generateArguments(decisions, { task: { turn: 1, prompt: 'Probe the gadget.' }, action: 'probe' }, {
+    flag: { type: 'boolean', description: 'Flag.' },
+    mode: { type: 'enum', description: 'Mode.', choices: { fast: 'Fast.', slow: 'Slow.' } },
+  }, { fragments: [], maxSteps: 8, note: async message => { notes.push(message); } });
+
+  assert.deepEqual(args, { flag: true, mode: 'fast' });
+  assert.equal(notes.length, 1, 'the isolated field question is journaled once');
+  assert.match(notes[0]!, /^Wave question mode was skipped after a provider rejection and asked singly \(Jev rejected the request \(422\)\.\)\.$/);
+  assert.equal(decisions.requests, 4, 'the rejected wave, the flag half, the isolated mode wave, and the single fallback');
+});
+
 test('an over-budget enum field decision fails without sending a request', async () => {
   const provider = new ScriptedProvider([{ action: 'gadget' }]);
   const decisions = new Decisions(provider, 100, new AbortController().signal);

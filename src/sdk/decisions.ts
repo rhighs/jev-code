@@ -102,7 +102,9 @@ export const isNearTie = (alternatives: readonly DecisionAlternative[], chosen: 
   }
   if (argmax === undefined) return false;
   if (chosen !== argmax) return true;
-  return second === Number.NEGATIVE_INFINITY || top - second <= NEAR_TIE_GAP + NEAR_TIE_EPSILON;
+  // No runner-up means no tie to break; a single-alternative distribution is a decided pick.
+  if (second === Number.NEGATIVE_INFINITY) return false;
+  return top - second <= NEAR_TIE_GAP + NEAR_TIE_EPSILON;
 };
 
 /**

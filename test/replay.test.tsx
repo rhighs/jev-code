@@ -274,6 +274,19 @@ test('resume rebuilds decision ids and alternatives best-effort from journaled o
   }]);
 });
 
+test('a chained resume keeps the usage carried by the journal it continues', async t => {
+  const ws = await tmp(t);
+  const path = join(ws, '.jev', 'runs', 'second.jsonl');
+  await writeJournal(path, [
+    journalStart('second', ws, PROMPT, { from: 'first', turns: 10, requests: 100 }),
+    turnOf('second', 11), turnEndOf('second', 11, 5), endOf('second', 'cancelled', 11),
+  ]);
+  const plan = await prepareResume({ journalPath: path, workspace: ws, effectOf: () => 'read' });
+  assert.equal(plan.requests, 105, 'the earlier carried usage survives a chained resume');
+  assert.equal(plan.turn, 12);
+  assert.equal(plan.turns, 11);
+});
+
 test('findLatestJournal picks the newest journal by mtime', async t => {
   const ws = await tmp(t);
   const runs = join(ws, '.jev', 'runs');

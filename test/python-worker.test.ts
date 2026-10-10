@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -181,4 +182,29 @@ test('a run context disposes its owned worker and rejects later bridge use', asy
   assert.ok(children[0]!.killed, 'context disposal kills the worker child');
   await assert.rejects(worker.run('unparse', tree, call), /disposed/);
   assert.throws(() => context.setWorker(worker), /disposed/);
+});
+
+/** A child stand-in whose spawn handshake is emitted manually, for dispose-race tests. */
+class FakeChild extends EventEmitter {
+  killed = false;
+  stdin = null;
+  stdout = null;
+  stderr = null;
+  ref(): void {}
+  unref(): void {}
+  kill(): boolean { this.killed = true; return true; }
+}
+
+test('a spawn that resolves after dispose kills the child instead of attaching it', async () => {
+  const child = new FakeChild();
+  const worker = new PythonWorker({ spawn: (() => child) as never });
+  const pending = worker.run('unparse', tree, call);
+  worker.dispose();
+  child.emit('spawn');
+  await assert.rejects(pending, /disposed/);
+
+  assert.equal(worker.alive, false, 'a disposed worker never attaches the raced child');
+  assert.equal(child.killed, true, 'the raced child is killed instead of orphaned');
+  assert.equal(worker.spawnCount, 1);
+  worker.dispose();
 });

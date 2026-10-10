@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, realpath, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Decisions, jsonState, type State } from './decisions.js';
-import { COMPLETION_COMPACTION, compactRetryState, decisionChoiceBytes, decisionProbabilityBytes, fitDecisionState, MAX_DECISION_REQUEST_BYTES } from './decision-context.js';
+import { ACTION_COMPACTION, COMPLETION_COMPACTION, compactRetryState, decisionChoiceBytes, decisionProbabilityBytes, fitDecisionState, MAX_DECISION_REQUEST_BYTES } from './decision-context.js';
 import { createRunContext, type DecisionSeed, type RunContext } from './run-context.js';
 import { fragmentsFrom, generateArguments, generateText, type GenerateOptions } from './generation.js';
 import { repairPythonFailure, type PythonRepairResult } from './python-ast.js';
@@ -65,7 +65,9 @@ export interface HarnessOptions {
   authorize?: (tool: Tool, args: Record<string, string | number | boolean>, signal: AbortSignal) => boolean | Promise<boolean>;
   /**
    * Optional post-completion verifier (the eval checker). It runs after an accepted finish; on
-   * failure its reason is appended as input and the loop continues once, bounded per run.
+   * failure its reason is appended as input and the loop continues once, bounded per run. The hook
+   * must settle on its own: it is raced against the run's abort signal, so Ctrl-C and the maxRunMs
+   * deadline cancel the run instead of hanging inside it.
    */
   verify?: (workspace: string) => Promise<{ ok: boolean; reason: string }>;
 }
@@ -76,6 +78,42 @@ const boundedArgs = (args: ToolRecord['args']): ToolRecord['args'] => Object.fro
 );
 
 const failKey = (record: ToolRecord): string => `${record.tool}\0${JSON.stringify(record.args)}`;
+
+/** A repair rebuild plus the run-context records to restore when its write never reaches disk. */
+interface PreparedRepair {
+  repaired: PythonRepairResult;
+  restore: () => void;
+}
+
+/**
+ * One repair rebuild attempt: `prepared` carries the files to write, `failed` names the error the
+ * rebuild threw (the caller journals the cause), and `unavailable` means no usable decision path.
+ */
+type RepairBuild =
+  | { kind: 'prepared'; repair: PreparedRepair }
+  | { kind: 'failed'; reason: string }
+  | { kind: 'unavailable' };
+
+const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
+
+/**
+ * Await one verification, racing it against the run signal. A hook that never settles would
+ * otherwise hang `Harness.run` past its deadline; cancellation and the deadline propagate here so
+ * the run's fatal handling (limited/cancelled) applies.
+ */
+const verificationWithinSignal = async (verification: Promise<{ ok: boolean; reason: string }>, signal: AbortSignal): Promise<{ ok: boolean; reason: string }> => {
+  if (signal.aborted) throw signal.reason;
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([verification, aborted]);
+  } finally {
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort);
+  }
+};
 
 const writtenPath = (record: ToolRecord | undefined): string | undefined => {
   if (!record?.result.ok) return undefined;
@@ -220,16 +258,24 @@ export class Harness {
         return record;
       }
       cycles.set(attribution.target, used + 1);
-      const repaired = await this.applyRepair(attribution, decisions, options, workspace, runContext);
-      if (repaired === undefined) {
+      const build = await this.applyRepair(attribution, decisions, options, workspace, runContext, signal);
+      if (build.kind === 'failed') {
+        await note(`Runtime repair for ${attribution.target} failed: ${build.reason}; fix the failure directly.`);
+        return record;
+      }
+      if (build.kind === 'unavailable') {
         await note(`Runtime repair for ${attribution.target} found no usable decision path; fix the failure directly.`);
         return record;
       }
-      if (!(await this.writeRepaired(repaired, attribution, turn, workspace, runContext, context, signal, emit))) return record;
+      const repair = build.repair;
+      if (!(await this.writeRepaired(repair, attribution, turn, workspace, runContext, context, signal, emit))) {
+        await note(`The repair write for ${attribution.target} was declined or failed; the file was left unchanged and the failure stands.`);
+        return record;
+      }
       await emit('tool_start', { tool: record.tool, args: record.args });
       const retry = await tool.execute(record.args, context);
       const retryRecord: ToolRecord = { turn, tool: record.tool, args: record.args, result: retry,
-        repair: { kind: repaired.outcome.kind, ...(repaired.outcome.decisionId === undefined ? {} : { decisionId: repaired.outcome.decisionId }), ...(repaired.outcome.forced === undefined ? {} : { forced: repaired.outcome.forced }), ...(repaired.outcome.notes.length ? { notes: [...repaired.outcome.notes] } : {}), target: attribution.target, cycle: cycle + 1 } };
+        repair: { kind: repair.repaired.outcome.kind, ...(repair.repaired.outcome.decisionId === undefined ? {} : { decisionId: repair.repaired.outcome.decisionId }), ...(repair.repaired.outcome.forced === undefined ? {} : { forced: repair.repaired.outcome.forced }), ...(repair.repaired.outcome.notes.length ? { notes: [...repair.repaired.outcome.notes] } : {}), target: attribution.target, cycle: cycle + 1 } };
       await emit('tool_end', retryRecord);
       record = retryRecord;
       if (retry.ok) {
@@ -253,9 +299,13 @@ export class Harness {
 
   /**
    * Rebuild the file(s) for one attribution. Refuses to touch any file of the target that changed
-   * after generation (the model may have edited it), and treats a rebuild error as repair unavailable.
+   * after generation (the model may have edited it), and reports a rebuild error with its cause
+   * instead of dropping it. The rebuild records new line maps/sources and consumes alternatives as
+   * it commits; `restore` puts the pre-rebuild records back when the write never reaches disk, so a
+   * later repair is not blocked by a source that never landed or by a runner-up that was consumed
+   * but never written.
    */
-  private async applyRepair(attribution: FailureAttribution, decisions: Decisions, base: Omit<GenerateOptions, 'allowEmpty' | 'maxBytes'>, workspace: string, runContext: RunContext): Promise<PythonRepairResult | undefined> {
+  private async applyRepair(attribution: FailureAttribution, decisions: Decisions, base: Omit<GenerateOptions, 'allowEmpty' | 'maxBytes'>, workspace: string, runContext: RunContext, signal: AbortSignal): Promise<RepairBuild> {
     const files = new Set<string>([attribution.path]);
     for (const [key, map] of runContext.lines) {
       const slot = [...map.values()][0];
@@ -265,35 +315,58 @@ export class Harness {
       const expected = runContext.sourceFor(key);
       if (expected === undefined) continue;
       const current = await readFile(join(workspace, key), 'utf8').catch(() => undefined);
-      if (current !== expected) return undefined;
+      if (current !== expected) return { kind: 'unavailable' };
     }
-    try { return await repairPythonFailure(decisions, runContext, attribution, this.repairOptions(attribution.field, base)); }
-    catch { return undefined; }
+    const fileSnapshots = [...files].map(key => ({ key, source: runContext.sourceFor(key), lines: runContext.lines.get(key) }));
+    const decisionSnapshot = runContext.snapshotDecisions();
+    const restore = (): void => {
+      for (const snapshot of fileSnapshots) runContext.restoreFile(snapshot.key, snapshot.source, snapshot.lines);
+      runContext.restoreDecisions(decisionSnapshot);
+    };
+    try {
+      const repaired = await repairPythonFailure(decisions, runContext, attribution, this.repairOptions(attribution.field, base));
+      return repaired === undefined ? { kind: 'unavailable' } : { kind: 'prepared', repair: { repaired, restore } };
+    } catch (error) {
+      restore();
+      // An abort is run-level cancellation, not a repair diagnosis; propagate it so the run stops
+      // instead of journaling a misleading repair note.
+      if (signal.aborted) throw error;
+      return { kind: 'failed', reason: errorText(error) };
+    }
   }
 
-  /** Write repaired files through the registry's write tool; returns false when the host declines or the write fails. */
-  private async writeRepaired(repaired: PythonRepairResult, attribution: FailureAttribution, turn: number, workspace: string, runContext: RunContext, context: ToolContext, signal: AbortSignal,
+  /** Write repaired files through the registry's write tool; returns false when the host declines or the write fails, restoring the run-context records. */
+  private async writeRepaired(repair: PreparedRepair, attribution: FailureAttribution, turn: number, workspace: string, runContext: RunContext, context: ToolContext, signal: AbortSignal,
     emit: <K extends keyof HarnessEventData>(type: K, data: HarnessEventData[K]) => Promise<void>): Promise<boolean> {
-    const entries = Object.entries(repaired.files);
-    if (!entries.length) return false;
-    const tool = entries.length > 1 ? this.registry.get('write_files') : this.registry.get('write_file');
-    if (tool === undefined) return false;
-    const args: ToolRecord['args'] = entries.length > 1 ? { files: JSON.stringify(repaired.files) } : { path: entries[0]![0], content: entries[0]![1] };
-    const authorized = await this.options.authorize?.(tool, args, signal) ?? true;
-    if (!authorized) return false;
-    signal.throwIfAborted();
-    await emit('tool_start', { tool: tool.name, args });
-    const result = await tool.execute(args, context);
-    const record: ToolRecord = { turn, tool: tool.name, args, result,
-      repair: { kind: repaired.outcome.kind, ...(repaired.outcome.decisionId === undefined ? {} : { decisionId: repaired.outcome.decisionId }), ...(repaired.outcome.forced === undefined ? {} : { forced: repaired.outcome.forced }), ...(repaired.outcome.notes.length ? { notes: [...repaired.outcome.notes] } : {}), target: attribution.target } };
-    await emit('tool_end', record);
-    if (!result.ok) return false;
-    if (tool.name === 'write_file') {
-      // Single-file writes know the concrete path only now; move the recorded lines/source to it.
-      const bodyField = Object.keys(tool.fields).find(name => name !== 'path' && tool.fields[name]!.type === 'string');
-      if (bodyField !== undefined) runContext.adoptWrittenFile(bodyField, String(args.path));
+    const { repaired } = repair;
+    let written = false;
+    try {
+      const entries = Object.entries(repaired.files);
+      if (!entries.length) return false;
+      const tool = entries.length > 1 ? this.registry.get('write_files') : this.registry.get('write_file');
+      if (tool === undefined) return false;
+      const args: ToolRecord['args'] = entries.length > 1 ? { files: JSON.stringify(repaired.files) } : { path: entries[0]![0], content: entries[0]![1] };
+      const authorized = await this.options.authorize?.(tool, args, signal) ?? true;
+      if (!authorized) return false;
+      signal.throwIfAborted();
+      await emit('tool_start', { tool: tool.name, args });
+      const result = await tool.execute(args, context);
+      const record: ToolRecord = { turn, tool: tool.name, args, result,
+        repair: { kind: repaired.outcome.kind, ...(repaired.outcome.decisionId === undefined ? {} : { decisionId: repaired.outcome.decisionId }), ...(repaired.outcome.forced === undefined ? {} : { forced: repaired.outcome.forced }), ...(repaired.outcome.notes.length ? { notes: [...repaired.outcome.notes] } : {}), target: attribution.target } };
+      await emit('tool_end', record);
+      if (!result.ok) return false;
+      if (tool.name === 'write_file') {
+        // Single-file writes know the concrete path only now; move the recorded lines/source to it.
+        const bodyField = Object.keys(tool.fields).find(name => name !== 'path' && tool.fields[name]!.type === 'string');
+        if (bodyField !== undefined) runContext.adoptWrittenFile(bodyField, String(args.path));
+      }
+      written = true;
+      return true;
+    } finally {
+      // A declined or failed repair write leaves the pre-rebuild records in place; the file on disk
+      // still matches them, so the next repair cycle can rebuild instead of being refused.
+      if (!written) repair.restore();
     }
-    return true;
   }
 
   /**
@@ -313,9 +386,9 @@ export class Harness {
   }): Promise<{ ok: boolean; reason: string }> {
     const verify = this.options.verify;
     if (verify === undefined) return { ok: true, reason: '' };
-    const run = async (): Promise<{ ok: boolean; reason: string }> => verify(args.workspace)
+    const run = async (): Promise<{ ok: boolean; reason: string }> => verificationWithinSignal(verify(args.workspace)
       .then(result => ({ ok: result.ok === true, reason: typeof result.reason === 'string' ? result.reason : '' }))
-      .catch((error: unknown) => ({ ok: false, reason: `verifier threw: ${error instanceof Error ? error.message : String(error)}` }));
+      .catch((error: unknown) => ({ ok: false, reason: `verifier threw: ${errorText(error)}` })), args.signal);
     let result = await run();
     for (let cycle = 0; !result.ok && cycle < 2; cycle++) {
       const attribution = attributeFailure(args.runContext, result.reason, args.workspace);
@@ -323,9 +396,13 @@ export class Harness {
       const used = args.cycles.get(attribution.target) ?? 0;
       if (used >= 2) break;
       args.cycles.set(attribution.target, used + 1);
-      const repaired = await this.applyRepair(attribution, args.decisions, args.options, args.workspace, args.runContext);
-      if (repaired === undefined) break;
-      if (!(await this.writeRepaired(repaired, attribution, args.turn, args.workspace, args.runContext, args.context, args.signal, args.emit))) break;
+      const build = await this.applyRepair(attribution, args.decisions, args.options, args.workspace, args.runContext, args.signal);
+      if (build.kind === 'failed') {
+        await args.emit('input', { instruction: `Repair note: runtime repair for ${attribution.target} failed: ${build.reason}; the verification failure stands.` });
+        break;
+      }
+      if (build.kind === 'unavailable') break;
+      if (!(await this.writeRepaired(build.repair, attribution, args.turn, args.workspace, args.runContext, args.context, args.signal, args.emit))) break;
       result = await run();
       if (result.ok) args.cycles.delete(attribution.target);
     }
@@ -345,6 +422,10 @@ export class Harness {
     const controller = new AbortController();
     const deadline = setTimeout(() => controller.abort(new LimitError('Run time budget exhausted.')), this.options.maxRunMs ?? DEFAULT_LIMITS.maxRunMs);
     const signal = externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal;
+    const maxTurns = this.options.maxTurns ?? DEFAULT_LIMITS.maxTurns;
+    // A resume whose carried turns already exhausted the configured budget cannot execute a turn;
+    // it fails fast with the required --max-turns instead of producing a zero-turn limited run.
+    const resumeExhausted = seed !== undefined && seed.turn > maxTurns;
     const records: ToolRecord[] = seed === undefined ? [] : [...seed.records];
     const turnTimings: RunResult['turnTimings'] = [];
     const messages = [/^(?:retry|try again)[.!]?$/i.test(prompt.trim()) ? this.conversation.at(-1)?.prompt ?? prompt : prompt];
@@ -391,8 +472,13 @@ export class Harness {
       // Tool validation (write_files) routes through the run's serializer worker.
       context.runContext = runContext;
       // A resumed run continues at the turn after the last complete turn_end. Turns and request
-      // usage carry over; wall-clock and generation-step budgets restart for the new run.
-      for (turn = seed?.turn ?? 1; turn <= (this.options.maxTurns ?? DEFAULT_LIMITS.maxTurns); turn++) {
+      // usage carry over; wall-clock and generation-step budgets restart for the new run. A resume
+      // past the turn budget is a fast limited result: no turn runs and the summary names the fix.
+      if (resumeExhausted) {
+        status = 'limited';
+        summary = `Run ${seed!.from} carried ${seed!.turns} turn${seed!.turns === 1 ? '' : 's'} and must continue at turn ${seed!.turn}, but the configured turn budget is ${maxTurns}; pass --max-turns ${seed!.turn} or higher to resume it.`;
+      }
+      for (turn = seed?.turn ?? 1; !resumeExhausted && turn <= maxTurns; turn++) {
         const turnStarted = performance.now();
         const turnRequests = decisions.requests;
         try {
@@ -430,10 +516,19 @@ export class Harness {
         criteria.blocked = 'No further useful action is possible without user information or an external prerequisite; explain it.';
         const routes = Object.fromEntries(Object.entries(criteria).map(([key, description]) => [key, route(description, key)])) as RouteTable;
         const actionRouter = defineRouter(routes);
-        const actionInstruction = `Choose the next action for this coding task:\n${messages.join('\nUpdate: ')}\nUse the actual workspace and tool outcomes to decide.`;
-        // Size safety: compact history/recent and re-measure before sending. A size failure is
-        // tracked per action decision; three consecutive failures end the run as limited.
-        const actionFit = fitDecisionState(state, candidate => decisionChoiceBytes(jsonState(candidate), actionInstruction, criteria), MAX_DECISION_REQUEST_BYTES);
+        // The instruction embeds the task text, so it is derived from the candidate state: when
+        // compaction clips task.prompt/task.updates the instruction shrinks with it and the measure
+        // stays consistent with what is sent.
+        const actionInstructionFor = (candidate: State): string => {
+          const task = candidate.task as { prompt?: unknown; updates?: unknown } | undefined;
+          const prompt = typeof task?.prompt === 'string' ? task.prompt : '';
+          const updates = Array.isArray(task?.updates) ? task.updates.filter((update): update is string => typeof update === 'string') : [];
+          return `Choose the next action for this coding task:\n${[prompt, ...updates].join('\nUpdate: ')}\nUse the actual workspace and tool outcomes to decide.`;
+        };
+        // Size safety: compact history/recent and the carried task text, then re-measure. A long
+        // but legal prompt degrades to a clipped task instead of ending the run; three consecutive
+        // failures on an unshrinkable state still end the run as limited.
+        const actionFit = fitDecisionState(state, candidate => decisionChoiceBytes(jsonState(candidate), actionInstructionFor(candidate), criteria), MAX_DECISION_REQUEST_BYTES, ACTION_COMPACTION);
         if (actionFit.overBudget) {
           actionSizeFailures++;
           const sizeFailure = `path=action, bytes=${actionFit.bytes}, cap=${actionFit.cap}, trimmed keys=${actionFit.trimmed.join(', ') || 'none'}`;
@@ -444,6 +539,7 @@ export class Harness {
           continue;
         }
         actionSizeFailures = 0;
+        const actionInstruction = actionInstructionFor(actionFit.state);
         const selection = await actionRouter.select(
           decisions.publicSession(actionFit.state),
           jsonState(actionFit.state),
@@ -599,9 +695,10 @@ export class Harness {
     } finally {
       clearTimeout(deadline);
     }
-    turn = Math.min(turn, this.options.maxTurns ?? DEFAULT_LIMITS.maxTurns);
-    // A non-completed run with a journal can be continued: the summary names the exact command.
-    if (status !== 'completed' && journal !== undefined) summary = `${summary}\nResume this run with jev-code --resume ${id}.`;
+    turn = resumeExhausted && seed !== undefined ? seed.turns : Math.min(turn, maxTurns);
+    // A non-completed run with a journal can be continued: the summary names the exact command. A
+    // resume that already outran the turn budget is not advertised again, since it cannot run.
+    if (status !== 'completed' && journal !== undefined && !resumeExhausted) summary = `${summary}\nResume this run with jev-code --resume ${id}.`;
     const result: RunResult = { id, startedAt, endedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - started), turnTimings, status, summary, ...(modelSummary === undefined ? {} : { modelSummary }), turns: turn, requests: decisions.requests, usage: decisions.usage, records };
     this.conversation.push({ prompt: trim(messages.join('\nUpdate: '), 3000), status, summary: trim(summary, 2000) });
     if (this.conversation.length > 4) this.conversation.shift();

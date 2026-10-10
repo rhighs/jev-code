@@ -194,7 +194,9 @@ export async function prepareResume(options: ResumeOptions): Promise<ResumePlan>
   const records: ToolRecord[] = [];
   const decisions: DecisionSeed[] = [];
   let plan = '';
-  let requests = 0;
+  // Carried usage is transitive: a journal produced by a resumed run already carries the earlier
+  // spend on its start event, so seed from it before adding this journal's own turn_end requests.
+  let requests = start.data.resume?.requests ?? 0;
   for (let index = 0; index < read.events.length; index++) {
     const event = read.events[index]!;
     switch (event.type) {

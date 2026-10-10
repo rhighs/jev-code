@@ -6,7 +6,7 @@ export const name = (id: string, store = false): PythonNode => node('Name', { id
 /** A visible Python name. `params` carries the curated parameter types of builtins (see python-symbols.ts). */
 export interface Symbol { kind: 'builtin' | 'variable' | 'parameter' | 'function' | 'module'; arity?: number; params?: PythonType[] }
 export interface Scope { names: Map<string, Symbol>; parent?: Scope; function: boolean; loop: boolean }
-export interface Vocab { words: string[]; identifiers: string[]; strings: string[]; numbers: number[]; purposes: string[] }
+export interface Vocab { words: string[]; identifiers: string[]; strings: string[]; numbers: number[]; purposes: string[]; pieces: string[] }
 export interface Builder {
   pick(slot: string, scope: Scope, criteria: Record<string, string>, depth?: number): Promise<string>;
   terminal(slot: string, scope: Scope, values: Array<string | number>): Promise<string | number>;

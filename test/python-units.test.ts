@@ -4,7 +4,7 @@ import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import { Decisions } from '../src/decisions.js';
 import { createBuilder, generatePythonAst, repairPythonFailure, vocabulary, type Shared } from '../src/python-ast.js';
 import { functionDef, node, type Builder, type PythonNode, type Scope } from '../src/python-nodes.js';
-import { attributeFailure, commitRepairedUnit, dependentNames, decodedAnswer, fillUnits, forcedLabels, loadUnitCache, saveUnitCache, unitFromCached, unitToCached, type Unit, type UnitCacheEntry, type UnitCheck, type UnitRepair } from '../src/python-units.js';
+import { attributeFailure, commitRepairedUnit, dependentNames, decodedAnswer, fillUnits, forcedLabels, loadUnitCache, saveUnitCache, unitAttemptPath, unitFromCached, unitToCached, type Unit, type UnitCheck, type UnitRepair } from '../src/python-units.js';
 import { attemptScope, createRunContext, type RunContext } from '../src/run-context.js';
 import { LimitError, type DecisionEventData, type DecisionProvider } from '../src/types.js';
 import { SlotProvider, type SlotEntry } from './helpers.js';
@@ -406,14 +406,14 @@ test('a changed task text clears the cached units and regenerates the whole tree
   const context = createRunContext();
   const first = new GateProvider([...decomposition, ...bodies, ...main]);
   await generatePythonAst(inContext(first, context), { ...state, argumentsSoFar: { path: 'main.py' } }, 'content', options);
-  assert.equal((context.units.get('main.py') as UnitCacheEntry | undefined)?.task, prompt);
+  assert.equal(context.units.get('main.py')?.task, prompt);
 
   const changed = 'Write Python helper functions greet(name) and shout(name), then print a different greeting.';
   const second = new GateProvider([...decomposition, ...bodies, ...main]);
   await generatePythonAst(inContext(second, context), { task: { prompt: changed, turn: 2, updates: [] }, argumentsSoFar: { path: 'main.py' } }, 'content', options);
   assert.ok(second.seen.some(entry => entry.generation.slot === 'unit_count'), 'the changed task regenerates the decomposition');
   assert.ok(second.seen.some(entry => entry.generation.unit === 'greet' && entry.generation.slot === 'function_body'), 'unit bodies regenerate');
-  assert.equal((context.units.get('main.py') as UnitCacheEntry | undefined)?.task, changed, 'the entry now holds the new task text');
+  assert.equal(context.units.get('main.py')?.task, changed, 'the entry now holds the new task text');
   assert.equal(loadUnitCache(context, 'main.py', prompt), undefined, 'a lookup for another task clears the entry');
   assert.equal(context.units.has('main.py'), false);
   await context.dispose();
@@ -554,7 +554,7 @@ test('a unit-body traceback maps to the failing leaf and replay rebuilds the sou
   const attribution = attributeFailure(context, text, '/ws');
   assert.ok(attribution, 'the traceback is attributable');
   assert.equal(attribution.unit, 'greet');
-  assert.equal(attribution.target, 'content');
+  assert.equal(attribution.target, 'main.py', 'adoption re-keys the target to the written path');
   assert.equal(attribution.field, 'content');
   assert.equal(attribution.path, 'main.py');
   assert.equal(attribution.line, 2);
@@ -685,14 +685,14 @@ test('an exhausted alternative list regenerates the unit once', async () => {
   const leaf = context.pathFor(attemptScope('content', 'greet')).find(candidate => candidate.kind === 'leaf')!;
   assert.equal(leaf.nearTie, true, 'the near-tie gate opens the replay loop');
 
-  const attribution = { target: 'content', path: 'content', field: 'content', scope: attemptScope('content', 'greet'), unit: 'greet', decisionId: leaf.decisionId, chosen: leaf.chosen, forced: ['missing_alternative'], reason: 'x' };
+  const attribution = { target: 'main.py', path: 'main.py', field: 'content', scope: attemptScope('content', 'greet'), unit: 'greet', decisionId: leaf.decisionId, chosen: leaf.chosen, forced: ['missing_alternative'], reason: 'x' };
   const before = provider.criteria.filter(entry => entry.unit === 'greet' && entry.slot === 'function_body').length;
   const repaired = await repairPythonFailure(d, context, attribution, { ...options, context });
   assert.ok(repaired);
   assert.equal(repaired.outcome.kind, 'unit-regeneration', 'every unusable alternative falls through to one regeneration');
   const after = provider.criteria.filter(entry => entry.unit === 'greet' && entry.slot === 'function_body').length;
   assert.equal(after - before, 1, 'the unit is regenerated exactly once');
-  assert.match(repaired.files['content']!, /def greet\(name\):\n    return 'greet'\n/);
+  assert.match(repaired.files['main.py']!, /def greet\(name\):\n    return 'greet'\n/);
   await context.dispose();
 });
 
@@ -793,6 +793,55 @@ test('a validated dropped search candidate is reused when leaf replay is unavail
   assert.ok(repaired);
   assert.equal(repaired.outcome.kind, 'candidate-reuse');
   assert.match(repaired.files['content']!, /def get_greeting\(name\):\n    return name\n/);
+  await context.dispose();
+});
+
+test('a width>1 attribution resolves through the kept candidate, not candidate 0', async () => {
+  const context = createRunContext();
+  const prompt = 'Write a Python helper get_greeting(name) that returns the greeting text, then print it.';
+  const unit = 'get_greeting';
+  const provider = new SlotProvider([
+    { slot: 'unit_count', answer: '1' },
+    { slot: 'unit_0_name', answer: { value: unit } }, { slot: 'unit_0_arity', answer: '1' }, { slot: 'unit_0_purpose', answer: { value: 'returns the greeting' } }, { slot: 'unit_0_parameter_0', answer: { value: 'name' } },
+    // candidate 0: returns the literal 'greeting' (dropped, lower score)
+    { unit, candidate: 0, slot: 'function_body', answer: 'return' }, { unit, candidate: 0, slot: 'expression', answer: 'string' }, { unit, candidate: 0, slot: 'string', answer: { value: 'greeting' }, runnerUp: 'name' },
+    // candidate 1: dropped by the static check
+    { unit, candidate: 1, slot: 'function_body', answer: 'pass', once: true }, { unit, candidate: 1, slot: 'function_body', answer: 'finish', once: true },
+    // candidate 2: returns another literal (kept, higher score), also a near-tie
+    { unit, candidate: 2, slot: 'function_body', answer: 'return' }, { unit, candidate: 2, slot: 'expression', answer: 'string' }, { unit, candidate: 2, slot: 'string', answer: { value: 'greeting text' }, runnerUp: 'name' },
+    { slot: 'candidate_score', candidate: 0, answer: { score: 2 } }, { slot: 'candidate_score', candidate: 2, answer: { score: 3 } },
+    { slot: 'module_body', answer: 'expr', once: true }, { slot: 'expression', answer: 'call' }, { slot: 'callee', answer: { value: 'print' }, once: true },
+    { slot: 'argument_count', answer: '1' }, { slot: 'argument_0', answer: 'call', once: true }, { slot: 'callee', answer: { value: unit } },
+    { slot: 'argument_0', answer: 'string' }, { slot: 'string', answer: { value: 'name' } },
+    { slot: 'module_body', answer: 'finish' },
+  ]);
+  const d = inContext(provider, context);
+  const source = await generatePythonAst(d, { task: { prompt, turn: 1, updates: [] } }, 'content', { ...options, searchWidth: 3 });
+  assert.match(source, /return 'greeting text'/);
+  context.adoptWrittenFile('content', 'main.py');
+
+  const keptPath = context.pathFor(attemptScope('content', unit, 2));
+  assert.ok(keptPath.length > 0, 'the kept candidate path is recorded');
+  const keptLeaf = keptPath.find(entry => entry.kind === 'leaf')!;
+  const defLine = source.split('\n').findIndex(line => line.startsWith(`def ${unit}(`)) + 1;
+  assert.equal(context.slotAtLine('main.py', defLine)?.scope, attemptScope('content', unit, 2), 'the line map records the kept candidate scope');
+
+  const attempt = unitAttemptPath(context, 'content', unit, attemptScope('content', unit));
+  assert.equal(attempt.scope, attemptScope('content', unit, 2), 'attribution resolves through the kept candidate');
+  assert.equal(attempt.entries[0]?.decisionId, keptPath[0]?.decisionId);
+
+  const attribution = attributeFailure(context, traceback([
+    { path: '/ws/main.py', line: 3, source: 'print(get_greeting(name))' },
+    { path: '/ws/main.py', line: 2, source: "return 'greeting text'" },
+  ], 'TypeError: boom'), '/ws');
+  assert.ok(attribution);
+  assert.equal(attribution.unit, unit);
+  assert.equal(attribution.decisionId, keptLeaf.decisionId, 'the failing leaf comes from the kept candidate');
+
+  const repaired = await repairPythonFailure(d, context, attribution, { ...options, context });
+  assert.ok(repaired);
+  assert.equal(repaired.outcome.kind, 'unit-replay', 'the repair replays the kept candidate');
+  assert.match(repaired.files['main.py']!, /return 'name'/, 'the repaired body is the kept candidate with a forced leaf');
   await context.dispose();
 });
 

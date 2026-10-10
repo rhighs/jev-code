@@ -181,7 +181,10 @@ export async function generateArguments(decisions: Decisions, state: State, fiel
       if (fit.overBudget) {
         throw new LimitError(`Field decision size failure: path=field, fields=${entries.map(([name]) => name).join(', ')}, bytes=${fit.bytes}, cap=${fit.cap}, trimmed keys=${fit.trimmed.join(', ') || 'none'}; the request was not sent.`);
       }
-      const answers = await scoped.chooseWave(fit.state, questions, { scope: attemptScope('field'), retryState: compactRetryState });
+      const answers = await scoped.chooseWave(fit.state, questions, { scope: attemptScope('field'), retryState: compactRetryState,
+        // A question isolated by a provider rejection falls back to a single request; journal it
+        // exactly like the AST wave so field-wave degradation is auditable.
+        onSkip: async (question, detail) => { await options.note?.(`Wave question ${question} was skipped after a provider rejection and asked singly (${detail}).`); } });
       return entries.map(([name, field]) => [name, field.type === 'boolean' ? answers[name]!.choice === 'true' : answers[name]!.choice] as const);
     } catch (error) { controller.abort(error); throw error; }
   };

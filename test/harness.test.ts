@@ -10,7 +10,7 @@ import { Harness } from '../src/harness.js';
 import { prepareResume } from '../src/replay.js';
 import { attemptScope, createRunContext, type RunContext } from '../src/run-context.js';
 import { builtInTools } from '../src/tools.js';
-import type { DecisionProvider, Tool } from '../src/types.js';
+import type { DecisionProvider, Tool, ToolRepairRecord } from '../src/types.js';
 import { ScriptedProvider, SlotProvider, type SlotEntry, type Step } from './helpers.js';
 
 async function workspace(t: test.TestContext): Promise<string> {
@@ -455,7 +455,7 @@ test('sequential runs create isolated run contexts that are disposed at run end'
       contexts.push(context);
       beforePaths.push(context.pathFor(scope).length);
       beforeUnits.push(context.units.size);
-      context.units.set('probe', contexts.length);
+      context.units.set('probe', { task: 'probe', units: [] });
       await decisions.chooseWithAlternatives({ probe: true }, 'Pick a probe.',
         { a: 'A', b: 'B' }, { scope, questionKey: 'probe', kind: 'leaf' });
       assert.equal(context.pathFor(scope).length, 1);
@@ -524,7 +524,7 @@ class RepairProvider implements DecisionProvider {
 }
 
 const planEntries = (): SlotEntry[] => [{ phase: 'plan', answer: 'plan_0', once: true }, { phase: 'plan', answer: 'plan_0', once: true }, { phase: 'plan', answer: 'plan_0', once: true }];
-const journalOf = async (root: string, id: string): Promise<Array<{ type: string; data: Record<string, unknown> }>> =>
+const journalOf = async (root: string, id: string): Promise<Array<{ type: string; data: Record<string, unknown> & { repair?: ToolRepairRecord } }>> =>
   (await readFile(join(root, '.jev', 'runs', `${id}.jsonl`), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { type: string; data: Record<string, unknown> });
 
 test('a failing Python run is attributed to its leaf, replayed in place, and re-run in the same turn', async t => {
@@ -552,7 +552,7 @@ test('a failing Python run is attributed to its leaf, replayed in place, and re-
   assert.equal(provider.astStates.filter(state => state.unit === 'compute').length, 6, 'the replay asked no unit questions');
   assert.ok(provider.offered.find(selection => selection.turn === 3)!.offered.includes('bash'), 'the repaired failure counts once, so actionCriteria keeps the tool available');
 
-  const repairs = (await journalOf(root, result.id)).filter(event => event.type === 'tool_end' && event.data.repair !== undefined).map(event => event.data.repair as Record<string, unknown>);
+  const repairs = (await journalOf(root, result.id)).flatMap(event => event.type === 'tool_end' && event.data.repair !== undefined ? [event.data.repair] : []);
   assert.ok(repairs.some(repair => repair.kind === 'unit-replay' && typeof repair.decisionId === 'number' && repair.forced === 'value_0'), `journaled repair: ${JSON.stringify(repairs)}`);
 });
 
@@ -580,7 +580,7 @@ test('a module-slot failure substitutes the failing leaf in place and re-runs in
   assert.equal(bash.result.ok, true, bash.result.output);
   assert.match(bash.result.output, /^1\.0$/m);
   assert.ok((await readFile(join(root, 'main.py'), 'utf8')).includes('print(1 / 1)'));
-  const repairs = (await journalOf(root, result.id)).filter(event => event.type === 'tool_end' && event.data.repair !== undefined).map(event => event.data.repair as Record<string, unknown>);
+  const repairs = (await journalOf(root, result.id)).flatMap(event => event.type === 'tool_end' && event.data.repair !== undefined ? [event.data.repair] : []);
   assert.ok(repairs.some(repair => repair.kind === 'module-substitution' && repair.forced === 'value_1'), `journaled repair: ${JSON.stringify(repairs)}`);
 });
 
@@ -625,6 +625,21 @@ test('a verify failure is appended as input and the next turn repairs it', async
   assert.ok(continuation.task.updates.some(update => /Verification failed: hi\.txt must contain hi/.test(update)), 'the reason is visible to the next turn');
 });
 
+test('a verify hook that never settles is bounded by the run deadline instead of hanging', async t => {
+  const root = await workspace(t);
+  const provider = new ScriptedProvider([
+    { action: 'write_file', args: { path: 'a.txt', content: 'x' } },
+    { action: 'finish', verdict: 1 },
+  ]);
+  const started = performance.now();
+  const result = await new Harness({ workspace: root, provider, journalDirectory: false, maxRunMs: 50,
+    verify: () => new Promise(() => {}) }).run('Write a file.');
+
+  assert.equal(result.status, 'limited', result.summary);
+  assert.match(result.summary, /Run time budget exhausted/);
+  assert.ok(performance.now() - started < 5_000, 'the hanging verifier did not hold the run open');
+});
+
 test('a repair that cannot fix the failure journals a note and leaves the failure to the model', async t => {
   const root = await workspace(t);
   const prompt = "Write a Python program in main.py with a helper compute that prints int('x') and int('y').";
@@ -647,10 +662,40 @@ test('a repair that cannot fix the failure journals a note and leaves the failur
   assert.equal(bash.result.ok, false, 'the failure stays visible after two failed repair cycles');
   const journal = await journalOf(root, result.id);
   const notes = journal.filter(event => event.type === 'input').map(event => String(event.data.instruction));
-  assert.ok(notes.some(note => /Repair budget exhausted for content after 2 cycles/.test(note)), `journal notes: ${JSON.stringify(notes)}`);
-  const repairs = journal.filter(event => event.type === 'tool_end' && event.data.repair !== undefined).map(event => event.data.repair as Record<string, unknown>);
+  assert.ok(notes.some(note => /Repair budget exhausted for main\.py after 2 cycles/.test(note)), `journal notes: ${JSON.stringify(notes)}`);
+  const repairs = journal.flatMap(event => event.type === 'tool_end' && event.data.repair !== undefined ? [event.data.repair] : []);
   assert.ok(repairs.some(repair => repair.kind === 'unit-replay' && repair.cycle === 1) && repairs.some(repair => repair.cycle === 2), `journaled repair cycles: ${JSON.stringify(repairs)}`);
   assert.ok(provider.offered.find(selection => selection.turn === 3)!.offered.includes('bash'), 'the repair cycles count once per failure, so actionCriteria still offers the shell tool');
+});
+
+test('a repair rebuild that fails for a provider reason journals the cause instead of claiming no decision path', async t => {
+  const root = await workspace(t);
+  const prompt = "Write a Python program in main.py with a helper compute that prints int('x').";
+  const script: SlotEntry[] = [
+    ...planEntries(), { phase: 'plan', answer: 'plan_0', once: true },
+    { slot: 'unit_count', answer: '1' },
+    { slot: 'unit_0_name', answer: { value: 'compute' } }, { slot: 'unit_0_arity', answer: '0' }, { slot: 'unit_0_purpose', answer: { value: 'compute' } },
+    { unit: 'compute', slot: 'function_body', answer: 'return' }, { unit: 'compute', slot: 'expression', answer: 'call' },
+    { unit: 'compute', slot: 'callee', answer: { value: 'int' } }, { unit: 'compute', slot: 'argument_count', answer: '1' },
+    { unit: 'compute', slot: 'argument_0', answer: 'string' }, { unit: 'compute', slot: 'string', answer: { value: 'x' } },
+    { slot: 'module_body', answer: 'expr', once: true }, { slot: 'expression', answer: 'call' }, { slot: 'callee', answer: { value: 'print' }, once: true },
+    { slot: 'argument_count', answer: '1' }, { slot: 'argument_0', answer: 'call', once: true }, { slot: 'callee', answer: { value: 'compute' } },
+    { slot: 'module_body', answer: 'finish' },
+  ];
+  const inner = new RepairProvider(new SlotProvider(script), ['write_file', 'bash', 'blocked']);
+  // The first provider request after the failed shell run is the repair rebuild; it fails there.
+  let arm = false;
+  const provider: DecisionProvider = { decide: async (input, questions, signal) => {
+    if (arm) { arm = false; throw new Error('provider offline'); }
+    return inner.decide(input, questions, signal);
+  } };
+  const result = await new Harness({ workspace: root, provider, experimentalGrid: true,
+    onEvent: event => { if (event.type === 'tool_end' && event.data.tool === 'bash' && !event.data.result.ok) arm = true; } }).run(prompt);
+
+  assert.equal(result.status, 'blocked', result.summary);
+  const notes = (await journalOf(root, result.id)).filter(event => event.type === 'input').map(event => String(event.data.instruction));
+  assert.ok(notes.some(note => /Runtime repair for main\.py failed: provider offline; fix the failure directly\./.test(note)), `journal notes: ${JSON.stringify(notes)}`);
+  assert.ok(!notes.some(note => /found no usable decision path/.test(note)), 'the repair failure is not misattributed as a missing decision path');
 });
 
 test('a Python traceback that maps to no generated file journals an unattributed-failure note', async t => {
@@ -704,22 +749,39 @@ test('a size-rejected completion check is labeled as a size failure and the run 
   assert.ok(!provider.states.some(state => state.completionCheck), 'the over-budget completion check was never sent');
 });
 
-test('three consecutive action-size failures end the run as limited with the named fields', async t => {
+test('a long but legal prompt degrades under the action size cap instead of ending the run', async t => {
   const root = await workspace(t);
-  const scripted = new ScriptedProvider([
-    { action: 'write_file', args: { path: 'yy.txt', content: 'yyyy' } },
+  // ~9.7k characters: the action request exceeds the 24k-byte cap until the carried task is clipped.
+  const filler = 'Implement a careful, well-documented feature that touches several files. '.repeat(140);
+  const prompt = `Write a file named out.txt with the word hello. Context: ${filler}`;
+  assert.ok(prompt.length < 32_000, `prompt length ${prompt.length}`);
+  const provider = new ScriptedProvider([
+    { action: 'write_file', args: { path: 'out.txt', content: 'hello' } },
     { action: 'finish', verdict: 1 },
   ]);
-  const harness = new Harness({ workspace: root, provider: scripted, experimentalGrid: true, journalDirectory: false });
-  assert.equal((await harness.run('y'.repeat(3000))).status, 'completed');
-  const sent = scripted.states.length;
+  const result = await new Harness({ workspace: root, provider, journalDirectory: false }).run(prompt);
 
-  const result = await harness.run('z'.repeat(20_000));
+  assert.equal(provider.actions[0]?.turn, 1, 'the run reached an action on the first turn instead of dying on the size cap');
+  assert.ok(!/three consecutive size failures/.test(result.summary), result.summary);
+  const first = provider.states[0]! as unknown as { task: { prompt: string } };
+  assert.ok(first.task.prompt.length < prompt.length, 'the action state clipped the carried task');
+  assert.match(first.task.prompt, /context clipped/);
+  assert.ok(result.records.some(record => record.tool === 'write_file'), 'the selected action was attempted');
+});
+
+test('an unshrinkable action state still ends the run as limited with the named fields', async t => {
+  const root = await workspace(t);
+  // The tool description rides in both the action state and the criteria, and no profile clips it.
+  const gadget: Tool = { name: 'gadget', effect: 'read', description: `Run the gadget. ${'D'.repeat(30_000)}`,
+    fields: {}, async execute() { return { ok: true, output: 'gadget ran' }; } };
+  const provider = new ScriptedProvider([{ action: 'gadget' }]);
+  const result = await new Harness({ workspace: root, provider, tools: [...builtInTools(), gadget], experimentalGrid: true, journalDirectory: false }).run('Run the gadget.');
+
   assert.equal(result.status, 'limited', result.summary);
   assert.equal(result.turns, 3);
   assert.match(result.summary, /action decision request exceeds the safe size budget/);
-  assert.match(result.summary, /path=action, bytes=\d{4,}, cap=24000, trimmed keys=conversation/);
-  assert.equal(scripted.states.length, sent, 'no action request was sent while over budget');
+  assert.match(result.summary, /path=action, bytes=\d{4,}, cap=24000/);
+  assert.equal(provider.states.length, 0, 'no action request was sent while over budget');
 });
 
 test('an over-budget plan select is skipped with a journal note and generation falls back', async t => {
@@ -908,6 +970,20 @@ test('an interrupted run resumes at the next turn without replaying journaled to
   const resumedState = secondProvider.states.find(state => state.task.turn === 3) as unknown as { rules: string[] };
   assert.ok(resumedState.rules.some(rule => /resumed from journal/.test(rule)), JSON.stringify(resumedState.rules));
   assert.match(second.summary, /Wrote note.txt\./, 'the carried record feeds the completion summary');
+});
+
+test('resuming past the configured turn budget fails fast with the required max-turns', async t => {
+  const root = await workspace(t);
+  const provider = new ScriptedProvider([{ action: 'blocked', args: { summary: 'unused' } }]);
+  const seed = { from: 'interrupted', turn: 4, turns: 3, requests: 12, records: [], plan: '', decisions: [] };
+  const result = await new Harness({ workspace: root, provider, resume: seed, maxTurns: 3 }).run('Write the file.');
+
+  assert.equal(result.status, 'limited', result.summary);
+  assert.match(result.summary, /carried 3 turns and must continue at turn 4/);
+  assert.match(result.summary, /--max-turns 4 or higher/);
+  assert.doesNotMatch(result.summary, /Resume this run with jev-code/, 'an unrunnable resume is not advertised again');
+  assert.equal(result.turns, 3, 'the carried turns are reported');
+  assert.equal(provider.states.length, 0, 'no turn ran');
 });
 
 test('a resumed run carries request usage into the enforced budget', async t => {
