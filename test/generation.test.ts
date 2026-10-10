@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { AstRegistry, type AstAdapter } from '../src/ast-adapters.js';
+import { MAX_DECISION_REQUEST_BYTES } from '../src/decision-context.js';
 import { Decisions } from '../src/decisions.js';
 import { generateArguments, generateText, syntaxFeedback } from '../src/generation.js';
 import { characterAlphabet } from '../src/grid.js';
 import { generateProgram } from '../src/lang/core.js';
 import { typescriptDialect } from '../src/lang/javascript.js';
+import { planText } from '../src/text-plan.js';
 import type { DecisionProvider } from '../src/types.js';
 import { ScriptedProvider } from './helpers.js';
 
@@ -175,4 +177,38 @@ test('a JS/TS syntax hint drops productions matching the diagnostic in the retry
 
   const unmatched = await run([{ message: 'Expression expected.', offset: 4 }]);
   assert.ok(unmatched['printed']!.includes('call'), 'unmatched diagnostics stay message-only');
+});
+
+test('an over-budget enum field decision fails without sending a request', async () => {
+  const provider = new ScriptedProvider([{ action: 'gadget' }]);
+  const decisions = new Decisions(provider, 100, new AbortController().signal);
+  await assert.rejects(generateArguments(decisions, { task: { turn: 1, prompt: 'Run the gadget.' }, action: 'gadget' },
+    { mode: { type: 'enum', description: 'M'.repeat(14_000), choices: { fast: 'Fast.', slow: 'Slow.' } } },
+    { fragments: [], maxSteps: 8 }), /Field decision size failure: path=field, field=mode, bytes=\d+, cap=24000/);
+  assert.equal(provider.states.length, 0, 'the request was never sent');
+});
+
+test('a field state that fits only after compaction still sends the choice', async () => {
+  const provider = new ScriptedProvider([{ action: 'probe', args: { flag: 'true' } }]);
+  const decisions = new Decisions(provider, 100, new AbortController().signal);
+  const recent = Array.from({ length: 8 }, (_, index) => ({ turn: index + 1, tool: 'bash', args: { command: `run ${index}`, timeout_ms: '' },
+    result: { ok: true, output: 'o'.repeat(4000) } }));
+  const state = { task: { turn: 1, prompt: 'Probe the flag.' }, action: 'probe', recent };
+  assert.ok(Buffer.byteLength(JSON.stringify(state)) > MAX_DECISION_REQUEST_BYTES, 'the raw state is over the cap');
+  const args = await generateArguments(decisions, state, { flag: { type: 'boolean', description: 'Flag.' } }, { fragments: [], maxSteps: 8 });
+  assert.deepEqual(args, { flag: true });
+  assert.equal(provider.states[0]!.recent.length, 4, 'the sent state was compacted');
+  assert.ok(provider.states[0]!.recent.every(record => record.result.output.length <= 820), 'recent outputs were clipped');
+});
+
+test('an over-budget plan select is skipped with a note and no request', async () => {
+  const provider = new ScriptedProvider([{ action: 'write_file', args: { path: 'main.py', content: 'print("hi")' } }]);
+  const decisions = new Decisions(provider, 100, new AbortController().signal);
+  const notes: string[] = [];
+  const prompt = 'Write a Python program that prints ' + Array.from({ length: 120 }, (_, index) => `"literal_${index}_${'l'.repeat(200)}"`).join(' ');
+  const result = await planText(decisions, { task: { prompt } }, 'content', [], async message => { notes.push(message); });
+  assert.equal(result, undefined);
+  assert.equal(decisions.requests, 0, 'the plan select was not sent');
+  assert.ok(notes.length >= 1);
+  assert.ok(notes.every(note => /Plan select for content at \w+ was skipped \(size failure\): path=plan, bytes=\d+, cap=24000, trimmed keys=/.test(note)), `notes: ${JSON.stringify(notes)}`);
 });

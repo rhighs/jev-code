@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import type { AstAdapter } from '../src/ast-adapters.js';
+import { MAX_DECISION_REQUEST_BYTES } from '../src/decision-context.js';
 import { Harness } from '../src/harness.js';
 import { attemptScope, createRunContext, type RunContext } from '../src/run-context.js';
 import { builtInTools } from '../src/tools.js';
@@ -657,3 +658,144 @@ test('a Python traceback that maps to no generated file journals an unattributed
   const notes = journal.filter(event => event.type === 'input').map(event => String(event.data.instruction));
   assert.ok(notes.some(note => /Python traceback could not be attributed to a generated decision/.test(note)), JSON.stringify(notes));
 });
+
+test('an over-budget field decision becomes a failed record instead of ending the run', async t => {
+  const root = await workspace(t);
+  const description = 'M'.repeat(14_000);
+  const gadget: Tool = { name: 'gadget', effect: 'read', description: 'Run the gadget.',
+    fields: { mode: { type: 'enum', description, choices: { fast: 'Fast.', slow: 'Slow.' } } },
+    async execute() { return { ok: true, output: 'gadget ran' }; } };
+  const provider = new ScriptedProvider([{ action: 'gadget' }, { action: 'blocked', args: { summary: 'Gadget could not run.' } }]);
+  const result = await new Harness({ workspace: root, provider, tools: [...builtInTools(), gadget], experimentalGrid: true, journalDirectory: false }).run('Run the gadget.');
+
+  assert.equal(result.status, 'blocked', result.summary);
+  const record = result.records[0]!;
+  assert.equal(record.tool, 'gadget');
+  assert.equal(record.result.ok, false, 'the over-budget field became a failed record');
+  assert.match(record.result.output, /Field decision size failure: path=field, field=mode, bytes=\d+, cap=24000/);
+  assert.ok(!provider.states.some(state => state.field === 'mode'), 'no enum request was sent for the over-budget field');
+});
+
+test('a size-rejected completion check is labeled as a size failure and the run continues', async t => {
+  const root = await workspace(t);
+  const blob: Tool = { name: 'blob', effect: 'read', description: 'Return a large observation.',
+    fields: {}, async execute() { return { ok: true, output: 'done', data: { blob: 'x'.repeat(30_000) } }; } };
+  const provider = new ScriptedProvider([
+    { action: 'blob' },
+    { action: 'finish', verdict: 1 },
+    { action: 'blocked', args: { summary: 'Stopped probing.' } },
+  ]);
+  const result = await new Harness({ workspace: root, provider, tools: [...builtInTools(), blob], experimentalGrid: true, journalDirectory: false }).run('Probe once, then finish.');
+
+  assert.equal(result.status, 'blocked', result.summary);
+  const rejected = result.records.find(record => record.tool === 'finish')!;
+  assert.equal(rejected.result.ok, false);
+  assert.match(rejected.result.output, /Completion rejected \(1\/3\): size failure/);
+  assert.match(rejected.result.output, /path=completion, bytes=\d+, cap=24000, trimmed keys=/);
+  assert.ok(!provider.states.some(state => state.completionCheck), 'the over-budget completion check was never sent');
+});
+
+test('three consecutive action-size failures end the run as limited with the named fields', async t => {
+  const root = await workspace(t);
+  const scripted = new ScriptedProvider([
+    { action: 'write_file', args: { path: 'yy.txt', content: 'yyyy' } },
+    { action: 'finish', verdict: 1 },
+  ]);
+  const harness = new Harness({ workspace: root, provider: scripted, experimentalGrid: true, journalDirectory: false });
+  assert.equal((await harness.run('y'.repeat(3000))).status, 'completed');
+  const sent = scripted.states.length;
+
+  const result = await harness.run('z'.repeat(20_000));
+  assert.equal(result.status, 'limited', result.summary);
+  assert.equal(result.turns, 3);
+  assert.match(result.summary, /action decision request exceeds the safe size budget/);
+  assert.match(result.summary, /path=action, bytes=\d{4,}, cap=24000, trimmed keys=conversation/);
+  assert.equal(scripted.states.length, sent, 'no action request was sent while over budget');
+});
+
+test('an over-budget plan select is skipped with a journal note and generation falls back', async t => {
+  const root = await workspace(t);
+  const literals = Array.from({ length: 40 }, (_, index) => `literal_${index}_${'l'.repeat(200)}`);
+  const prompt = 'Write a file that contains ' + literals.map(value => `"${value}"`).join(' ');
+  const provider = new ScriptedProvider([
+    { action: 'write_file', args: { path: 'main.txt', content: literals[0]! } },
+    { action: 'finish', verdict: 1 },
+  ]);
+  const result = await new Harness({ workspace: root, provider }).run(prompt);
+
+  assert.equal(result.status, 'completed', result.summary);
+  assert.equal(await readFile(join(root, 'main.txt'), 'utf8'), literals[0]);
+  const journal = await journalOf(root, result.id);
+  const notes = journal.filter(event => event.type === 'input').map(event => String(event.data.instruction));
+  assert.ok(notes.some(note => /Plan select for content at plan was skipped \(size failure\): path=plan, bytes=\d+, cap=24000/.test(note)), JSON.stringify(notes));
+});
+
+test('three size-rejected completion checks end the run as limited with the size cause', async t => {
+  const root = await workspace(t);
+  const blob: Tool = { name: 'blob', effect: 'read', description: 'Return a large observation.',
+    fields: {}, async execute() { return { ok: true, output: 'done', data: { blob: 'x'.repeat(30_000) } }; } };
+  const provider = new ScriptedProvider([
+    { action: 'blob' }, { action: 'finish', verdict: 1 },
+    { action: 'blob' }, { action: 'finish', verdict: 1 },
+    { action: 'blob' }, { action: 'finish', verdict: 1 },
+  ]);
+  const result = await new Harness({ workspace: root, provider, tools: [...builtInTools(), blob], experimentalGrid: true, journalDirectory: false }).run('Probe, then finish.');
+
+  assert.equal(result.status, 'limited', result.summary);
+  assert.match(result.summary, /Stopped after 3 rejected completion checks; 3 of them were size failures/);
+  assert.match(result.summary, /exceeded the 24000-byte safe size cap after compaction/);
+  assert.equal(result.records.filter(record => record.tool === 'finish').length, 3, 'each completion rejection is a failed finish record');
+  assert.ok(!provider.states.some(state => state.completionCheck), 'no over-budget completion check was ever sent');
+});
+
+test('a prior failure reason survives compaction in the next turn state', async t => {
+  const root = await workspace(t);
+  const reason = 'ERROR: missing module frobnicate';
+  let calls = 0;
+  const probe: Tool = { name: 'probe', effect: 'read', description: 'Probe output.',
+    fields: {},
+    async execute() { calls++; return calls === 6 ? { ok: false, output: `${reason}\n${'x'.repeat(5000)}` } : { ok: true, output: `probe ${calls} ` + 'x'.repeat(5000) }; } };
+  const provider = new ScriptedProvider([
+    ...Array.from({ length: 6 }, () => ({ action: 'probe' as const })),
+    { action: 'finish', verdict: 1 },
+  ]);
+  const result = await new Harness({ workspace: root, provider, tools: [...builtInTools(), probe], journalDirectory: false }).run('Keep probing until the failure is understood.');
+
+  assert.equal(result.status, 'completed', result.summary);
+  const next = provider.states.find(state => state.task.turn === 7)!;
+  assert.ok(next, 'the run reached the turn after the failure');
+  assert.equal(next.recent.length, 4, 'the action state was compacted to the newest records');
+  assert.ok(next.recent.every(record => record.result.output.length <= 820), 'outputs were clipped');
+  assert.ok(next.recent.some(record => !record.result.ok && record.result.output.includes(reason)), `failure reason survives: ${JSON.stringify(next.recent.map(record => record.result.output.slice(0, 32)))}`);
+});
+
+test('a 60-turn run with large outputs keeps every request under the size cap', async t => {
+  const root = await workspace(t);
+  let calls = 0;
+  const probe: Tool = { name: 'probe', effect: 'write', description: 'Record a probe observation.',
+    fields: {},
+    async execute() { calls++; return { ok: true, output: `probe ${calls} ` + 'x'.repeat(1500) }; } };
+  const inner = new ScriptedProvider([
+    ...Array.from({ length: 59 }, () => ({ action: 'probe' as const })),
+    { action: 'finish', verdict: 1 },
+  ]);
+  const provider = new SizeRecordingProvider(inner);
+  const result = await new Harness({ workspace: root, provider, tools: [...builtInTools(), probe], maxTurns: 60, journalDirectory: false }).run('Keep probing until done.');
+
+  assert.equal(result.status, 'completed', result.summary);
+  assert.equal(result.turns, 60);
+  assert.equal(result.requests, 61);
+  assert.ok(provider.sizes.every(size => size <= MAX_DECISION_REQUEST_BYTES), `largest request ${Math.max(...provider.sizes)} of ${provider.sizes.length}`);
+  const last = inner.states.at(-1) as unknown as { history: Array<{ turn: number }> };
+  assert.equal(last.history.length, 16, 'the completion check compacted its history');
+});
+
+/** Wraps a scripted provider and records the byte size of every request, mirroring scored-grid tests. */
+class SizeRecordingProvider implements DecisionProvider {
+  readonly sizes: number[] = [];
+  constructor(private readonly inner: ScriptedProvider) {}
+  async decide<Q extends Questions>(input: EntryType, questions: Q, signal?: AbortSignal): Promise<SystemOneResult<Q>> {
+    this.sizes.push(Buffer.byteLength(JSON.stringify({ state: input, questions })));
+    return this.inner.decide(input, questions, signal);
+  }
+}

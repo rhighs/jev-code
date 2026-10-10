@@ -2,6 +2,7 @@ import type { Decisions, State } from './decisions.js';
 import type { Field } from './types.js';
 import type { TextProgress, TextChange } from './grid.js';
 import type { RunContext } from './run-context.js';
+import { decisionChoiceBytes, fitDecisionState, MAX_DECISION_REQUEST_BYTES } from './decision-context.js';
 import { compactContext, generateScoredGrid } from './scored-grid.js';
 import ts from 'typescript';
 import { AstRegistry, type AstAdapter } from './ast-adapters.js';
@@ -31,6 +32,8 @@ export interface GenerateOptions {
   searchWidth?: number;
   /** Run-scoped generation state; defaults to the decisions facade's shared context. */
   context?: RunContext;
+  /** Host-side note for decisions that were skipped or rejected for size reasons (journal hook). */
+  note?: (message: string) => Promise<void>;
   onText?: (field: string, value: string, done: boolean, change?: TextChange, progress?: TextProgress) => Promise<void>;
 }
 
@@ -101,7 +104,7 @@ export async function generateText(decisions: Decisions, state: State, field: st
     return accepted;
   }
   const ws = state.workspace as { files?: string[] } | undefined;
-  const plan = await planText(decisions, compactContext(state), field, Array.isArray(ws?.files) ? ws.files : []);
+  const plan = await planText(decisions, compactContext(state), field, Array.isArray(ws?.files) ? ws.files : [], options.note);
   if (plan !== undefined && (!syntaxFeedback(state, field, plan).length)) {
     if ((!plan && !options.allowEmpty) || Buffer.byteLength(plan) > options.maxBytes) throw new LimitError(`${field} selected text violates its size constraints.`);
     await options.onText?.(field, plan, true, { replace: plan }, { decoder: 'choice', step: 1, cursor: gridCursor(plan), bytes: Buffer.byteLength(plan) });
@@ -116,20 +119,34 @@ export async function generateArguments(decisions: Decisions, state: State, fiel
   const controller = new AbortController();
   const scoped = decisions.fork(controller.signal);
   const rawNumbers = JSON.stringify(state).match(/-?\d+(?:\.\d+)?/g) ?? [];
+  // Size safety for field choices: compact history/recent and re-measure before sending. A field
+  // that cannot fit fails that field decision (a failed field record in the harness), not the run.
+  const fittedFieldInput = (name: string, instructions: string, criteria: Record<string, string>): State => {
+    const input: State = { ...state, argumentFields: fields, field: name };
+    const fit = fitDecisionState(input, candidate => decisionChoiceBytes(candidate, instructions, criteria), MAX_DECISION_REQUEST_BYTES);
+    if (fit.overBudget) {
+      throw new LimitError(`Field decision size failure: path=field, field=${name}, bytes=${fit.bytes}, cap=${fit.cap}, trimmed keys=${fit.trimmed.join(', ') || 'none'}; the request was not sent.`);
+    }
+    return fit.state;
+  };
   const outcomes = await Promise.allSettled(Object.entries(fields).map(async ([name, field]) => {
     try {
-      const input = { ...state, argumentFields: fields, field: name };
       let value: string | number | boolean;
-      if (field.type === 'boolean') value = await scoped.choose(input, field.description, { true: 'Yes.', false: 'No.' }) === 'true';
-      else if (field.type === 'enum') value = await scoped.choose(input, field.description, field.choices);
-      else if (field.type === 'number') {
+      if (field.type === 'boolean') {
+        const criteria = { true: 'Yes.', false: 'No.' };
+        value = await scoped.choose(fittedFieldInput(name, field.description, criteria), field.description, criteria) === 'true';
+      } else if (field.type === 'enum') {
+        value = await scoped.choose(fittedFieldInput(name, field.description, field.choices), field.description, field.choices);
+      } else if (field.type === 'number') {
         const numbers = new Set([field.default, field.min, field.max, 0, 1, 2, 5, 10, 100, 1000, 8000, 30_000, 60_000,
           ...rawNumbers.slice(0, 100).map(Number)].filter((number): number is number => number !== undefined && Number.isFinite(number) &&
           (field.min === undefined || number >= field.min) && (field.max === undefined || number <= field.max)));
         const criteria: Record<string, string> = { custom: 'Construct another numeric value using bounded token choices.' };
         if (field.default !== undefined) criteria.default = `Use the documented default value ${field.default}.`;
         for (const number of numbers) criteria[`number_${number}`] = `Use ${number}.`;
-        const selected = await scoped.choose(input, `${field.description} Use the default unless the task needs another value.`, criteria);
+        const instruction = `${field.description} Use the default unless the task needs another value.`;
+        const input = fittedFieldInput(name, instruction, criteria);
+        const selected = await scoped.choose(input, instruction, criteria);
         if (selected !== 'custom') value = selected === 'default' ? field.default! : Number(selected.slice(7));
         else {
           const text = await generateText(scoped, input, name, field.description, { ...options, maxBytes: 32, allowEmpty: false });
@@ -137,7 +154,7 @@ export async function generateArguments(decisions: Decisions, state: State, fiel
           value = Number(text);
         }
         if (!Number.isFinite(value) || (field.min !== undefined && value < field.min) || (field.max !== undefined && value > field.max)) throw new Error(`${name} is outside its permitted range.`);
-      } else value = await generateText(scoped, input, name, field.description, { ...options, maxBytes: field.maxBytes ?? 256_000, allowEmpty: field.allowEmpty ?? false });
+      } else value = await generateText(scoped, { ...state, argumentFields: fields, field: name }, name, field.description, { ...options, maxBytes: field.maxBytes ?? 256_000, allowEmpty: field.allowEmpty ?? false });
       return [name, value] as const;
     } catch (error) { controller.abort(error); throw error; }
   }));

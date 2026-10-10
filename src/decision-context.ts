@@ -52,6 +52,145 @@ export function buildDecisionContext(parts: ContextPart[], measure: (values: Rec
   return { values, trimmed };
 }
 
+/**
+ * Byte cap for the uncapped decision paths (action select, completion check, field choices, plan
+ * selects). The value mirrors MAX_GRID_REQUEST_BYTES in scored-grid.ts: bytes are the token proxy,
+ * and 24k bytes keeps a request well inside Jev's 32k-token budget without touching the AST/grid caps.
+ */
+export const MAX_DECISION_REQUEST_BYTES = 24_000;
+
+/** Per-key clamps applied when a decision state exceeds the byte cap. */
+export interface DecisionCompaction {
+  history?: { keep: number; output: number };
+  recent?: { keep: number; args: number; output: number; data?: number };
+  observations?: { keep: number; args: number; output: number; data?: number };
+  conversation?: { prompt: number; summary: number };
+  plan?: number;
+}
+
+export interface DecisionFit {
+  state: Record<string, unknown>;
+  bytes: number;
+  cap: number;
+  /** Keys the compaction changed, in application order. */
+  trimmed: string[];
+  overBudget: boolean;
+}
+
+/** Action/field/plan profile: bounded records with clipped outputs and result data. */
+export const DECISION_COMPACTION: DecisionCompaction = {
+  history: { keep: 12, output: 200 },
+  recent: { keep: 4, args: 512, output: 800, data: 512 },
+  observations: { keep: 4, args: 512, output: 800, data: 512 },
+  conversation: { prompt: 600, summary: 800 },
+  plan: 1000,
+};
+
+/**
+ * Completion-check profile: keeps more evidence and never clips `result.data`, the observed
+ * evidence the verdict is made from. An over-budget completion is rejected as a size failure
+ * rather than judged on trimmed evidence.
+ */
+export const COMPLETION_COMPACTION: DecisionCompaction = {
+  history: { keep: 16, output: 200 },
+  recent: { keep: 8, args: 1024, output: 2000 },
+  observations: { keep: 8, args: 1024, output: 2000 },
+  conversation: { prompt: 600, summary: 800 },
+  plan: 1000,
+};
+
+/** Request bytes for one Choice question, matching the payload DecisionSession.choose sends. */
+export function decisionChoiceBytes(state: unknown, instructions: string, criteria: Record<string, string>): number {
+  return Buffer.byteLength(JSON.stringify({ state, questions: { selection: { type: 'choice', instructions, criteria } } }));
+}
+
+/** Request bytes for one Noul question, matching the payload DecisionSession.probability sends. */
+export function decisionProbabilityBytes(state: unknown, instructions: string): number {
+  return Buffer.byteLength(JSON.stringify({ state, questions: { verdict: { type: 'noul', instructions } } }));
+}
+
+const clipText = (value: unknown, limit: number): unknown =>
+  typeof value === 'string' && value.length > limit ? `${value.slice(0, limit)}\n[context clipped]` : value;
+
+const clipShape = (value: unknown, limit: number, depth = 0): unknown => {
+  if (typeof value === 'string') return clipText(value, limit);
+  if (Array.isArray(value)) return value.map(item => clipShape(item, limit, depth + 1));
+  if (typeof value === 'object' && value !== null && depth < 6) {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, clipShape(item, limit, depth + 1)]));
+  }
+  return value;
+};
+
+/** One-line history records: turn, tool, outcome and a clipped output, with older entries dropped. */
+const oneLineRecords = (records: readonly unknown[], output: number): Array<Record<string, unknown>> =>
+  records.map(record => {
+    const value = record as Record<string, unknown>;
+    const result = value.result as Record<string, unknown> | undefined;
+    return { turn: value.turn, tool: value.tool, ok: result?.ok ?? value.ok, output: clipText(result?.output ?? value.output, output) };
+  });
+
+const boundedRecords = (records: readonly unknown[], options: { args: number; output: number; data?: number }): Array<Record<string, unknown>> =>
+  records.map(record => {
+    const value = record as Record<string, unknown>;
+    const result = (value.result ?? {}) as Record<string, unknown>;
+    return {
+      ...value,
+      args: clipShape(value.args ?? {}, options.args),
+      result: {
+        ...result,
+        ...(typeof result.output === 'string' ? { output: clipText(result.output, options.output) } : {}),
+        ...(options.data !== undefined && result.data !== undefined ? { data: clipShape(result.data, options.data) } : {}),
+      },
+    };
+  });
+
+/** Apply one compaction pass to a decision state and report the keys that changed. */
+export function compactDecisionState(state: Record<string, unknown>, profile: DecisionCompaction = DECISION_COMPACTION): { state: Record<string, unknown>; trimmed: string[] } {
+  const compacted: Record<string, unknown> = { ...state };
+  const trimmed: string[] = [];
+  const replace = (key: string, next: unknown): void => {
+    if (JSON.stringify(state[key]) === JSON.stringify(next)) return;
+    compacted[key] = next;
+    trimmed.push(key);
+  };
+  if (profile.history !== undefined && Array.isArray(state.history)) {
+    replace('history', oneLineRecords((state.history as readonly unknown[]).slice(-profile.history.keep), profile.history.output));
+  }
+  if (profile.recent !== undefined && Array.isArray(state.recent)) {
+    replace('recent', boundedRecords((state.recent as readonly unknown[]).slice(-profile.recent.keep), profile.recent));
+  }
+  if (profile.observations !== undefined && Array.isArray(state.observations)) {
+    replace('observations', boundedRecords((state.observations as readonly unknown[]).slice(-profile.observations.keep), profile.observations));
+  }
+  const conversation = profile.conversation;
+  if (conversation !== undefined && Array.isArray(state.conversation)) {
+    replace('conversation', (state.conversation as readonly unknown[]).map(entry => {
+      const value = entry as Record<string, unknown>;
+      return { ...value, prompt: clipText(value.prompt, conversation.prompt), summary: clipText(value.summary, conversation.summary) };
+    }));
+  }
+  if (profile.plan !== undefined) replace('plan', clipText(state.plan, profile.plan));
+  return { state: compacted, trimmed };
+}
+
+/**
+ * Fit a decision state under the byte cap: return it unchanged when it already fits; otherwise
+ * compact history/recent/observations/conversation/plan once and re-measure. `measure` must compute
+ * the byte size of the request that would be built from the candidate state.
+ */
+export function fitDecisionState(
+  state: Record<string, unknown>,
+  measure: (state: Record<string, unknown>) => number,
+  cap: number = MAX_DECISION_REQUEST_BYTES,
+  profile: DecisionCompaction = DECISION_COMPACTION,
+): DecisionFit {
+  const original = measure(state);
+  if (original <= cap) return { state, bytes: original, cap, trimmed: [], overBudget: false };
+  const compacted = compactDecisionState(state, profile);
+  const bytes = measure(compacted.state);
+  return { state: compacted.state, bytes, cap, trimmed: compacted.trimmed, overBudget: bytes > cap };
+}
+
 export interface AstStateInput { objective: string; context: Record<string, unknown>; preview: string; core: Record<string, unknown>; questions: unknown; cap: number }
 
 export function astDecisionState({ objective, context, preview, core, questions, cap }: AstStateInput): Record<string, unknown> {

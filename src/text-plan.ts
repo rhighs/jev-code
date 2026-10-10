@@ -1,9 +1,10 @@
 import type { Decisions, State } from './decisions.js';
+import { decisionChoiceBytes, fitDecisionState, MAX_DECISION_REQUEST_BYTES } from './decision-context.js';
 import { completionSummary } from './summary.js';
 import type { ToolRecord } from './types.js';
 
 /** A shared intent keeps independent positions from inventing different programs. */
-export async function planText(decisions: Decisions, state: State, field: string, files: string[] = []): Promise<string | undefined> {
+export async function planText(decisions: Decisions, state: State, field: string, files: string[] = [], note?: (message: string) => Promise<void>): Promise<string | undefined> {
   const task = state.task as { prompt?: string; updates?: string[] } | undefined;
   if (!task?.prompt) return undefined;
   const prompt = [task.prompt, ...(task.updates ?? [])].join('\n');
@@ -11,13 +12,24 @@ export async function planText(decisions: Decisions, state: State, field: string
   const taskFiles: string[] = prompt.match(/[\w./-]+\.(?:py|[cm]?[jt]sx?|sh|json|md|txt|html|css|rs|go|java|rb|c|cpp)\b/g) ?? [];
   const language = /\bpython\b/i.test(prompt) || String(args?.path ?? '').endsWith('.py') ? 'python' :
     /\b(?:typescript|javascript)\b/i.test(prompt) || /\.[cm]?[jt]sx?$/.test(String(args?.path ?? '')) ? 'javascript' : undefined;
+  // Size safety for plan selects: compact history/recent and re-measure; an over-budget plan
+  // select is skipped with a journal note and generation falls back to bounded token composition.
+  const planDecision = async (phase: string, instruction: string, criteria: Record<string, string>): Promise<string | undefined> => {
+    const fit = fitDecisionState({ ...state, generation: { field, phase } }, candidate => decisionChoiceBytes(candidate, instruction, criteria), MAX_DECISION_REQUEST_BYTES);
+    if (fit.overBudget) {
+      await note?.(`Plan select for ${field} at ${phase} was skipped (size failure): path=plan, bytes=${fit.bytes}, cap=${fit.cap}, trimmed keys=${fit.trimmed.join(', ') || 'none'}; falling back to bounded token composition.`);
+      return undefined;
+    }
+    return decisions.choose(fit.state, instruction, criteria);
+  };
   const select = async (candidates: string[], instruction: string): Promise<string | undefined> => {
     const unique = [...new Set(candidates.filter(value => !value.includes('\0')))].slice(0, 200);
     const criteria: Record<string, string> = { free: 'No offered whole-field plan satisfies the task. Compose text from bounded token choices.' };
     unique.forEach((value, index) => { criteria[`plan_${index}`] = JSON.stringify(value); });
     if (!unique.length) return undefined;
-    const selected = await decisions.choose({ ...state, generation: { field, phase: 'plan' } }, `${instruction}\nTask: ${prompt}\nChoose a shared exact text plan only if it satisfies this field.`, criteria);
-    return selected === 'free' ? undefined : unique[Number(selected.slice(5))];
+    const request = `${instruction}\nTask: ${prompt}\nChoose a shared exact text plan only if it satisfies this field.`;
+    const selected = await planDecision('plan', request, criteria);
+    return selected === undefined || selected === 'free' ? undefined : unique[Number(selected.slice(5))];
   };
   if (field === 'cwd') return select(['.'], 'Choose the Bash working directory; . means the selected workspace.');
   if (field === 'path') {
@@ -40,7 +52,7 @@ export async function planText(decisions: Decisions, state: State, field: string
     const literal = await select(code.concat(literals), 'Select exact file contents only if the task explicitly supplies those contents. Do not mistake a signature, example output or incidental quoted text for a complete program.');
     if (literal !== undefined) return literal;
     if (!language) return undefined;
-    const form = await decisions.choose({ ...state, generation: { field, phase: 'plan_form' } }, `For this file, does the task require only a standalone program that prints a literal message, or more complex code? Task: ${prompt}`,
+    const form = await planDecision('plan_form', `For this file, does the task require only a standalone program that prints a literal message, or more complex code? Task: ${prompt}`,
       { print: 'Only a simple standalone literal-message print program is required.', free: 'Other source, logic, functions or behavior is required; compose the required source.' });
     if (form !== 'print') return undefined;
     const ignored = new Set('a an the create make write simple program script file python python3 javascript typescript hello-world run it with to verify test and world'.split(' '));

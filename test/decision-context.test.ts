@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
-import { buildDecisionContext, windowSource, PENDING } from '../src/decision-context.js';
+import { buildDecisionContext, windowSource, PENDING, COMPLETION_COMPACTION, DECISION_COMPACTION, decisionChoiceBytes, decisionProbabilityBytes, fitDecisionState, MAX_DECISION_REQUEST_BYTES } from '../src/decision-context.js';
 import { Decisions } from '../src/decisions.js';
 import { generatePythonAst } from '../src/python-ast.js';
 import { MAX_GRID_REQUEST_BYTES } from '../src/scored-grid.js';
@@ -81,4 +81,77 @@ test('a long partial program keeps every decision request under the cap and gene
   assert.equal(result.split('\n').filter(Boolean).length, lines);
   assert.equal(provider.requests.length, expected);
   assert.ok(provider.requests.every(size => size <= MAX_GRID_REQUEST_BYTES), `largest request ${Math.max(...provider.requests)}`);
+});
+
+test('decision states that already fit are returned unchanged with nothing trimmed', () => {
+  const state = { task: { prompt: 'small' }, history: [{ turn: 1, tool: 'read_file', ok: true, output: 'ok' }], recent: [] };
+  const fit = fitDecisionState(state, candidate => bytes({ state: candidate }), MAX_DECISION_REQUEST_BYTES);
+  assert.equal(fit.overBudget, false);
+  assert.deepEqual(fit.trimmed, []);
+  assert.equal(fit.state, state, 'a fitting state is not copied or compacted');
+  assert.equal(fit.bytes, bytes({ state }));
+  assert.equal(fit.cap, MAX_DECISION_REQUEST_BYTES);
+});
+
+test('a 60-turn state with large outputs compacts under the cap and keeps the newest evidence', () => {
+  const records = Array.from({ length: 60 }, (_, index) => ({ turn: index + 1, tool: 'bash', args: { command: `run ${index}`, timeout_ms: '' },
+    result: { ok: index % 3 !== 0, output: `out ${index} ` + 'x'.repeat(5000) } }));
+  const state = { task: { prompt: 'keep probing' },
+    conversation: [{ prompt: 'c'.repeat(3000), status: 'completed', summary: 's'.repeat(3000) }],
+    observations: Array.from({ length: 8 }, (_, index) => ({ turn: index, tool: 'bash', args: { command: 'observe' }, result: { ok: true, output: 'o'.repeat(5000) } })),
+    plan: 'p'.repeat(4000),
+    history: records.slice(0, -8).map(record => ({ turn: record.turn, tool: record.tool, ok: record.result.ok, output: record.result.output })),
+    recent: records.slice(-8) };
+  const measure = (candidate: Record<string, unknown>): number => bytes({ state: candidate, questions: {} });
+  assert.ok(measure(state) > MAX_DECISION_REQUEST_BYTES, 'the raw 60-turn state is over the cap');
+  const fit = fitDecisionState(state, measure, MAX_DECISION_REQUEST_BYTES);
+  assert.equal(fit.overBudget, false);
+  assert.ok(fit.bytes <= MAX_DECISION_REQUEST_BYTES, `${fit.bytes} bytes after compaction`);
+  assert.deepEqual(fit.trimmed, ['history', 'recent', 'observations', 'conversation', 'plan']);
+  const recent = fit.state.recent as Array<{ turn: number }>;
+  assert.deepEqual(recent.map(record => record.turn), [57, 58, 59, 60]);
+  const history = fit.state.history as Array<{ turn: number }>;
+  assert.equal(history.length, 12);
+  assert.equal(history.at(-1)!.turn, 52, 'history keeps the newest one-line records');
+  const observations = fit.state.observations as Array<{ turn: number }>;
+  assert.deepEqual(observations.map(record => record.turn), [4, 5, 6, 7], 'observations keep the newest records');
+});
+
+test('a required task over the cap reports overBudget instead of dropping the task', () => {
+  const state = { task: { prompt: 'x'.repeat(30_000) }, history: [], recent: [] };
+  const fit = fitDecisionState(state, candidate => bytes({ state: candidate }), 1000);
+  assert.equal(fit.overBudget, true);
+  assert.ok(fit.bytes > 1000);
+  assert.equal((fit.state.task as { prompt: string }).prompt.length, 30_000);
+});
+
+test('a prior failure reason survives compaction for the next decision', () => {
+  const reason = 'ERROR: no module named frobnicate';
+  const state = { task: { prompt: 'run the tool' }, history: [],
+    recent: [{ turn: 4, tool: 'bash', args: { command: 'frobnicate' }, result: { ok: false, output: `${reason}\n${'y'.repeat(9000)}` } }] };
+  const fit = fitDecisionState(state, candidate => bytes({ state: candidate }), 1500);
+  assert.equal(fit.overBudget, false);
+  const recent = fit.state.recent as Array<{ result: { ok: boolean; output: string } }>;
+  assert.equal(recent[0]!.result.ok, false);
+  assert.ok(recent[0]!.result.output.includes(reason), `clipped output keeps the reason: ${recent[0]!.result.output.slice(0, 80)}`);
+  assert.ok(recent[0]!.result.output.includes('[context clipped]'));
+});
+
+test('the completion profile keeps result data that the default profile clips', () => {
+  const state = { task: { prompt: 'judge' }, recent: [{ turn: 1, tool: 'probe', args: {}, result: { ok: true, output: 'done', data: { blob: 'd'.repeat(4000) } } }] };
+  const measure = (candidate: Record<string, unknown>): number => bytes({ state: candidate });
+  const action = fitDecisionState(state, measure, 1000, DECISION_COMPACTION);
+  assert.equal(action.overBudget, false, 'the default profile clips result data and fits');
+  assert.ok(JSON.stringify(action.state).length < JSON.stringify(state).length);
+  const completion = fitDecisionState(state, measure, 1000, COMPLETION_COMPACTION);
+  assert.equal(completion.overBudget, true, 'unclipped completion evidence can remain over budget');
+  assert.ok(JSON.stringify(completion.state).includes('d'.repeat(4000)));
+});
+
+test('choice and probability byte helpers measure the same question envelope the session sends', () => {
+  const state = { task: { prompt: 'x' } };
+  const criteria = { a: 'A.', b: 'B.' };
+  assert.equal(decisionChoiceBytes(state, 'Choose.', criteria), bytes({ state, questions: { selection: { type: 'choice', instructions: 'Choose.', criteria } } }));
+  assert.equal(decisionProbabilityBytes(state, 'Are you sure?'), bytes({ state, questions: { verdict: { type: 'noul', instructions: 'Are you sure?' } } }));
+  assert.ok(decisionChoiceBytes(state, 'Choose.', criteria) > decisionProbabilityBytes(state, 'Are you sure?'));
 });

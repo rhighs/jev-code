@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, realpath, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Decisions, jsonState, type State } from './decisions.js';
+import { COMPLETION_COMPACTION, decisionChoiceBytes, decisionProbabilityBytes, fitDecisionState, MAX_DECISION_REQUEST_BYTES } from './decision-context.js';
 import { createRunContext, type RunContext } from './run-context.js';
 import { fragmentsFrom, generateArguments, generateText, type GenerateOptions } from './generation.js';
 import { repairPythonFailure, type PythonRepairResult } from './python-ast.js';
@@ -323,7 +324,7 @@ export class Harness {
     const messages = [/^(?:retry|try again)[.!]?$/i.test(prompt.trim()) ? this.conversation.at(-1)?.prompt ?? prompt : prompt];
     const repairCycles = new Map<string, number>();
     const unattributedNotes = new Set<string>();
-    let turn = 0, plan = '', completionRejections = 0, verifyContinuations = 0;
+    let turn = 0, plan = '', completionRejections = 0, completionSizeFailures = 0, verifyContinuations = 0, actionSizeFailures = 0;
     let journal: string | undefined;
     let journalHandle: FileHandle | undefined;
     let eventQueue = Promise.resolve();
@@ -396,10 +397,24 @@ export class Harness {
         criteria.blocked = 'No further useful action is possible without user information or an external prerequisite; explain it.';
         const routes = Object.fromEntries(Object.entries(criteria).map(([key, description]) => [key, route(description, key)])) as RouteTable;
         const actionRouter = defineRouter(routes);
+        const actionInstruction = `Choose the next action for this coding task:\n${messages.join('\nUpdate: ')}\nUse the actual workspace and tool outcomes to decide.`;
+        // Size safety: compact history/recent and re-measure before sending. A size failure is
+        // tracked per action decision; three consecutive failures end the run as limited.
+        const actionFit = fitDecisionState(state, candidate => decisionChoiceBytes(jsonState(candidate), actionInstruction, criteria), MAX_DECISION_REQUEST_BYTES);
+        if (actionFit.overBudget) {
+          actionSizeFailures++;
+          const sizeFailure = `path=action, bytes=${actionFit.bytes}, cap=${actionFit.cap}, trimmed keys=${actionFit.trimmed.join(', ') || 'none'}`;
+          if (actionSizeFailures >= 3) {
+            throw new LimitError(`The action decision request exceeds the safe size budget after compaction (${sizeFailure}); three consecutive size failures ended the run before an action was selected.`);
+          }
+          await emit('input', { instruction: `Note: the action decision request exceeds the safe size budget after compaction (${sizeFailure}); retrying after compaction (${actionSizeFailures}/3).` });
+          continue;
+        }
+        actionSizeFailures = 0;
         const selection = await actionRouter.select(
-          decisions.publicSession(state),
-          jsonState(state),
-          `Choose the next action for this coding task:\n${messages.join('\nUpdate: ')}\nUse the actual workspace and tool outcomes to decide.`,
+          decisions.publicSession(actionFit.state),
+          jsonState(actionFit.state),
+          actionInstruction,
         );
         const action = selection.value as string;
         await emit('action', { tool: action });
@@ -416,6 +431,8 @@ export class Harness {
           astRegistry: this.astRegistry, context: runContext,
           experimentalGrid: this.options.experimentalGrid ?? false,
           gridBatchSize: this.options.gridBatchSize ?? 8, concurrency: this.options.concurrency ?? 4, searchWidth: this.options.searchWidth ?? 1,
+          // Skipped or size-rejected generation decisions surface as journal notes.
+          note: async (noteMessage: string) => { await emit('input', { instruction: `Note: ${noteMessage}` }); },
           // Patch events preserve the scored cells without duplicating the draft per batch.
           onText: async (field: string, value: string, done: boolean, change?: TextChange, progress?: TextProgress) => emit('text', {
             field, bytes: progress?.bytes ?? Buffer.byteLength(value), done, change: change ?? null,
@@ -432,9 +449,29 @@ export class Harness {
               recent: evidence.slice(-8).map(record => ({ ...record, args: boundedArgs(record.args), result: { ...record.result, output: trim(record.result.output, 2000) } })),
               history: evidence.slice(0, -8).map(record => ({ turn: record.turn, tool: record.tool, result: { ok: record.result.ok, output: trim(record.result.output, 200) } })), proposedSummary: message };
             const instruction = 'Judge ONLY the current task and its latest updates, using the actual tool results below. Do not add requirements the user did not ask for. Complete when the requested work is present and applicable verification succeeded. Continue when specific requested work is missing or a verification failure is unresolved. Prior tasks and rejected finish attempts are not requirements.';
-            const verdict = this.options.completionThreshold === undefined
-              ? await decisions.choose(checkState, instruction, { complete: 'The current requested work is complete. End the run.', continue: 'Specific requested work or verification remains unfinished. Continue working.' })
-              : await decisions.probability(checkState, instruction);
+            const completionCriteria = { complete: 'The current requested work is complete. End the run.', continue: 'Specific requested work or verification remains unfinished. Continue working.' };
+            const completionFit = fitDecisionState(checkState, candidate => this.options.completionThreshold === undefined
+              ? decisionChoiceBytes(jsonState(candidate), instruction, completionCriteria)
+              : decisionProbabilityBytes(jsonState(candidate), instruction), MAX_DECISION_REQUEST_BYTES, COMPLETION_COMPACTION);
+            let verdict: string | number;
+            if (completionFit.overBudget) {
+              // A completion check that cannot fit is a rejected completion labeled as a size
+              // failure, so the 3-rejection terminal path does not misattribute the cause.
+              completionRejections++;
+              completionSizeFailures++;
+              await fail(`Completion rejected (${completionRejections}/3): size failure: the completion check could not run because the request exceeds the safe size budget after compaction (path=completion, bytes=${completionFit.bytes}, cap=${completionFit.cap}, trimmed keys=${completionFit.trimmed.join(', ') || 'none'}).`);
+              if (completionRejections >= 3) {
+                status = 'limited';
+                const sizeNote = completionSizeFailures === 0 ? ' without an implementation change'
+                  : `; ${completionSizeFailures} of them were size failures because the completion-check request exceeded the ${MAX_DECISION_REQUEST_BYTES}-byte safe size cap after compaction`;
+                summary = `${completionSummary(records)}\nStopped after 3 rejected completion checks${sizeNote}. Jev could not establish completion; successful tools were not treated as proof of the entire task.`;
+                break;
+              }
+              continue;
+            }
+            verdict = this.options.completionThreshold === undefined
+              ? await decisions.choose(completionFit.state, instruction, completionCriteria)
+              : await decisions.probability(completionFit.state, instruction);
             const accepted = typeof verdict === 'string' ? verdict === 'complete' : verdict >= this.options.completionThreshold!;
             if (this.pendingInputs.length) {
               await fail('New user instructions arrived. Apply them before ending the run.');
