@@ -12,7 +12,7 @@ import { astDecisionState, PENDING } from './decision-context.js';
 import { attemptScope, type DecisionKind, type DecisionPathEntry, type LineSlot, type RunContext } from './run-context.js';
 import { sanitizedEnv } from './env.js';
 import { LimitError } from './types.js';
-import { identifierCandidates, numberCandidates, objectiveWords, phraseLiterals, quotedLiterals, stringCandidates } from './vocab.js';
+import { identifierCandidates, numberCandidates, objectiveWords, phraseLiterals, quotedLiterals, stringCandidates, stringPieces, stringTokenPieces } from './vocab.js';
 import { anyMemberFits, BUILTINS, builtinCallable, fits, memberCriteria, moduleMembers, type PythonType } from './python-symbols.js';
 import { choice } from '@typesafe-ai/sdk';
 import { functionDef, name, node, type PythonNode, type Scope, type Symbol, type Vocab } from './python-nodes.js';
@@ -263,6 +263,7 @@ export function createBuilder(shared: Shared, input: BuilderInput): WaveBuilder 
   const { decisions, render, report, unit, peers, candidate, repair, replay } = input;
   const { field, options, objective, context, budget, vocab, maxDepth } = shared;
   const { words, identifiers, strings, numbers } = vocab;
+  const pieces = stringPieces(objective, words, identifiers);
   const runContext = options.context ?? decisions.runContext;
   const pathScope = attemptScope(field, unit, candidate);
   // Retry narrowing: `arity` forbids the offending peer call; `undefined` keeps the offending
@@ -393,14 +394,19 @@ export function createBuilder(shared: Shared, input: BuilderInput): WaveBuilder 
     if (slot === 'string') criteria.custom = 'Compose a different terminal value from valid token choices, staying in AST generation.';
     const selected = await pick(slot, scope, criteria, 0, 'leaf');
     if (selected !== 'custom') return values[Number(selected.slice(6))]!;
-    const pieces = [...new Set([...words, ...identifiers, ...'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'.split(''), ' ', ', ', ': ', '!', '?', '.', '\n'])].slice(0, 240);
+    // Enriched pieces (quoted and phrase task literals, identifiers, words, separators, the
+    // alphabet) plus, once a result exists, the longest continuations of known candidates so one
+    // pick advances several characters. The 32-piece loop cap, 3-repeat stop, `end` and
+    // byte-budget failure are unchanged.
+    const candidates = [...strings, ...pieces];
     let result = '', last = '', repeats = 0;
     for (let count = 0; count < 32; count++) {
-      const candidates: Record<string, string> = Object.fromEntries(pieces.map((piece, index) => [`piece_${index}`, JSON.stringify(piece)]));
-      if (result || slot === 'string') candidates.end = 'This terminal value is complete.';
-      const selected = await pick(`${slot}_token:${JSON.stringify(result)}`, scope, candidates, 0, 'leaf');
+      const offered = stringTokenPieces(result, pieces, candidates);
+      const criteria: Record<string, string> = Object.fromEntries(offered.map((piece, index) => [`piece_${index}`, JSON.stringify(piece)]));
+      if (result || slot === 'string') criteria.end = 'This terminal value is complete.';
+      const selected = await pick(`${slot}_token:${JSON.stringify(result)}`, scope, criteria, 0, 'leaf');
       if (selected === 'end') return result;
-      const piece = pieces[Number(selected.slice(6))]!;
+      const piece = offered[Number(selected.slice(6))]!;
       repeats = piece === last ? repeats + 1 : 1;
       last = piece;
       result += piece;

@@ -291,6 +291,72 @@ test('numeric terminals offer constants only and string spelling stops after thr
   assert.ok(!spelled.states.some(state => String(state.generation.slot).startsWith('string_token:"aaa"')));
 });
 
+test('a task-derived literal resolves from the enriched custom pieces in one pick', async () => {
+  const provider = new AstProvider(['0', 'expr', 'call', { value: 'print' }, '1', 'string', 'custom', { value: JSON.stringify('Hello, world!') }, 'end', 'finish']);
+  const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Print "Hello, world!".' } }, 'content', options);
+  assert.equal(source, "print('Hello, world!')\n");
+  const tokenAt = provider.states.findIndex(state => state.generation.slot === 'string_token:""');
+  assert.ok(tokenAt >= 0);
+  assert.ok(Object.values(provider.criteria[tokenAt]!).includes(JSON.stringify('Hello, world!')), 'the quoted task literal is offered as one piece');
+  assert.deepEqual(provider.states.filter(state => String(state.generation.slot).startsWith('string_token:')).map(state => state.generation.slot),
+    ['string_token:""', 'string_token:"Hello, world!"'], 'one piece pick composes the literal, then end');
+});
+
+test('custom spelling prefers the longest continuation of a known literal', async () => {
+  const provider = new AstProvider(['0', 'expr', 'call', { value: 'print' }, '1', 'string', 'custom',
+    { value: JSON.stringify('Hello') }, { value: JSON.stringify(', world!') }, 'end', 'finish']);
+  const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Print "Hello, world!".' } }, 'content', options);
+  assert.equal(source, "print('Hello, world!')\n");
+  assert.deepEqual(provider.states.filter(state => String(state.generation.slot).startsWith('string_token:')).map(state => state.generation.slot),
+    ['string_token:""', 'string_token:"Hello"', 'string_token:"Hello, world!"'], 'two multi-character piece picks complete the literal');
+  const secondAt = provider.states.findIndex(state => state.generation.slot === 'string_token:"Hello"');
+  assert.ok(secondAt >= 0);
+  assert.equal(provider.criteria[secondAt]!.piece_0, JSON.stringify(', world!'), 'the longest matching continuation is offered first');
+  assert.ok(!Object.values(provider.criteria[secondAt]!).includes(JSON.stringify('Hello, world!')), 'a piece that would duplicate the prefix is not offered');
+});
+
+test('a novel literal spells from the longest task pieces within a handful of requests', async () => {
+  const provider = new AstProvider(['0', 'expr', 'call', { value: 'print' }, '1', 'string', 'custom',
+    { value: JSON.stringify('split') }, { value: JSON.stringify(' ') }, { value: JSON.stringify('banana') }, 'end', 'finish']);
+  const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Print the words banana split.' } }, 'content', options);
+  assert.equal(source, "print('split banana')\n");
+  const tokenAt = provider.states.findIndex(state => state.generation.slot === 'string_token:""');
+  const first = provider.criteria[tokenAt]!;
+  assert.ok(Object.values(first).includes(JSON.stringify('banana')) && Object.values(first).includes(JSON.stringify('split')), 'task words are offered as single pieces');
+  const stringRequests = provider.states.filter(state => String(state.generation.slot).startsWith('string_token:') || state.generation.slot === 'string').length;
+  assert.ok(stringRequests <= 6, `a novel literal costs a handful of requests, got ${stringRequests}`);
+});
+
+test('enriched pieces keep the three-repeat stop and the 32-piece cap', async () => {
+  const repeated = new AstProvider(['0', 'expr', 'call', { value: 'print' }, '1', 'string', 'custom',
+    { value: JSON.stringify('split') }, { value: JSON.stringify('split') }, { value: JSON.stringify('split') }, 'finish']);
+  assert.equal(await generatePythonAst(decisions(repeated), { task: { prompt: 'Print the words banana split.' } }, 'content', options), "print('splitsplitsplit')\n");
+  assert.equal(repeated.states.filter(state => String(state.generation.slot).startsWith('string_token:')).length, 3, 'the third identical piece stops the loop');
+
+  const chars = [...'abcdefghijklmnopqrstuvwxyzABCDEF'];
+  const exhausted = new AstProvider(['0', 'expr', 'call', { value: 'print' }, '1', 'string', 'custom', ...chars.map(value => ({ value: JSON.stringify(value) }))]);
+  await assert.rejects(generatePythonAst(decisions(exhausted), { task: { prompt: 'Print a value.' } }, 'content', options), /token budget exhausted/);
+  assert.equal(exhausted.states.filter(state => String(state.generation.slot).startsWith('string_token:')).length, 32, 'the 32-piece cap is unchanged');
+});
+
+test('a wordy task keeps the offered pieces inside the Choice label limit and still offers the alphabet', async () => {
+  const prompt = `Print ${Array.from({ length: 40 }, (_, index) => `word${index}`).join(' ')}.`;
+  const provider = new AstProvider(['0', 'expr', 'call', { value: 'print' }, '1', 'string', 'custom', { value: JSON.stringify('z') }, 'end', 'finish']);
+  const source = await generatePythonAst(decisions(provider), { task: { prompt } }, 'content', options);
+  assert.equal(source, "print('z')\n");
+  const tokenAt = provider.states.findIndex(state => state.generation.slot === 'string_token:""');
+  const criteria = provider.criteria[tokenAt]!;
+  assert.ok(Object.keys(criteria).length <= 255, `the offered pieces stay inside the Choice label limit (${Object.keys(criteria).length})`);
+  assert.ok(Object.values(criteria).includes(JSON.stringify('z')), 'the single-character alphabet survives the enrichment cap');
+});
+
+test('an over-budget custom terminal throws the existing byte-budget error', async () => {
+  const words = ['zzzzzzzzzz', 'qqqqqqqqqq', 'wwwwwwwwww', 'eeeeeeeeee'];
+  const provider = new AstProvider(['0', 'expr', 'call', { value: 'print' }, '1', 'string', 'custom', ...words.map(value => ({ value: JSON.stringify(value) }))]);
+  await assert.rejects(generatePythonAst(decisions(provider), { task: { prompt: `Print ${words.join(' ')}.` } }, 'content', { ...options, maxBytes: 32 }),
+    /AST terminal exceeds its byte budget/);
+});
+
 test('blocks cannot repeat pass, are capped in length, identifiers never spell, and range needs an argument', async () => {
   const loop = new AstProvider(['0', 'while', 'boolean', 'true', 'pass', 'finish', 'finish']);
   assert.equal(await generatePythonAst(decisions(loop), state, 'content', options), 'while True:\n    pass\n');

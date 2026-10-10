@@ -6,7 +6,7 @@ import type { GenerateOptions } from '../generation.js';
 import { gridCursor } from '../grid.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from '../scored-grid.js';
 import { LimitError } from '../types.js';
-import { identifierCandidates, numberCandidates, objectiveWords, phraseLiterals, quotedLiterals, stringCandidates } from '../vocab.js';
+import { identifierCandidates, numberCandidates, objectiveWords, phraseLiterals, quotedLiterals, stringCandidates, stringPieces, stringTokenPieces } from '../vocab.js';
 
 export type ValueType = 'string' | 'number' | 'bool' | 'list' | 'unknown';
 export type BinOp = 'add' | 'sub' | 'mul' | 'div' | 'mod' | 'concat';
@@ -123,6 +123,7 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
   const objective = [task?.prompt ?? '', ...(task?.updates ?? [])].join('\n');
   const context = compactContext(state);
   const vocab = vocabulary(objective, dialect.keywords);
+  const pieces = stringPieces(objective, vocab.words, vocab.identifiers);
   const { builtins, features, typed } = dialect;
   const program: Program = { body: [] };
   let step = 0;
@@ -158,14 +159,19 @@ export async function generateProgram(dialect: Dialect, decisions: Decisions, st
     if (slot === 'string') criteria.custom = 'Compose a different string from valid token choices.';
     const selected = await pick(slot, scope, criteria);
     if (selected !== 'custom') return values[Number(selected.slice(6))]!;
-    const pieces = [...new Set([...vocab.words, ...'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'.split(''), ' ', ', ', ': ', '!', '?', '.'])].slice(0, 240);
+    // Same enrichment and longest-continuation policy as the Python builder's terminal: quoted
+    // and phrase task literals, identifiers, words, separators and the alphabet, then the longest
+    // continuations of known candidates. The 32-piece loop cap, 3-repeat stop, `end` and
+    // byte-budget failure are unchanged.
+    const candidates = [...vocab.strings, ...pieces];
     let result = '', last = '', repeats = 0;
     for (let count = 0; count < 32; count++) {
-      const candidates: Record<string, string> = Object.fromEntries(pieces.map((piece, index) => [`piece_${index}`, JSON.stringify(piece)]));
-      candidates.end = 'This string is complete.';
-      const choice = await pick(`string_token:${JSON.stringify(result)}`, scope, candidates);
+      const offered = stringTokenPieces(result, pieces, candidates);
+      const criteria: Record<string, string> = Object.fromEntries(offered.map((piece, index) => [`piece_${index}`, JSON.stringify(piece)]));
+      criteria.end = 'This string is complete.';
+      const choice = await pick(`string_token:${JSON.stringify(result)}`, scope, criteria);
       if (choice === 'end') return result;
-      const piece = pieces[Number(choice.slice(6))]!;
+      const piece = offered[Number(choice.slice(6))]!;
       repeats = piece === last ? repeats + 1 : 1;
       last = piece;
       result += piece;
