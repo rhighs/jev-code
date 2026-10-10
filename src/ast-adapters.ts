@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import type { Decisions, State } from './decisions.js';
 import type { GenerateOptions } from './generation.js';
 import { generatePythonAst, generatePythonProject, validatePythonProject, validatePythonSource } from './python-ast.js';
+import type { RunContext } from './run-context.js';
 import { resolveWorkspacePath } from './workspace.js';
 import { atomicWrite } from './tools.js';
 import { bundledAstAdapters } from './lang/index.js';
@@ -15,14 +16,15 @@ export interface AstAdapter {
   languages: string[];
   generate(decisions: Decisions, state: State, field: string, options: GenerateOptions): Promise<string>;
   /** Reject invalid source; validation is mandatory before a write. */
-  validate(source: string, signal: AbortSignal): Promise<void>;
+  validate(source: string, signal: AbortSignal, context?: RunContext): Promise<void>;
   /** Multi-file output as a JSON manifest of path to source, for the write_files tool. */
   generateProject?(decisions: Decisions, state: State, field: string, options: GenerateOptions): Promise<string>;
-  validateProject?(files: Record<string, string>, signal: AbortSignal): Promise<void>;
+  validateProject?(files: Record<string, string>, signal: AbortSignal, context?: RunContext): Promise<void>;
 }
 export const pythonAstAdapter: AstAdapter = {
-  id: 'python', extensions: ['.py'], languages: ['python'], generate: generatePythonAst, validate: validatePythonSource,
-  generateProject: generatePythonProject, validateProject: validatePythonProject,
+  id: 'python', extensions: ['.py'], languages: ['python'], generate: generatePythonAst,
+  validate: (source, signal, context) => validatePythonSource(source, signal, context),
+  generateProject: generatePythonProject, validateProject: (files, signal, context) => validatePythonProject(files, signal, undefined, context),
 };
 
 export class AstRegistry {

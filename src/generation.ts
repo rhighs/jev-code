@@ -75,7 +75,7 @@ export async function generateText(decisions: Decisions, state: State, field: st
     });
     decisions.signal.throwIfAborted();
     if (Buffer.byteLength(manifest) > options.maxBytes) throw new LimitError(`AST adapter ${adapter.id} returned a project outside its size constraints.`);
-    await adapter.validateProject!(parseManifest(manifest), decisions.signal);
+    await adapter.validateProject!(parseManifest(manifest), decisions.signal, options.context ?? decisions.runContext);
     decisions.signal.throwIfAborted();
     await options.onText?.(field, manifest, true, { replace: manifest }, { decoder: 'ast', step: 0, cursor: gridCursor(manifest), bytes: Buffer.byteLength(manifest) });
     return manifest;
@@ -87,7 +87,7 @@ export async function generateText(decisions: Decisions, state: State, field: st
       const source = await adapter.generate(decisions, attemptState, field, { ...options, ...forward });
       decisions.signal.throwIfAborted();
       if (typeof source !== 'string' || (!source && !options.allowEmpty) || Buffer.byteLength(source) > options.maxBytes) throw new LimitError(`AST adapter ${adapter.id} returned source outside its byte/size constraints.`);
-      try { await adapter.validate(source, decisions.signal); } catch (failure) { return { source, failure }; }
+      try { await adapter.validate(source, decisions.signal, options.context ?? decisions.runContext); } catch (failure) { return { source, failure }; }
       decisions.signal.throwIfAborted();
       return { source };
     };

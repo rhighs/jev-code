@@ -1,4 +1,5 @@
 import type { TextProgress, TextChange } from './grid.js';
+import type { RunContext } from './run-context.js';
 export { DecisionError, LimitError } from './sdk/types.js';
 export type { DecisionProvider } from './sdk/types.js';
 
@@ -23,6 +24,11 @@ export interface ToolContext {
   resolvePath(path: string): Promise<string>;
   onOutput?: (stream: 'stdout' | 'stderr', text: string) => Promise<void>;
   assertRequests?(count: number): void;
+  /**
+   * Run-scoped generation context when a harness owns the run; validation routes through its
+   * serializer worker. Direct tool callers omit it and get the process-scoped default.
+   */
+  runContext?: RunContext;
 }
 
 export type ToolArgs = Record<string, string | number | boolean>;

@@ -1,16 +1,15 @@
-import { spawn } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Decisions, State } from './decisions.js';
 import type { GenerateOptions } from './generation.js';
+import { PythonWorker, spawnPerCallBridge, type PythonBridge } from './python-worker.js';
 import { assemble, assembleProject, cachedPeer, commitRepairedUnit, decompose, decomposeLayout, dropUnitCache, ENTRY, fillUnits, invalidateCachedBodies, isEntry, loadUnitCache, normalizeUnitTask, peersOf, saveUnitCache, unitAttemptPath, unitFromCached, unitToCached, type FailureAttribution, type Layout, type Peer, type Unit, type UnitCacheEntry, type UnitCheck, type UnitRepair, type WaveBuilder, type WaveQuestion } from './python-units.js';
 import { RUBRIC, wantsReturn } from './python-search.js';
 import { gridCursor } from './grid.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
 import { astDecisionState, PENDING } from './decision-context.js';
-import { attemptScope, type DecisionKind, type DecisionPathEntry, type LineSlot, type RunContext } from './run-context.js';
-import { sanitizedEnv } from './env.js';
+import { attemptScope, defaultRunContext, type DecisionKind, type DecisionPathEntry, type LineSlot, type RunContext } from './run-context.js';
 import { LimitError } from './types.js';
 import { identifierCandidates, numberCandidates, objectiveWords, phraseLiterals, quotedLiterals, stringCandidates, stringPieces, stringTokenPieces } from './vocab.js';
 import { anyMemberFits, BUILTINS, builtinCallable, fits, memberCriteria, moduleMembers, type PythonType } from './python-symbols.js';
@@ -38,120 +37,28 @@ export function previewTree(value: unknown, field = ''): unknown {
   return Object.fromEntries(Object.entries(ast).map(([key, child]) => [key, ast._type === 'Module' && key === 'body' && Array.isArray(child) && !child.length ? [] : previewTree(child, key)]));
 }
 
-/** Only the trusted serializer runs here. Generated Python is compiled, never executed. */
-const bridge = String.raw`
-import ast, json, sys
-if sys.version_info < (3, 9):
-    raise RuntimeError('Python AST generation requires Python 3.9 or newer')
-def decode(value):
-    if isinstance(value, list): return [decode(item) for item in value]
-    if not isinstance(value, dict): return value
-    kind = value.get('_type')
-    cls = getattr(ast, kind, None)
-    if not isinstance(cls, type) or not issubclass(cls, ast.AST): raise ValueError('Invalid AST node')
-    fields = {key: decode(item) for key, item in value.items() if key != '_type'}
-    if 'type_params' not in cls._fields and fields.get('type_params') == []: fields.pop('type_params')
-    if any(key not in cls._fields for key in fields): raise ValueError('Invalid AST field')
-    return cls(**fields)
-tree = ast.fix_missing_locations(decode(json.load(sys.stdin)))
-compile(tree, '<jev-ast>', 'exec')
-source = ast.unparse(tree)
-if source: source += '\n'
-compile(ast.parse(source), '<jev-source>', 'exec')
-print(json.dumps(source))
-`;
+/**
+ * Resolve the bridge for one call. An explicit run context (or the process-scoped default for
+ * direct library callers) owns one lazy multiplexed worker; disposing the context kills it. A
+ * foreign worker handle that cannot serve bridge operations keeps the pre-worker spawn-per-call
+ * behavior.
+ */
+const bridgeFor = (context: RunContext | undefined): PythonBridge => {
+  const resolved = context ?? defaultRunContext();
+  const active = resolved.activeWorker;
+  if (active instanceof PythonWorker) return active;
+  if (active !== undefined) return spawnPerCallBridge;
+  const worker = new PythonWorker();
+  resolved.setWorker(worker);
+  return worker;
+};
 
-async function runPythonJson(input: unknown, signal: AbortSignal, maxBytes: number, script: string, cwd?: string): Promise<string> {
-  signal.throwIfAborted();
-  return new Promise((resolve, reject) => {
-    const child = spawn('python3', ['-I', '-c', script], { env: sanitizedEnv(), stdio: ['pipe', 'pipe', 'pipe'], signal, timeout: 10_000, ...(cwd === undefined ? {} : { cwd }) });
-    const output: Buffer[] = [];
-    let outputBytes = 0, error = '', failed = false;
-    const fail = (reason: unknown): void => { if (failed) return; failed = true; child.kill('SIGKILL'); reject(reason); };
-    child.on('error', fail);
-    child.stdin.on('error', fail);
-    child.stdout.on('data', (chunk: Buffer) => {
-      outputBytes += chunk.length;
-      if (outputBytes > maxBytes * 6 + 1024) fail(new LimitError('Unparsed Python exceeds the source byte budget.'));
-      else output.push(chunk);
-    });
-    child.stderr.on('data', (chunk: Buffer) => { error = (error + chunk.toString()).slice(-8000); });
-    child.on('close', code => {
-      if (failed) return;
-      if (signal.aborted) { reject(signal.reason); return; }
-      if (code !== 0) { reject(new Error(`Python AST validation failed: ${error.trim() || `exit ${code}`}`)); return; }
-      try {
-        const source: unknown = JSON.parse(Buffer.concat(output).toString('utf8'));
-        if (typeof source !== 'string') throw new Error('Python returned invalid source.');
-        if (Buffer.byteLength(source) > maxBytes) throw new LimitError('Unparsed Python exceeds the source byte budget.');
-        resolve(source);
-      } catch (reason) { reject(reason); }
-    });
-    child.stdin.end(JSON.stringify(input));
-  });
+export async function unparsePython(tree: PythonNode, signal: AbortSignal, maxBytes = 256_000, context?: RunContext): Promise<string> {
+  return await bridgeFor(context).run('unparse', tree, { signal, maxBytes }) as string;
 }
-
-export async function unparsePython(tree: PythonNode, signal: AbortSignal, maxBytes = 256_000): Promise<string> {
-  return runPythonJson(tree, signal, maxBytes, bridge);
+export async function validatePythonSource(source: string, signal: AbortSignal, context?: RunContext): Promise<void> {
+  await bridgeFor(context).run('source', source, { signal, maxBytes: Math.max(1, Buffer.byteLength(source)) });
 }
-export async function validatePythonSource(source: string, signal: AbortSignal): Promise<void> {
-  await runPythonJson(source, signal, Math.max(1, Buffer.byteLength(source)), "import ast,json,sys; source=json.load(sys.stdin); compile(ast.parse(source),'<jev>','exec'); print(json.dumps(source))");
-}
-
-/** Static only: every file is compiled and every import target is located on disk; nothing is imported or executed. */
-const projectBridge = String.raw`
-import ast, json, os, sys, importlib.util
-root = os.getcwd()
-paths = json.load(sys.stdin)
-for top in sorted({p.split('/')[0].removesuffix('.py') for p in paths}):
-    if importlib.util.find_spec(top) is not None: raise ValueError(f'{top} shadows an installed module')
-sys.path.insert(0, root)
-def local(parts):
-    base = os.path.join(root, *parts)
-    if os.path.isfile(base + '.py'): return base + '.py'
-    if os.path.isdir(base) and os.path.isfile(os.path.join(base, '__init__.py')): return os.path.join(base, '__init__.py')
-    return None
-def resolve(name, where):
-    parts = name.split('.')
-    if local(parts[:1]) is None:
-        if importlib.util.find_spec(parts[0]) is None: raise ValueError(f'{where}: cannot resolve import {name}')
-        return None
-    for i in range(1, len(parts) + 1):
-        if local(parts[:i]) is None: raise ValueError(f'{where}: cannot resolve import {name}')
-    return local(parts)
-def exported(path):
-    names = set()
-    for stmt in ast.parse(open(path, encoding='utf-8').read()).body:
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)): names.add(stmt.name)
-        elif isinstance(stmt, ast.Assign): names.update(t.id for t in stmt.targets if isinstance(t, ast.Name))
-        elif isinstance(stmt, (ast.Import, ast.ImportFrom)): names.update((a.asname or a.name).split('.')[0] for a in stmt.names)
-    return names
-def check(path, tree):
-    for stmt in ast.walk(tree):
-        if isinstance(stmt, ast.Import):
-            for a in stmt.names: resolve(a.name, path)
-        elif isinstance(stmt, ast.ImportFrom):
-            if stmt.level: raise ValueError(f'{path}: relative imports are not supported')
-            target = resolve(stmt.module, path)
-            if target is None: continue
-            if target.endswith('__init__.py'):
-                pkg = os.path.dirname(target)
-                for a in stmt.names:
-                    if a.name != '*' and a.name not in exported(target) and local(stmt.module.split('.') + [a.name]) is None:
-                        raise ValueError(f'{path}: {stmt.module} has no name {a.name}')
-            else:
-                names = exported(target)
-                for a in stmt.names:
-                    if a.name != '*' and a.name not in names: raise ValueError(f'{path}: {stmt.module} has no name {a.name}')
-for path in paths:
-    source = open(os.path.join(root, path), encoding='utf-8').read()
-    try: tree = ast.parse(source, path)
-    except SyntaxError as err: raise ValueError(f'{path}: {err.msg} (line {err.lineno})')
-    compile(tree, path, 'exec')
-for path in paths:
-    check(path, ast.parse(open(os.path.join(root, path), encoding='utf-8').read(), path))
-print(json.dumps('ok'))
-`;
 
 export const manifestPath = /^(?:[A-Za-z_][A-Za-z0-9_]*\/)*[A-Za-z_][A-Za-z0-9_]*\.py$/;
 
@@ -168,7 +75,8 @@ export function parseManifest(text: string): Record<string, string> {
   return raw as Record<string, string>;
 }
 
-export async function validatePythonProject(files: Record<string, string>, signal: AbortSignal, dir?: string): Promise<void> {
+/** Static only: every file is compiled and every import target is located on disk; nothing is imported or executed. */
+export async function validatePythonProject(files: Record<string, string>, signal: AbortSignal, dir?: string, context?: RunContext): Promise<void> {
   signal.throwIfAborted();
   const paths = Object.keys(files);
   for (const path of paths) if (!manifestPath.test(path)) throw new Error(`Invalid manifest path: ${path}`);
@@ -179,37 +87,11 @@ export async function validatePythonProject(files: Record<string, string>, signa
       await mkdir(dirname(target), { recursive: true });
       await writeFile(target, files[path]!, 'utf8');
     }
-    await runPythonJson(paths, signal, 16, projectBridge, root);
+    await bridgeFor(context).run('project', { root, paths }, { signal, maxBytes: 16 });
   } finally {
     if (dir === undefined) await rm(root, { recursive: true, force: true });
   }
 }
-
-const checkBridge = String.raw`
-import ast, json, sys, builtins
-spec = json.load(sys.stdin)
-def done(reason, symbol=None):
-    print(json.dumps(json.dumps({'reason': reason, 'symbol': symbol} if symbol else {'reason': reason}))); sys.exit(0)
-try:
-    tree = ast.parse(spec['source'])
-    compile(tree, '<candidate>', 'exec')
-except Exception:
-    done('compile')
-fn = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == spec['name']), None)
-if fn is None: done('compile')
-defined = set(dir(builtins)) | set(spec['params']) | set(spec['peers']) | {spec['name']}
-for n in ast.walk(fn):
-    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store): defined.add(n.id)
-    elif isinstance(n, (ast.Import, ast.ImportFrom)): defined.update((a.asname or a.name).split('.')[0] for a in n.names)
-    elif isinstance(n, ast.FunctionDef): defined.add(n.name); defined.update(a.arg for a in n.args.args)
-    elif isinstance(n, ast.ExceptHandler) and n.name: defined.add(n.name)
-for n in ast.walk(fn):
-    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in defined: done('undefined', n.id)
-for n in ast.walk(fn):
-    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in spec['peers'] and (len(n.args) != spec['peers'][n.func.id] or n.keywords): done('arity', n.func.id)
-if spec['wantsReturn'] and not any(isinstance(n, ast.Return) and n.value is not None for n in ast.walk(fn)): done('return')
-done('ok')
-`;
 
 export interface CandidateSpec { name: string; params: string[]; peers: Record<string, number>; wantsReturn: boolean }
 export interface CandidateDiagnosis { reason: 'compile' | 'undefined' | 'arity' | 'return'; symbol?: string }
@@ -220,20 +102,18 @@ const candidateReasons = new Set<string>(['compile', 'undefined', 'arity', 'retu
  * Returns the first reason plus the offending symbol when the check knows one; undefined when the
  * candidate passes.
  */
-export async function diagnoseCandidate(source: string, spec: CandidateSpec, signal: AbortSignal): Promise<CandidateDiagnosis | undefined> {
-  const raw = await runPythonJson({ source, ...spec }, signal, 512, checkBridge);
-  let parsed: unknown;
-  try { parsed = JSON.parse(raw); } catch { throw new Error(`Python candidate check returned an invalid result: ${raw}`); }
-  if (!parsed || typeof parsed !== 'object') throw new Error(`Python candidate check returned an invalid result: ${raw}`);
-  const result = parsed as { reason?: unknown; symbol?: unknown };
+export async function diagnoseCandidate(source: string, spec: CandidateSpec, signal: AbortSignal, context?: RunContext): Promise<CandidateDiagnosis | undefined> {
+  const raw = await bridgeFor(context).run('candidate', { source, ...spec }, { signal, maxBytes: 512 });
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`Python candidate check returned an invalid result: ${JSON.stringify(raw)}`);
+  const result = raw as { reason?: unknown; symbol?: unknown };
   if (result.reason === 'ok') return undefined;
-  if (typeof result.reason !== 'string' || !candidateReasons.has(result.reason)) throw new Error(`Python candidate check returned an invalid reason: ${raw}`);
+  if (typeof result.reason !== 'string' || !candidateReasons.has(result.reason)) throw new Error(`Python candidate check returned an invalid reason: ${JSON.stringify(result)}`);
   return { reason: result.reason as CandidateDiagnosis['reason'], ...(typeof result.symbol === 'string' ? { symbol: result.symbol } : {}) };
 }
 
 /** Static only: compile, undefined names, peer arity, missing return. Nothing is executed. */
-export async function checkCandidate(source: string, spec: CandidateSpec, signal: AbortSignal): Promise<string | undefined> {
-  return (await diagnoseCandidate(source, spec, signal))?.reason;
+export async function checkCandidate(source: string, spec: CandidateSpec, signal: AbortSignal, context?: RunContext): Promise<string | undefined> {
+  return (await diagnoseCandidate(source, spec, signal, context))?.reason;
 }
 
 export interface Shared { field: string; options: GenerateOptions; objective: string; context: State; budget: { step: number }; vocab: Vocab; maxDepth: number }
@@ -680,14 +560,14 @@ async function generate(decisions: Decisions, state: State, field: string, optio
   const task = state.task as { prompt?: string; updates?: string[] } | undefined;
   const objective = [task?.prompt ?? '', ...(task?.updates ?? [])].join('\n');
   const shared: Shared = { field, options, objective, context: compactContext(state), budget: { step: 0 }, vocab: vocabulary(objective), maxDepth: 8 };
+  const runContext = options.context ?? decisions.runContext;
   const tree = node('Module', { body: [], type_ignores: [] });
-  const previewOf = (root: PythonNode): Promise<string> => unparsePython(previewTree(root) as PythonNode, decisions.signal, options.maxBytes);
+  const previewOf = (root: PythonNode): Promise<string> => unparsePython(previewTree(root) as PythonNode, decisions.signal, options.maxBytes, runContext);
   const emit = async (preview: string, info: StepInfo, unit?: string): Promise<void> => options.onText?.(field, preview, false, { replace: preview }, {
     decoder: 'ast', step: shared.budget.step, cursor: gridCursor(preview), bytes: Buffer.byteLength(preview), ast: { ...info, ...(unit === undefined ? {} : { unit }) },
   });
   const rootScope: Scope = { names: new Map(), function: false, loop: false };
   const peers: Peer[] = [];
-  const runContext = options.context ?? decisions.runContext;
   const target = unitCacheTarget(state, field);
   const taskText = normalizeUnitTask(objective);
   runContext.recordGenerationTask(target, taskText, project);
@@ -741,9 +621,9 @@ async function generate(decisions: Decisions, state: State, field: string, optio
     const defOf = (unit: Unit, body?: PythonNode[]): PythonNode => body === undefined ? unit.def : functionDef(unit.name, unit.params.map(p => node('arg', { arg: p, annotation: null, type_comment: null })), body);
     const specOf = (unit: Unit): CandidateSpec => ({ name: unit.name, params: unit.params, peers: Object.fromEntries(peersOf(unit, peers).filter(p => p.name !== unit.name).map(p => [p.name, p.arity])), wantsReturn: wantsReturn(unit.purpose) });
     const unitCheck: UnitCheck = {
-      render: (unit, body) => unparsePython(node('Module', { body: [defOf(unit, body)], type_ignores: [] }), decisions.signal, options.maxBytes),
+      render: (unit, body) => unparsePython(node('Module', { body: [defOf(unit, body)], type_ignores: [] }), decisions.signal, options.maxBytes, runContext),
       check: async (unit, source) => {
-        const diagnosis = await diagnoseCandidate(source, specOf(unit), decisions.signal);
+        const diagnosis = await diagnoseCandidate(source, specOf(unit), decisions.signal, runContext);
         return diagnosis === undefined ? undefined : { reason: diagnosis.reason, ...(diagnosis.symbol === undefined ? {} : { symbol: diagnosis.symbol }) };
       },
     };
@@ -824,8 +704,8 @@ async function generate(decisions: Decisions, state: State, field: string, optio
         report: options.onText ? async (_preview, info) => emit(await assembled(), info, unit.name) : async () => {},
       }), parentFor, unitCheck, width > 1 ? {
         width,
-        render: (unit, body) => unparsePython(node('Module', { body: [defOf(unit, body)], type_ignores: [] }), decisions.signal, options.maxBytes),
-        check: (unit, source) => checkCandidate(source, specOf(unit), decisions.signal),
+        render: (unit, body) => unparsePython(node('Module', { body: [defOf(unit, body)], type_ignores: [] }), decisions.signal, options.maxBytes, runContext),
+        check: (unit, source) => checkCandidate(source, specOf(unit), decisions.signal, runContext),
         score: async (unit, d, source, candidate) => (await d.score({
           task: { prompt: objective },
           generation: { field, phase: 'search', slot: 'candidate_score', unit: unit.name, candidate, spec: { name: unit.name, arity: unit.arity, purpose: unit.purpose, params: unit.params }, peers: peersOf(unit, peers).map(p => ({ ...p })), candidateSource: source },
@@ -894,12 +774,12 @@ async function generate(decisions: Decisions, state: State, field: string, optio
   if (layout) {
     const files = assembleProject(tree, units, layout);
     const manifest: Record<string, string> = {};
-    for (const [path, module] of Object.entries(files)) manifest[path] = (module.body as PythonNode[]).length ? await unparsePython(module, decisions.signal, options.maxBytes) : '';
+    for (const [path, module] of Object.entries(files)) manifest[path] = (module.body as PythonNode[]).length ? await unparsePython(module, decisions.signal, options.maxBytes, runContext) : '';
     const text = JSON.stringify(manifest);
     if (Buffer.byteLength(text) > options.maxBytes) throw new LimitError('Python project exceeds its byte budget.');
     if (reused || repair !== undefined) {
       // Reused units skip per-attempt checks, so revalidate the assembled project before returning it.
-      try { await validatePythonProject(manifest, decisions.signal); }
+      try { await validatePythonProject(manifest, decisions.signal, undefined, runContext); }
       catch (error) { invalidateCachedBodies(runContext, target); throw error; }
     }
     for (const [path, source] of Object.entries(manifest)) recordFileLines(runContext, path, target, field, source, units.filter(unit => unit.module === moduleNameOf(layout!, path)));
@@ -908,10 +788,10 @@ async function generate(decisions: Decisions, state: State, field: string, optio
     return text;
   }
   if (units.length) assemble(tree, units);
-  const source = await unparsePython(tree, decisions.signal, options.maxBytes);
+  const source = await unparsePython(tree, decisions.signal, options.maxBytes, runContext);
   if (reused || repair !== undefined) {
     // Reused units skip per-attempt checks, so revalidate the assembled source before returning it.
-    try { await validatePythonSource(source, decisions.signal); }
+    try { await validatePythonSource(source, decisions.signal, runContext); }
     catch (error) { invalidateCachedBodies(runContext, target); throw error; }
   }
   recordFileLines(runContext, target, target, field, source, units);

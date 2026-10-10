@@ -221,7 +221,7 @@ export function builtInTools(): Tool[] {
           canonical.set(target, path);
           targets.push([target, content]);
         }
-        await validatePythonProject(files, context.signal);
+        await validatePythonProject(files, context.signal, undefined, context.runContext);
         await atomicWriteAll(targets, context.signal);
         const paths = Object.keys(files);
         return { ok: true, output: `Wrote ${paths.length} files:\n${paths.join('\n')}`, data: { paths, bytes: paths.reduce((n, path) => n + Buffer.byteLength(files[path]!), 0) } };

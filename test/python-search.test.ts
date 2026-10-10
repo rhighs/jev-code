@@ -1,13 +1,21 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { Decisions } from '../src/decisions.js';
 import { checkCandidate, generatePythonAst } from '../src/python-ast.js';
+import { PythonWorker, type PythonWorkerSpawn } from '../src/python-worker.js';
 import { wantsReturn } from '../src/python-search.js';
 import { createRunContext } from '../src/run-context.js';
 import type { DecisionProvider } from '../src/types.js';
 import { SlotProvider, type SlotEntry } from './helpers.js';
 
 const options = { maxSteps: 200, maxBytes: 8000, allowEmpty: false, fragments: [] };
+/** Spawn-count probe for the run context worker. */
+const probeSpawn = (children: ChildProcess[]): PythonWorkerSpawn => (command, args, argsOptions) => {
+  const child = spawn(command, args, argsOptions);
+  children.push(child);
+  return child;
+};
 // Each run gets its own context: parity here means both paths start with an empty unit cache.
 const decisions = (provider: DecisionProvider, max = 200) => new Decisions(provider, max, new AbortController().signal, undefined, 4, undefined, createRunContext());
 const prompt = 'Write a Python helper get_greeting(name) that returns the greeting text, then print it.';
@@ -44,7 +52,9 @@ test('width 3 drops a returnless candidate, scores the survivors, keeps the best
     { slot: 'candidate_score', candidate: 0, answer: { score: 3 } }, { slot: 'candidate_score', candidate: 2, answer: { score: 2 } },
     ...main]);
   const events: Array<{ text: string; progress: Progress }> = [];
+  const spawned: ChildProcess[] = [];
   const context = createRunContext();
+  context.setWorker(new PythonWorker({ spawn: probeSpawn(spawned) }));
   const d = new Decisions(provider, 200, new AbortController().signal, undefined, 4, undefined, context);
   const source = await generatePythonAst(d, state, 'content', { ...options, searchWidth: 3, onText: async (_f, text, _d, _c, progress) => { events.push({ text, progress: progress as Progress }); } });
   assert.equal(source, "def get_greeting(name):\n    return 'greeting'\nprint(get_greeting('name'))\n");
@@ -59,6 +69,7 @@ test('width 3 drops a returnless candidate, scores the survivors, keeps the best
   const retained = context.candidatesFor('content', unit);
   assert.equal(retained.length, 1, 'the validated-but-dropped candidate is retained for repair');
   assert.match(JSON.stringify(retained[0]), /"Return".*"name"/, 'the retained body is the runner-up candidate');
+  assert.equal(spawned.length, 1, 'every candidate render and static check shares one worker child');
   await context.dispose();
 });
 
@@ -100,4 +111,20 @@ test('static checks report compile, undefined, arity and return in that order', 
   assert.equal(wantsReturn('check whether the file has lines'), true);
   assert.equal(wantsReturn('returns the greeting'), true);
   assert.equal(wantsReturn('print the board'), false);
+});
+
+test('static candidate checks route through the run context worker', async () => {
+  const spawned: ChildProcess[] = [];
+  const context = createRunContext();
+  context.setWorker(new PythonWorker({ spawn: probeSpawn(spawned) }));
+  const signal = new AbortController().signal;
+  const spec = { name: 'f', params: ['x'], peers: { g: 2 }, wantsReturn: true };
+  assert.equal(await checkCandidate('def f(x:\n    return x\n', spec, signal, context), 'compile');
+  assert.equal(await checkCandidate('def f(x):\n    return y\n', spec, signal, context), 'undefined');
+  assert.equal(await checkCandidate('def f(x):\n    return g(x)\n', spec, signal, context), 'arity');
+  assert.equal(await checkCandidate('def f(x):\n    g(x, x)\n', spec, signal, context), 'return');
+  assert.equal(await checkCandidate('def f(x):\n    return g(x, x)\n', spec, signal, context), undefined);
+  assert.equal(spawned.length, 1, 'six candidate checks share one worker child');
+  await context.dispose();
+  assert.ok(spawned[0]!.killed, 'context disposal kills the worker child');
 });

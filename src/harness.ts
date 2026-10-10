@@ -388,6 +388,8 @@ export class Harness {
       const context = toolContext(workspace, signal, path => resolveWorkspacePath(workspace, path, this.options.allowOutsideWorkspace ?? false));
       context.onOutput = async (stream, text) => emit('tool_output', { stream, text });
       context.assertRequests = count => decisions.assertRequestBudget(count);
+      // Tool validation (write_files) routes through the run's serializer worker.
+      context.runContext = runContext;
       // A resumed run continues at the turn after the last complete turn_end. Turns and request
       // usage carry over; wall-clock and generation-step budgets restart for the new run.
       for (turn = seed?.turn ?? 1; turn <= (this.options.maxTurns ?? DEFAULT_LIMITS.maxTurns); turn++) {

@@ -1,13 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import { Decisions } from '../src/decisions.js';
-import { generatePythonAst, unparsePython } from '../src/python-ast.js';
+import { checkCandidate, generatePythonAst, unparsePython, validatePythonProject, validatePythonSource } from '../src/python-ast.js';
+import { PythonWorker, type PythonWorkerSpawn } from '../src/python-worker.js';
 import { attemptScope, closeDefaultRunContext, createRunContext, defaultRunContext } from '../src/run-context.js';
 import { Harness } from '../src/harness.js';
+import { builtInTools, toolContext } from '../src/tools.js';
+import { resolveWorkspacePath } from '../src/workspace.js';
 import type { DecisionEventData, DecisionProvider, HarnessEvent } from '../src/types.js';
 import { ScriptedProvider } from './helpers.js';
 
@@ -669,4 +673,116 @@ test('the wave budget pre-check covers the singles worst case plus bisection ove
   assert.equal(calls, 1, 'the wave itself is one request');
   assert.equal(fits.requests, 1);
   await fits.runContext.dispose();
+});
+
+const emptyTree = { _type: 'Module', body: [], type_ignores: [] };
+const longTree = { _type: 'Module', body: [{ _type: 'Expr', value: { _type: 'Constant', value: 'long text', kind: null } }], type_ignores: [] };
+/** Spawn-count probe for the run context worker. */
+const probeSpawn = (children: ChildProcess[]): PythonWorkerSpawn => (command, args, options) => {
+  const child = spawn(command, args, options);
+  children.push(child);
+  return child;
+};
+
+test('a generation run reuses one serializer child for every render', async () => {
+  const spawned: ChildProcess[] = [];
+  const context = createRunContext();
+  context.setWorker(new PythonWorker({ spawn: probeSpawn(spawned) }));
+  const provider = new AstProvider(['0', ...hello()]);
+  const d = new Decisions(provider, 100, new AbortController().signal, undefined, 4, undefined, context);
+  assert.equal(await generatePythonAst(d, state, 'content', { ...options, context }), "print('Hello, world!')\n");
+  assert.equal(spawned.length, 1, 'every preview and the final unparse share one child');
+  await context.dispose();
+  assert.ok(spawned[0]!.killed, 'run-context disposal kills the child');
+});
+
+test('all four bridge operations route through one run context worker', async () => {
+  const spawned: ChildProcess[] = [];
+  const context = createRunContext();
+  context.setWorker(new PythonWorker({ spawn: probeSpawn(spawned) }));
+  assert.equal(await unparsePython(emptyTree, new AbortController().signal, 8000, context), '');
+  await validatePythonSource('value = 1\n', new AbortController().signal, context);
+  await validatePythonProject({ 'main.py': 'import os\nfrom os import path\n' }, new AbortController().signal, undefined, context);
+  assert.equal(await checkCandidate('def f(x):\n    return y\n', { name: 'f', params: ['x'], peers: {}, wantsReturn: true }, new AbortController().signal, context), 'undefined');
+  assert.equal(spawned.length, 1, 'unparse, source, project and candidate checks share one child');
+  await context.dispose();
+});
+
+test('cancelling one render rejects only it and leaves its concurrent sibling in flight', async () => {
+  const spawned: ChildProcess[] = [];
+  const context = createRunContext();
+  context.setWorker(new PythonWorker({ spawn: probeSpawn(spawned) }));
+  const controller = new AbortController();
+  const cancelled = unparsePython(longTree, controller.signal, 8000, context);
+  const sibling = unparsePython(emptyTree, new AbortController().signal, 8000, context);
+  controller.abort(new Error('Cancelled'));
+  await assert.rejects(cancelled, /Cancelled/);
+  assert.equal(await sibling, '');
+  assert.equal(spawned.length, 1, 'the worker survives the cancelled render');
+  await context.dispose();
+});
+
+test('worker and spawn-per-call paths return identical results and errors', async () => {
+  const workerContext = createRunContext();
+  const spawnContext = createRunContext();
+  // A foreign worker handle cannot serve bridge operations, so this context keeps the pre-worker
+  // spawn-per-call path; everything else is identical.
+  spawnContext.setWorker({ dispose: () => undefined });
+  const signal = new AbortController().signal;
+
+  assert.equal(await unparsePython(emptyTree, signal, 8000, workerContext), await unparsePython(emptyTree, signal, 8000, spawnContext));
+  assert.equal(await unparsePython(longTree, signal, 8000, workerContext), await unparsePython(longTree, signal, 8000, spawnContext));
+  await assert.rejects(unparsePython(longTree, signal, 1, workerContext), /byte budget|byte limit/);
+  await assert.rejects(unparsePython(longTree, signal, 1, spawnContext), /byte budget|byte limit/);
+
+  await validatePythonSource('value = 1\n', signal, workerContext);
+  await validatePythonSource('value = 1\n', signal, spawnContext);
+  await assert.rejects(validatePythonSource('return 1\n', signal, workerContext), /outside function/);
+  await assert.rejects(validatePythonSource('return 1\n', signal, spawnContext), /outside function/);
+
+  const spec = { name: 'f', params: ['x'], peers: { g: 2 }, wantsReturn: true };
+  for (const source of ['def f(x:\n    return x\n', 'def f(x):\n    return y\n', 'def f(x):\n    return g(x)\n', 'def f(x):\n    g(x, x)\n', 'def f(x):\n    return g(x, x)\n']) {
+    assert.equal(await checkCandidate(source, spec, signal, workerContext), await checkCandidate(source, spec, signal, spawnContext));
+  }
+
+  const valid = { 'main.py': 'import os\nfrom os import path\n' };
+  const invalid = { 'main.py': 'from missing.pkg import thing\n' };
+  await validatePythonProject(valid, signal, undefined, workerContext);
+  await validatePythonProject(valid, signal, undefined, spawnContext);
+  await assert.rejects(validatePythonProject(invalid, signal, undefined, workerContext), /cannot resolve import missing\.pkg/);
+  await assert.rejects(validatePythonProject(invalid, signal, undefined, spawnContext), /cannot resolve import missing\.pkg/);
+  await workerContext.dispose();
+  await spawnContext.dispose();
+});
+
+test('write_files validation reaches the run context worker', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'jev-ast-worker-'));
+  try {
+    const spawned: ChildProcess[] = [];
+    const context = createRunContext();
+    context.setWorker(new PythonWorker({ spawn: probeSpawn(spawned) }));
+    const tool = builtInTools().find(candidate => candidate.name === 'write_files')!;
+    const contextForTool = toolContext(root, new AbortController().signal, path => resolveWorkspacePath(root, path));
+    contextForTool.runContext = context;
+    const manifest = { 'main.py': 'from pkg.mod import f\nprint(f())\n', 'pkg/__init__.py': '', 'pkg/mod.py': 'def f():\n    return 1\n' };
+    const result = await tool.execute({ files: JSON.stringify(manifest) }, contextForTool);
+    assert.equal(result.ok, true);
+    assert.equal(spawned.length, 1, 'the manifest validation routed through the run worker');
+    assert.equal(await readFile(join(root, 'pkg/mod.py'), 'utf8'), 'def f():\n    return 1\n');
+    await context.dispose();
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('a direct library call uses the process-scoped default worker and closes it explicitly', async () => {
+  await closeDefaultRunContext();
+  const spawned: ChildProcess[] = [];
+  const context = defaultRunContext();
+  context.setWorker(new PythonWorker({ spawn: probeSpawn(spawned) }));
+  assert.equal(await unparsePython(emptyTree, new AbortController().signal), '', 'a direct call without a context uses the process default');
+  assert.equal(spawned.length, 1);
+  assert.equal(context.activeWorker instanceof PythonWorker, true);
+  await closeDefaultRunContext();
+  assert.equal(context.isDisposed, true);
+  assert.ok(spawned[0]!.killed, 'closing the default context kills the worker child');
+  assert.throws(() => context.allocateDecisionId(), /disposed/);
 });
