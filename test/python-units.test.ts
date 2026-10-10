@@ -100,6 +100,43 @@ test('a unit calling a peer is constrained to the peer arity', async () => {
   assert.ok(callee.keys.length > 0);
 });
 
+test('the main block of a unit tree narrows module member arguments and derives the member count', async () => {
+  const provider = new GateProvider([
+    ...decomposition,
+    ...bodies,
+    { slot: 'module_body', answer: 'import', once: true },
+    { slot: 'module', answer: 'random' },
+    { slot: 'module_body', answer: 'expr', once: true },
+    { slot: 'expression', answer: 'call' },
+    { slot: 'callee', answer: { value: 'print' }, once: true },
+    { slot: 'argument_count', answer: '1' },
+    { slot: 'argument_0', answer: 'call', once: true },
+    { slot: 'callee', answer: 'member' },
+    { slot: 'receiver', answer: { value: 'random' } },
+    { slot: 'member', answer: 'randint' },
+    { slot: 'argument_0', answer: 'number' },
+    { slot: 'number', answer: { value: '1' }, once: true },
+    { slot: 'argument_1', answer: 'number' },
+    { slot: 'number', answer: { value: '10' }, once: true },
+    { slot: 'module_body', answer: 'finish' },
+  ]);
+  const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Write Python helper functions greet(name) and shout(name), then print random.randint(1, 10).', turn: 1, updates: [] } }, 'content', options);
+  assert.match(source, /^import random\n/);
+  assert.match(source, /print\(random\.randint\(1, 10\)\)\n$/);
+  const member = provider.criteria.findIndex(entry => entry.slot === 'member');
+  assert.ok(member >= 0, 'the member pick asks instead of spelling');
+  assert.ok(provider.criteria[member]!.keys.includes('randint'));
+  const args = provider.criteria.slice(member).filter(entry => /^argument_[01]$/.test(entry.slot));
+  assert.equal(args.length, 2);
+  for (const arg of args) {
+    assert.ok(arg.keys.includes('number'));
+    assert.ok(!arg.keys.includes('boolean'), 'None is not offered for a number parameter');
+    assert.ok(!arg.keys.includes('string'));
+  }
+  assert.equal(provider.criteria.filter(entry => entry.slot === 'argument_count').length, 1, 'the randint count is host-derived; only print asks');
+  assert.ok(!provider.criteria.some(entry => entry.slot === 'method_name'));
+});
+
 test('a unit whose static check fails twice aborts the other in-flight unit and nothing is produced', async () => {
   const units = [stubUnit('greet'), stubUnit('shout')];
   const aborted: string[] = [];

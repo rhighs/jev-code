@@ -1,7 +1,10 @@
+import type { PythonType } from './python-symbols.js';
+
 export interface PythonNode { _type: string; [field: string]: unknown }
 export const node = (_type: string, fields: Record<string, unknown> = {}): PythonNode => ({ _type, ...fields });
 export const name = (id: string, store = false): PythonNode => node('Name', { id, ctx: node(store ? 'Store' : 'Load') });
-export interface Symbol { kind: 'builtin' | 'variable' | 'parameter' | 'function' | 'module'; arity?: number }
+/** A visible Python name. `params` carries the curated parameter types of builtins (see python-symbols.ts). */
+export interface Symbol { kind: 'builtin' | 'variable' | 'parameter' | 'function' | 'module'; arity?: number; params?: PythonType[] }
 export interface Scope { names: Map<string, Symbol>; parent?: Scope; function: boolean; loop: boolean }
 export interface Vocab { words: string[]; identifiers: string[]; strings: string[]; numbers: number[]; purposes: string[] }
 export interface Builder {

@@ -11,7 +11,7 @@ import { Harness } from '../src/harness.js';
 import type { DecisionEventData, DecisionProvider, HarnessEvent } from '../src/types.js';
 import { ScriptedProvider } from './helpers.js';
 
-interface AstState { generation: { phase: string; slot: string; partialSource: string; partialAst?: unknown; symbols: string[]; constraints: { inFunction: boolean; inLoop: boolean } } }
+interface AstState { generation: { phase: string; slot: string; partialSource: string; partialAst?: unknown; symbols: string[]; symbolTable?: Record<string, { kind: string; arity?: number; params?: string[] }>; constraints: { inFunction: boolean; inLoop: boolean } } }
 class AstProvider implements DecisionProvider {
   states: AstState[] = [];
   criteria: Array<Record<string, EntryType>> = [];
@@ -121,11 +121,104 @@ test('defined functions constrain call arity from the symbol table', async () =>
   assert.equal(provider.states.filter(state => state.generation.slot === 'argument_count').length, 1, 'Known function arity is enforced without asking for another count');
 });
 
-test('calls to imported module members use a defined receiver', async () => {
+test('calls to imported module members fill the callee from the curated table and derive the count host-side', async () => {
   const provider = new AstProvider(['0', 'import', 'math', 'expr', 'call', { value: 'print' }, '1', 'call', 'member', { value: 'math' },
-    { value: JSON.stringify('sqrt') }, '1', 'number', { value: '16' }, 'finish']);
+    'sqrt', 'number', { value: '16' }, 'finish']);
   const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Python import math and print math.sqrt(16).' } }, 'content', options);
   assert.equal(source, 'import math\nprint(math.sqrt(16))\n');
+  const member = provider.states.findIndex(state => state.generation.slot === 'member');
+  assert.ok(member >= 0, 'the member pick replaces the spelled method name');
+  assert.match(String(provider.criteria[member]!.sqrt), /math\.sqrt\(x: number\) -> number/, 'the member criteria carry the curated signature');
+  assert.ok(!provider.states.some(state => state.generation.slot === 'method_name'), 'a curated module never spells its member');
+  assert.equal(provider.states.filter(state => state.generation.slot === 'argument_count').length, 1, 'sqrt arity 1 is host-derived; only print asks');
+  const table = provider.states.at(-1)!.generation.symbolTable!;
+  assert.deepEqual(table.input!.params, ['string'], 'builtin symbols carry curated parameter types');
+  assert.deepEqual(table.range!.params, ['number', 'number', 'number']);
+});
+
+test('member arguments narrow by parameter type: randint offers numbers with no range or None', async () => {
+  const provider = new AstProvider(['0', 'import', 'random', 'expr', 'call', { value: 'print' }, '1', 'call', 'member', { value: 'random' },
+    'randint', 'number', { value: '1' }, 'number', { value: '100' }, 'finish']);
+  const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Python import random and print random.randint(1, 100).' } }, 'content', options);
+  assert.equal(source, 'import random\nprint(random.randint(1, 100))\n');
+  const member = provider.states.findIndex(state => state.generation.slot === 'member');
+  assert.ok(member >= 0);
+  assert.match(String(provider.criteria[member]!.randint), /random\.randint\(a: number, b: number\) -> number/);
+  const args = provider.states.flatMap((state, index) => index > member && /^argument_[01]$/.test(state.generation.slot) ? [provider.criteria[index]!] : []);
+  assert.equal(args.length, 2, 'both randint number arguments are asked');
+  for (const criteria of args) {
+    assert.ok(Object.hasOwn(criteria, 'number'));
+    assert.ok(!Object.hasOwn(criteria, 'boolean'), 'None is not offered for a number parameter');
+    assert.ok(!Object.hasOwn(criteria, 'string'));
+    assert.ok(!Object.hasOwn(criteria, 'list'));
+  }
+  assert.equal(provider.states.filter(state => state.generation.slot === 'argument_count').length, 1, 'randint arity 2 is host-derived; only print asks');
+});
+
+test('a typed argument narrows its callee candidates and the member list by result type', async () => {
+  const provider = new AstProvider(['0', 'import', 'random', 'import', 'math', 'assign', { value: JSON.stringify('target') },
+    'call', 'member', { value: 'math' }, 'sqrt', 'call', 'member', { value: 'random' }, 'randint', 'number', { value: '1' }, 'number', { value: '100' }, 'finish']);
+  const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Python import random and math, then target = math.sqrt(random.randint(1, 100)).' } }, 'content', options);
+  assert.equal(source, 'import random\nimport math\ntarget = math.sqrt(random.randint(1, 100))\n');
+
+  const sqrtMember = provider.states.findIndex(state => state.generation.slot === 'member');
+  const innerCallee = provider.states.findIndex((state, index) => index > sqrtMember && state.generation.slot === 'callee');
+  const randintMember = provider.states.findIndex((state, index) => index > innerCallee && state.generation.slot === 'member');
+  assert.ok(sqrtMember >= 0 && innerCallee > sqrtMember && randintMember > innerCallee);
+
+  const calleeCriteria = provider.criteria[innerCallee]!;
+  const calleeValues = Object.values(calleeCriteria);
+  assert.ok(Object.hasOwn(calleeCriteria, 'member'), 'a member call can still produce a number');
+  assert.ok(calleeValues.includes('len'), 'number-returning builtins stay');
+  assert.ok(!calleeValues.includes('range'), 'range returns a list, not a number');
+  assert.ok(!calleeValues.includes('print'), 'print returns None, not a number');
+  assert.ok(!calleeValues.includes('str') && !calleeValues.includes('input'), 'string-returning calls are not numbers');
+
+  const members = provider.criteria[randintMember]!;
+  assert.ok(Object.hasOwn(members, 'randint'));
+  assert.ok(Object.hasOwn(members, 'choice'), 'unknown-result members still fit');
+  assert.ok(!Object.hasOwn(members, 'sample'), 'list-returning members are not numbers');
+  assert.ok(!Object.hasOwn(members, 'shuffle') && !Object.hasOwn(members, 'seed'), 'None-returning members are not numbers');
+  assert.equal(provider.states.filter(state => state.generation.slot === 'argument_count').length, 0, 'sqrt and randint arities are host-derived');
+});
+
+test('a multi-arity member offers exactly its accepted counts and narrows its arguments', async () => {
+  const provider = new AstProvider(['0', 'import', 'random', 'expr', 'call', { value: 'print' }, '1', 'call', 'member', { value: 'random' },
+    'randrange', '1', 'number', { value: '10' }, 'finish']);
+  const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Python import random and print random.randrange(10).' } }, 'content', options);
+  assert.equal(source, 'import random\nprint(random.randrange(10))\n');
+  const member = provider.states.findIndex(state => state.generation.slot === 'member');
+  const countAt = provider.states.findIndex((state, index) => index > member && state.generation.slot === 'argument_count');
+  assert.ok(countAt >= 0, 'a multi-arity member asks for a count');
+  assert.deepEqual(Object.keys(provider.criteria[countAt]!), ['1', '2', '3'], 'wrong arities (0 and 4) are not offered');
+  const arg = provider.states.findIndex((state, index) => index > countAt && state.generation.slot === 'argument_0');
+  assert.ok(Object.hasOwn(provider.criteria[arg]!, 'number') && !Object.hasOwn(provider.criteria[arg]!, 'boolean'));
+  assert.equal(provider.states.filter(state => state.generation.slot === 'argument_count').length, 2, 'print and randrange ask; no other count');
+});
+
+test('a call on an unknown receiver keeps the spelling path', async () => {
+  const provider = new AstProvider(['0', 'assign', { value: JSON.stringify('message') }, 'string', { value: JSON.stringify('hello') },
+    'expr', 'call', { value: 'print' }, '1', 'call', 'member', { value: 'message' }, { value: JSON.stringify('lower') }, '0', 'finish']);
+  const source = await generatePythonAst(decisions(provider), { task: { prompt: 'In Python assign hello to message and print message.lower().' } }, 'content', options);
+  assert.equal(source, "message = 'hello'\nprint(message.lower())\n");
+  assert.ok(provider.states.some(state => state.generation.slot === 'method_name'), 'the method name is spelled for an unknown receiver');
+  assert.ok(!provider.states.some(state => state.generation.slot === 'member'), 'no curated member pick without a module receiver');
+});
+
+test('builtin parameters narrow their arguments: an input prompt accepts only a string', async () => {
+  const provider = new AstProvider(['0', 'import', 'random',
+    'assign', { value: JSON.stringify('target') }, 'call', 'member', { value: 'random' }, 'randint', 'number', { value: '1' }, 'number', { value: '100' },
+    'assign', { value: JSON.stringify('guess') }, 'call', { value: 'int' }, '1', 'call', { value: 'input' }, '1', 'string', { value: JSON.stringify('Guess: ') },
+    'finish']);
+  const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Write a Python guessing game: import random, set target = random.randint(1, 100), then guess = int(input("Guess: ")).' } }, 'content', options);
+  assert.equal(source, "import random\ntarget = random.randint(1, 100)\nguess = int(input('Guess: '))\n");
+  const inputAt = provider.states.findLastIndex((state, index) => state.generation.slot === 'callee' && Object.values(provider.criteria[index]!).includes('input'));
+  assert.ok(inputAt >= 0);
+  const promptAt = provider.states.findIndex((state, index) => index > inputAt && state.generation.slot === 'argument_0');
+  const prompt = provider.criteria[promptAt]!;
+  assert.ok(Object.hasOwn(prompt, 'string'));
+  assert.ok(!Object.hasOwn(prompt, 'number') && !Object.hasOwn(prompt, 'boolean') && !Object.hasOwn(prompt, 'list'), 'only string candidates fit an input prompt');
+  assert.equal(provider.states.filter(state => state.generation.slot === 'argument_count').length, 2, 'int and input keep their count questions; randint is host-derived');
 });
 
 test('unavailable productions and invalid completed ASTs fail validation', async () => {

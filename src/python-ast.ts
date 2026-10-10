@@ -13,15 +13,19 @@ import { attemptScope, type DecisionKind, type DecisionPathEntry, type LineSlot,
 import { sanitizedEnv } from './env.js';
 import { LimitError } from './types.js';
 import { identifierCandidates, numberCandidates, objectiveWords, phraseLiterals, quotedLiterals, stringCandidates } from './vocab.js';
+import { anyMemberFits, BUILTINS, builtinCallable, fits, memberCriteria, moduleMembers, type PythonType } from './python-symbols.js';
 import { choice } from '@typesafe-ai/sdk';
 import { functionDef, name, node, type Builder, type PythonNode, type Scope, type Symbol, type Vocab } from './python-nodes.js';
 export type { PythonNode } from './python-nodes.js';
 
 const keywords = new Set('False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case'.split(' '));
-const builtins = ['print', 'range', 'len', 'str', 'int', 'float', 'list', 'dict', 'set', 'sum', 'min', 'max', 'abs', 'sorted', 'enumerate', 'zip', 'input', 'open'];
-const builtinArity: Record<string, number[]> = { print: [0, 1, 2, 3], range: [1, 2, 3], len: [1], str: [0, 1], int: [0, 1], float: [0, 1], list: [0, 1], dict: [0], set: [0, 1], sum: [1, 2], min: [1, 2, 3], max: [1, 2, 3], abs: [1], sorted: [1], enumerate: [1, 2], zip: [1, 2, 3], input: [0, 1], open: [1, 2, 3] };
+const builtins = Object.keys(BUILTINS);
 const maxBlockStatements = 16;
-const symbolTable = (scope: Scope): Record<string, Symbol> => ({ ...(scope.parent ? symbolTable(scope.parent) : Object.fromEntries(builtins.map(id => [id, { kind: 'builtin' }]))), ...Object.fromEntries(scope.names) });
+const builtinSymbol = (id: string): Symbol => {
+  const callable = builtinCallable(id);
+  return { kind: 'builtin', ...(callable?.params === undefined ? {} : { params: callable.params }) };
+};
+const symbolTable = (scope: Scope): Record<string, Symbol> => ({ ...(scope.parent ? symbolTable(scope.parent) : Object.fromEntries(builtins.map(id => [id, builtinSymbol(id)]))), ...Object.fromEntries(scope.names) });
 const visible = (scope: Scope): string[] => [...new Set([...scope.names.keys(), ...(scope.parent ? visible(scope.parent) : builtins)])];
 
 const statementLists = new Set(['body', 'orelse', 'finalbody']);
@@ -329,19 +333,41 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
     return value;
   }
 
-  async function expression(target: PythonNode, scope: Scope, depth: number, slot = 'expression', numberConstraint?: 'positive' | 'nonzero', calls = 0): Promise<void> {
+  /**
+   * Python-local mirror of `fillCall` in src/lang/core.ts: a known callee arity is host-derived (a
+   * single count is never a question), and each argument narrows by its curated parameter type.
+   */
+  async function fillCall(func: PythonNode, args: PythonNode[], counts: number[] | undefined, paramTypes: PythonType[] | undefined, scope: Scope, depth: number, calls: number): Promise<void> {
+    const count = Number(await pick('argument_count', scope, Object.fromEntries((counts ?? [0, 1, 2, 3]).map(value => [String(value), `${value} positional arguments.`]))));
+    for (let i = 0; i < count; i++) {
+      const arg = node('Hole'); args.push(arg);
+      const range = func._type === 'Name' && func.id === 'range';
+      const explicitRange = /range\s*\(|\b(?:empty|zero iterations|zero times)\b/i.test(objective);
+      const constraint = range && i === 2 ? 'nonzero' : range && !explicitRange && count === 1 ? 'positive' : undefined;
+      await expression(arg, scope, depth + 1, `argument_${i}`, constraint, calls + 1, paramTypes?.[i]);
+    }
+  }
+
+  async function expression(target: PythonNode, scope: Scope, depth: number, slot = 'expression', numberConstraint?: 'positive' | 'nonzero', calls = 0, expect?: PythonType): Promise<void> {
     const table = symbolTable(scope);
     const namesForValue = visible(scope).filter(id => !['builtin', 'function'].includes(table[id]!.kind) && !referenceForbidden.has(id));
-    // Direct callees come from the symbol table; members have a defined receiver.
-    const calleeNames = visible(scope).filter(id => !calleeForbidden.has(id) && !referenceForbidden.has(id));
+    // Direct callees come from the symbol table; a typed argument keeps only calls whose common
+    // result type fits (an unknown result still fits, mirroring lang/core.ts).
+    const calleeNames = visible(scope).filter(id => !calleeForbidden.has(id) && !referenceForbidden.has(id)
+      && fits(expect, table[id]!.kind === 'builtin' ? builtinCallable(id)?.returns ?? 'unknown' : 'unknown'));
     const receiverNames = visible(scope).filter(id => !referenceForbidden.has(id));
     const callees: Record<string, string> = Object.fromEntries(calleeNames.map((value, index) => [`name_${index}`, value]));
-    if (receiverNames.length) callees.member = 'Call an attribute or method of an already defined object or module.';
-    const criteria: Record<string, string> = { string: 'A literal string.', number: 'A numeric literal.', boolean: 'True, False or None.' };
+    if (receiverNames.length && anyMemberFits(expect)) callees.member = 'Call an attribute or method of an already defined object or module.';
+    const criteria: Record<string, string> = {};
+    if (fits(expect, 'string')) criteria.string = 'A literal string.';
+    if (fits(expect, 'number')) criteria.number = 'A numeric literal.';
+    if (fits(expect, 'bool')) criteria.boolean = 'True, False or None.';
     if (namesForValue.length) criteria.name = 'Reference an already defined variable, parameter or module.';
-    if (depth < maxDepth) Object.assign(criteria, { binary: 'Combine two expressions with arithmetic.', compare: 'Compare two expressions.', attribute: 'Read an attribute from a defined object.', subscript: 'Index a defined object.' });
+    if (depth < maxDepth && fits(expect, 'number')) criteria.binary = 'Combine two expressions with arithmetic.';
+    if (depth < maxDepth && fits(expect, 'bool')) criteria.compare = 'Compare two expressions.';
+    if (depth < maxDepth) Object.assign(criteria, { attribute: 'Read an attribute from a defined object.', subscript: 'Index a defined object.' });
     if (depth < maxDepth && calls < 2 && Object.keys(callees).length) criteria.call = 'Call a function, such as print, with arguments.';
-    if (depth < maxDepth && !slot.startsWith('element_') && !slot.startsWith('argument_')) criteria.list = 'A list of expressions.';
+    if (depth < maxDepth && fits(expect, 'list') && (expect === 'list' || (!slot.startsWith('element_') && !slot.startsWith('argument_')))) criteria.list = 'A list of expressions.';
     const production = await pick(slot, scope, criteria, depth);
     if (production === 'string') { Object.assign(target, node('Constant', { value: String(await terminal('string', scope, strings)), kind: null })); }
     else if (production === 'number') {
@@ -361,26 +387,31 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
       const args: PythonNode[] = [];
       Object.assign(target, node('Call', { func, args, keywords: [] }));
       const selected = await pick('callee', scope, callees);
-      let arity: number | undefined, counts = [0, 1, 2, 3];
+      let counts: number[] | undefined;
+      let paramTypes: PythonType[] | undefined;
       if (selected === 'member') {
         const receiver = await pick('receiver', scope, Object.fromEntries(receiverNames.map((value, index) => [`name_${index}`, value])), 0, 'leaf');
-        Object.assign(func, node('Attribute', { value: name(receiverNames[Number(receiver.slice(5))]!), attr: await identifier('method_name', scope), ctx: node('Load') }));
+        const receiverId = receiverNames[Number(receiver.slice(5))]!;
+        const members = moduleMembers(receiverId);
+        if (members === undefined) {
+          // An unknown receiver keeps the spelling path; curated tables only cover offered modules.
+          Object.assign(func, node('Attribute', { value: name(receiverId), attr: await identifier('method_name', scope), ctx: node('Load') }));
+        } else {
+          const member = await pick('member', scope, memberCriteria(receiverId, expect), 0, 'structural');
+          const callable = members[member]!;
+          Object.assign(func, node('Attribute', { value: name(receiverId), attr: member, ctx: node('Load') }));
+          counts = callable.arity;
+          paramTypes = callable.params;
+        }
       } else {
         const id = calleeNames[Number(selected.slice(5))]!;
         Object.assign(func, name(id));
         const symbol = table[id];
-        arity = symbol?.arity;
-        if (arity !== undefined) counts = [arity];
-        else if (symbol?.kind === 'builtin' && builtinArity[id]) counts = builtinArity[id]!;
+        if (symbol?.arity !== undefined) counts = [symbol.arity];
+        else if (symbol?.kind === 'builtin') counts = builtinCallable(id)?.arity;
+        if (symbol?.kind === 'builtin') paramTypes = symbol.params;
       }
-      const count = Number(await pick('argument_count', scope, Object.fromEntries(counts.map(value => [String(value), `${value} positional arguments.`]))));
-      for (let i = 0; i < count; i++) {
-        const arg = node('Hole'); args.push(arg);
-        const range = func._type === 'Name' && func.id === 'range';
-        const explicitRange = /range\s*\(|\b(?:empty|zero iterations|zero times)\b/i.test(objective);
-        const constraint = range && i === 2 ? 'nonzero' : range && !explicitRange && count === 1 ? 'positive' : undefined;
-        await expression(arg, scope, depth + 1, `argument_${i}`, constraint, calls + 1);
-      }
+      await fillCall(func, args, counts, paramTypes, scope, depth, calls);
     } else if (production === 'binary' || production === 'compare') {
       const left = node('Hole'), right = node('Hole');
       const operators = production === 'binary' ? { Add: 'addition +', Sub: 'subtraction -', Mult: 'multiplication *', Div: 'division /', FloorDiv: 'integer division //', Mod: 'remainder %', Pow: 'power **' } : { Eq: 'equal ==', NotEq: 'not equal !=', Lt: 'less than <', LtE: 'less or equal <=', Gt: 'greater than >', GtE: 'greater or equal >=', In: 'membership in' };
@@ -426,7 +457,7 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
       } else if (production === 'pass') Object.assign(statement, node('Pass'));
       else if (production === 'break' || production === 'continue') { Object.assign(statement, node(production === 'break' ? 'Break' : 'Continue')); return; }
       else if (production === 'import') {
-        const modules = ['math', 'json', 'sys', 'os', 'pathlib', 'random', 'datetime', 'collections', 're', 'itertools'];
+        const modules = ['math', 'json', 'sys', 'os', 'pathlib', 'random', 'datetime', 'collections', 're', 'itertools', 'time'];
         const module = await pick('module', scope, Object.fromEntries(modules.map(value => [value, value])));
         Object.assign(statement, node('Import', { names: [node('alias', { name: module, asname: null })] })); scope.names.set(module, { kind: 'module' });
       } else if (production === 'function') {
