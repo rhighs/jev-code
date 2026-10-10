@@ -100,6 +100,14 @@ test('packed ESM package satisfies the public consumer contract', { timeout: 180
   assert.doesNotMatch(declarations, /\bRunResources\b/, 'mutable RunResources remains public');
   assert.doesNotMatch(declarations, /\bwithResources\b/, 'session resource rebinding remains public');
   assert.match(sdkDeclarations, /ProgramResourceView/, 'read-only program resource view is missing');
+  for (const added of [
+    'WaveQuestion', 'WaveChoice', 'WaveDecisionResult', 'RunContext', 'createRunContext', 'closeDefaultRunContext',
+    'isNearTie', 'NEAR_TIE_GAP', 'waveFailureKind',
+  ]) {
+    assert.match(sdkDeclarations, new RegExp(`\\b${added}\\b`), `public SDK symbol missing: ${added}`);
+  }
+  const decisionDeclarations = await import('node:fs/promises').then(fs => fs.readFile(join(consumer, 'node_modules/jev-code/dist/sdk/decisions.d.ts'), 'utf8'));
+  assert.match(decisionDeclarations, /\bchooseWave\b/, 'chooseWave is missing from the decision session declarations');
 
   await assert.rejects(
     run(process.execPath, ['deep-import.mjs'], consumer),
