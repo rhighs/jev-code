@@ -2,7 +2,7 @@ import type { Decisions, State } from './decisions.js';
 import type { Field } from './types.js';
 import type { TextProgress, TextChange } from './grid.js';
 import type { RunContext } from './run-context.js';
-import { decisionChoiceBytes, fitDecisionState, MAX_DECISION_REQUEST_BYTES } from './decision-context.js';
+import { compactRetryState, decisionChoiceBytes, fitDecisionState, MAX_DECISION_REQUEST_BYTES } from './decision-context.js';
 import { compactContext, generateScoredGrid } from './scored-grid.js';
 import ts from 'typescript';
 import { AstRegistry, type AstAdapter } from './ast-adapters.js';
@@ -134,9 +134,9 @@ export async function generateArguments(decisions: Decisions, state: State, fiel
       let value: string | number | boolean;
       if (field.type === 'boolean') {
         const criteria = { true: 'Yes.', false: 'No.' };
-        value = await scoped.choose(fittedFieldInput(name, field.description, criteria), field.description, criteria) === 'true';
+        value = await scoped.choose(fittedFieldInput(name, field.description, criteria), field.description, criteria, compactRetryState) === 'true';
       } else if (field.type === 'enum') {
-        value = await scoped.choose(fittedFieldInput(name, field.description, field.choices), field.description, field.choices);
+        value = await scoped.choose(fittedFieldInput(name, field.description, field.choices), field.description, field.choices, compactRetryState);
       } else if (field.type === 'number') {
         const numbers = new Set([field.default, field.min, field.max, 0, 1, 2, 5, 10, 100, 1000, 8000, 30_000, 60_000,
           ...rawNumbers.slice(0, 100).map(Number)].filter((number): number is number => number !== undefined && Number.isFinite(number) &&
@@ -146,7 +146,7 @@ export async function generateArguments(decisions: Decisions, state: State, fiel
         for (const number of numbers) criteria[`number_${number}`] = `Use ${number}.`;
         const instruction = `${field.description} Use the default unless the task needs another value.`;
         const input = fittedFieldInput(name, instruction, criteria);
-        const selected = await scoped.choose(input, instruction, criteria);
+        const selected = await scoped.choose(input, instruction, criteria, compactRetryState);
         if (selected !== 'custom') value = selected === 'default' ? field.default! : Number(selected.slice(7));
         else {
           const text = await generateText(scoped, input, name, field.description, { ...options, maxBytes: 32, allowEmpty: false });

@@ -16,7 +16,7 @@ import { compareRecords, formatComparison, runEval, type EvalRecord } from './ev
 import { runDecide } from './decide.js';
 import { NO_KEY, configPath, promptSecret, readConfig, resolveApiKey, writeConfig } from './config.js';
 import { MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
-import { checkSchema, findJournal, readJournal, replayPlain } from './replay.js';
+import { checkSchema, findJournal, findLatestJournal, prepareResume, readJournal, replayPlain, type ResumePlan } from './replay.js';
 import type { HarnessOptions } from './harness.js';
 import type { Tool } from './types.js';
 
@@ -57,6 +57,7 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
   replay <run-id>         Render a saved .jev/runs or .jev/eval journal through the transcript
     --speed <x>               Pace events at x times real time (default: instant; gaps capped at 2 s)
     --plain                   Print cards as text instead of the Ink view
+  --resume <run-id|last>  Continue an interrupted run from its .jev/runs journal (no prompt)
   --eval-out <dir>        Directory for .jev/eval records (default: current directory)
   --json                  Emit JSONL events on stdout
   --no-journal            Disable .jev/runs JSONL persistence
@@ -65,6 +66,8 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
 The first run asks for your API key; TYPESAFE_API_KEY in the environment overrides the saved one. Ctrl-C cancels the current run.
 Direct file tools stay in the workspace unless --allow-outside is set.
 Bash is an ordinary host shell, with the workspace as its initial directory.
+--resume continues a blocked, limited, cancelled, or errored run from its journal; completed runs,
+eval journals (temporary workspaces), and workspaces other than the journal's are refused.
 `;
 
 async function stdinText(): Promise<string> {
@@ -160,10 +163,16 @@ async function main(): Promise<void> {
     'max-turns': { type: 'string' }, 'max-requests': { type: 'string' }, 'max-steps': { type: 'string' },
     'timeout-ms': { type: 'string' }, 'grid-batch-size': { type: 'string' }, concurrency: { type: 'string' }, 'search-width': { type: 'string' }, tools: { type: 'string' }, json: { type: 'boolean' },
     'experimental-grid': { type: 'boolean' }, asts: { type: 'string', multiple: true }, 'no-journal': { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
-    'eval-out': { type: 'string' },
+    'eval-out': { type: 'string' }, resume: { type: 'string' },
   } });
   if (values.help) { process.stdout.write(HELP); return; }
   const workspace = resolve(values.workspace ?? '.');
+  if (values.resume !== undefined) {
+    if (positionals.length) throw new Error('Use --resume <run-id|last> without a positional task.');
+    if (values['prompt-file'] !== undefined) throw new Error('Use --resume <run-id|last> without --prompt-file.');
+    if (values.interactive) throw new Error('--resume cannot be combined with --interactive.');
+    if (values['no-journal']) throw new Error('--resume requires journaling; remove --no-journal.');
+  }
   if (positionals[0] === 'ast') {
     const [, command, target, ...extra] = positionals;
     if (extra.length || !['install', 'list', 'remove'].includes(command ?? '') || (command === 'list' ? target !== undefined : !target)) throw new Error('Use ast install <module>, ast list, or ast remove <id>.');
@@ -197,16 +206,27 @@ async function main(): Promise<void> {
   if (values['prompt-file'] === '-' && values.interactive) throw new Error('Interactive mode needs a terminal; stdin is already used for the prompt.');
   const tty = isInteractiveTTY(process.stdin, process.stderr);
   if (values.interactive && !tty) throw new Error('--interactive requires a terminal.');
-  const interactive = values.interactive ?? (tty && !values.print && !values['prompt-file'] && !values.json);
-  const prompt = values['prompt-file'] === '-' ? await stdinText()
-    : values['prompt-file'] ? await readFile(resolve(values['prompt-file']), 'utf8') : positionals.join(' ');
-  if (!prompt && !interactive) throw new Error('Supply a coding task, or start without arguments in a terminal. Use --help for options.');
   const extraTools: Tool[] = [];
   if (values.tools) {
     const module = await import(pathToFileURL(resolve(values.tools)).href) as { tools?: Tool[] };
     if (!Array.isArray(module.tools)) throw new Error('Tool module must export a tools array.');
     extraTools.push(...module.tools);
   }
+  // --resume is a mode of its own: the prompt comes from the journal, and the registered tools
+  // classify any unmatched tool_start left behind by the interruption.
+  const toolEffects = new Map([...builtInTools(), ...extraTools].map(tool => [tool.name, tool.effect]));
+  let resume: ResumePlan | undefined;
+  if (values.resume !== undefined) {
+    const journalPath = values.resume === 'last' ? await findLatestJournal(workspace) : await findJournal(workspace, values.resume);
+    if (journalPath === undefined) throw new Error(`No journal found for run ${values.resume} under ${workspace}.`);
+    resume = await prepareResume({ journalPath, workspace, effectOf: name => toolEffects.get(name) });
+    for (const warning of resume.warnings) process.stderr.write(`resume: ${warning}\n`);
+  }
+  const interactive = resume === undefined && (values.interactive ?? (tty && !values.print && !values['prompt-file'] && !values.json));
+  const prompt = resume !== undefined ? resume.prompt
+    : values['prompt-file'] === '-' ? await stdinText()
+    : values['prompt-file'] ? await readFile(resolve(values['prompt-file']), 'utf8') : positionals.join(' ');
+  if (!prompt && !interactive) throw new Error('Supply a coding task, or start without arguments in a terminal. Use --help for options.');
   const limit = (name: 'max-turns' | 'max-requests' | 'max-steps' | 'timeout-ms' | 'grid-batch-size' | 'concurrency' | 'search-width', fallback: number): number => {
     const raw = values[name];
     if (raw !== undefined && !/^\d+$/.test(raw)) throw new Error(`--${name} must be a positive integer.`);
@@ -225,6 +245,7 @@ async function main(): Promise<void> {
     maxRunMs: limit('timeout-ms', DEFAULT_LIMITS.maxRunMs), allowOutsideWorkspace: values['allow-outside'] ?? false,
     gridBatchSize: limit('grid-batch-size', 8), concurrency: limit('concurrency', 4), searchWidth: limit('search-width', 1),
     ...(values['no-journal'] ? { journalDirectory: false as const } : {}),
+    ...(resume === undefined ? {} : { resume }),
   };
   if (interactive) {
     const { runSession } = await import('./ui/app.js');

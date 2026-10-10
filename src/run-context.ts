@@ -45,6 +45,23 @@ export interface PathChoice {
   nearTie: boolean;
 }
 
+/**
+ * A decision-path entry rebuilt best-effort from a resumed journal's decision events. The journal
+ * carries the identity, chosen label, and alternatives, but not the leaf/structural kind or the
+ * answer map, so seeded entries never enable forced-answer replay; they only preserve ids and
+ * alternatives.
+ */
+export interface DecisionSeed {
+  decisionId: number;
+  scope: string;
+  questionKey: string;
+  identity: DecisionIdentity;
+  chosen: string;
+  alternatives: DecisionAlternative[];
+  nearTie: boolean;
+  kind?: DecisionKind;
+}
+
 export interface LineSlot {
   slot: string;
   unit?: string;
@@ -137,6 +154,23 @@ export class RunContext {
   pathFor(scope: string): readonly DecisionPathEntry[] {
     this.assertActive();
     return this.paths.get(scope) ?? [];
+  }
+
+  /**
+   * Seed decision paths from a resumed journal. Ids are preserved and the allocator continues above
+   * the highest seeded id, so new decisions never collide with journaled ones. Seeded entries carry
+   * no answer map and default to the structural kind, so forced-answer replay skips them.
+   */
+  seedDecisions(seeds: readonly DecisionSeed[]): void {
+    this.assertActive();
+    for (const seed of seeds) {
+      this.recordDecision(seed.scope, {
+        decisionId: seed.decisionId, questionKey: seed.questionKey, identity: seed.identity,
+        chosen: seed.chosen, alternatives: [...seed.alternatives], nearTie: seed.nearTie,
+        kind: seed.kind ?? 'structural',
+      });
+      if (seed.decisionId >= this.nextDecisionId) this.nextDecisionId = seed.decisionId + 1;
+    }
   }
 
   /** Resolve a recorded decision by its id; invalidated entries are gone. */

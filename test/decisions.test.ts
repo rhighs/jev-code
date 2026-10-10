@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import { Decisions } from '../src/decisions.js';
+import { compactRetryState } from '../src/decision-context.js';
 import { attemptScope, createRunContext } from '../src/run-context.js';
 import { DecisionError, type DecisionEventData, type DecisionProvider } from '../src/types.js';
 
@@ -165,4 +166,72 @@ test('forked facades share the run context and plain choose keeps its event shap
   assert.equal(events[1]!.nearTie, undefined);
   assert.deepEqual(context.pathFor(attemptScope('content', 'greet')).map(entry => entry.decisionId), [1]);
   await context.dispose();
+});
+
+/** A state with compactable context keys, mirroring what harness/generation send. */
+const compactableState = (): Record<string, unknown> => ({
+  history: Array.from({ length: 20 }, (_, index) => ({ turn: index + 1, tool: 'read_file', ok: true, output: `output ${index} ${'h'.repeat(240)}` })),
+  recent: Array.from({ length: 8 }, (_, index) => ({ turn: index + 1, tool: 'bash', args: { command: 'c'.repeat(400) }, result: { ok: true, output: 'r'.repeat(900) } })),
+});
+
+/** A provider that fails the first `failures` requests with max_tokens_exceeded, then answers. */
+const tokenRetryProvider = (failures: number, answer: (key: string) => unknown): { provider: DecisionProvider; states: Record<string, unknown>[] } => {
+  const states: Record<string, unknown>[] = [];
+  const provider: DecisionProvider = {
+    decide: async <Q extends Questions>(state: EntryType, questions: Q) => {
+      states.push(structuredClone(state) as Record<string, unknown>);
+      if (states.length <= failures) throw new Error('max_tokens_exceeded: request exceeds the model token budget');
+      return { model: 'fake', usage: { input_tokens: 1, output_tokens: 0 },
+        answers: Object.fromEntries(Object.keys(questions).map(key => [key, answer(key)])) } as unknown as SystemOneResult<Q>;
+    },
+  };
+  return { provider, states };
+};
+
+test('choose, probability, and score compact and retry once on max_tokens_exceeded', async () => {
+  const signal = new AbortController().signal;
+  const choice = tokenRetryProvider(1, () => ({ type: 'choice', choice: 'a', confidence: 1, probabilities: { a: 1, b: 0 } }));
+  assert.equal(await new Decisions(choice.provider, 10, signal).choose(compactableState(), 'pick', { a: 'A', b: 'B' }, compactRetryState), 'a');
+  assert.equal(choice.states.length, 2, 'one rejection plus one retry');
+  const retriedChoice = choice.states[1] as { history: unknown[]; recent: Array<{ result: { output: string } }> };
+  assert.equal(retriedChoice.history.length, 4, 'the retry state was compacted harder');
+  assert.equal(retriedChoice.recent.length, 2);
+  assert.ok(retriedChoice.recent[0]!.result.output.length <= 420, 'retry outputs are clipped');
+
+  const noul = tokenRetryProvider(1, () => ({ type: 'noul', noul: 0.8 }));
+  assert.equal(await new Decisions(noul.provider, 10, signal).probability(compactableState(), 'true?', compactRetryState), 0.8);
+  assert.equal(noul.states.length, 2);
+
+  const rating = tokenRetryProvider(1, () => ({ type: 'score', score: 2, confidence: 0.9, legend, probabilities: { '0': 0, '1': 0, '2': 1, '3': 0 } }));
+  assert.deepEqual(await new Decisions(rating.provider, 10, signal).score(compactableState(), 'rate', levels, compactRetryState), { expected: 2, probabilities: [0, 0, 1, 0] });
+  assert.equal(rating.states.length, 2);
+});
+
+test('a second max_tokens_exceeded rejection fails the decision after one retry', async () => {
+  const retry = tokenRetryProvider(2, () => ({ type: 'choice', choice: 'a', confidence: 1, probabilities: { a: 1, b: 0 } }));
+  await assert.rejects(new Decisions(retry.provider, 10, new AbortController().signal).choose(compactableState(), 'pick', { a: 'A', b: 'B' }, compactRetryState),
+    /max_tokens_exceeded/);
+  assert.equal(retry.states.length, 2, 'the failure propagates after exactly one retry');
+});
+
+test('token-budget recovery is opt-in and only matches max_tokens_exceeded', async () => {
+  const signal = new AbortController().signal;
+  const withoutHook = tokenRetryProvider(3, () => ({ type: 'choice', choice: 'a', confidence: 1, probabilities: { a: 1, b: 0 } }));
+  await assert.rejects(new Decisions(withoutHook.provider, 10, signal).choose(compactableState(), 'pick', { a: 'A', b: 'B' }), /max_tokens_exceeded/);
+  assert.equal(withoutHook.states.length, 1, 'no builder means no retry');
+
+  let unrelated = 0;
+  const failing: DecisionProvider = { decide: async <Q extends Questions>(_state: EntryType, _questions: Q) => {
+    unrelated++;
+    throw new Error('provider offline');
+  } };
+  await assert.rejects(new Decisions(failing, 10, signal).choose(compactableState(), 'pick', { a: 'A', b: 'B' }, compactRetryState), /provider offline/);
+  assert.equal(unrelated, 1, 'unrelated failures never retry');
+});
+
+test('a builder that cannot compact still retries once with the unchanged state', async () => {
+  const retry = tokenRetryProvider(1, () => ({ type: 'choice', choice: 'a', confidence: 1, probabilities: { a: 1, b: 0 } }));
+  assert.equal(await new Decisions(retry.provider, 10, new AbortController().signal).choose({ task: {} }, 'pick', { a: 'A', b: 'B' }, compactRetryState), 'a');
+  assert.equal(retry.states.length, 2);
+  assert.deepEqual(retry.states[1], retry.states[0], 'an already-minimal state is retried unchanged');
 });

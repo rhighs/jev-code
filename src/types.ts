@@ -86,7 +86,12 @@ export interface TextEventData extends TextProgress {
   change: TextChange | null;
 }
 export interface HarnessEventData {
-  start: { schema: 1; prompt: string; workspace: string; decoder: 'dynamic'; limits: { turns: number; requests: number }; journal: string | null };
+  /**
+   * `resume` is additive and present only on a resumed run: `from` is the journaled run id the
+   * run continues, `turns` the turns carried over, and `requests` the request usage charged to
+   * the new run's budget (so transcript counters and the enforced budget agree).
+   */
+  start: { schema: 1; prompt: string; workspace: string; decoder: 'dynamic'; limits: { turns: number; requests: number }; journal: string | null; resume?: { from: string; turns: number; requests: number } };
   turn: { files: number; plan: string };
   turn_end: { durationMs: number; elapsedMs: number; requests: number };
   action: { tool: string };

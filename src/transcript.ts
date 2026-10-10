@@ -25,6 +25,7 @@ export interface Decision {
 }
 export type Item =
   | { kind: 'prompt'; text: string }
+  | { kind: 'resume'; text: string }
   | ToolItem
   | { kind: 'turn'; turn: number; files: number; plan: string }
   | { kind: 'update'; text: string }
@@ -113,7 +114,20 @@ export function reduce(state: TranscriptState, event: HarnessEvent | SessionEven
   const at = event.elapsedMs;
   state = { ...state, turn: event.turn, elapsedMs: at };
   switch (event.type) {
-    case 'start': return { ...state, schema: event.data.schema ?? 0, limits: event.data.limits, items: [...state.items, { kind: 'prompt', text: event.data.prompt }] };
+    case 'start': {
+      // A resumed run carries `resume` on its start event: seed the request counter from the
+      // carried usage so the live counter, end.requests, and the enforced budget agree, and render
+      // a continuation marker alongside (or instead of a repeated) prompt.
+      const resume = event.data.resume;
+      const repeated = state.items.some(item => item.kind === 'prompt');
+      const marker = resume === undefined
+        ? 'the run continued from an earlier journal'
+        : `resumed from ${resume.from} at turn ${resume.turns + 1} with ${resume.requests} requests carried`;
+      return { ...state, schema: event.data.schema ?? 0, limits: event.data.limits, requests: state.requests + (resume?.requests ?? 0),
+        items: [...state.items,
+          ...(repeated ? [] : [{ kind: 'prompt' as const, text: event.data.prompt }]),
+          ...(resume === undefined && !repeated ? [] : [{ kind: 'resume' as const, text: marker }])] };
+    }
     case 'turn': return { ...state, items: [...state.items, { kind: 'turn', turn: event.turn, files: event.data.files, plan: event.data.plan }] };
     case 'turn_end': return state;
     case 'input': return { ...state, items: [...state.items, { kind: 'update', text: event.data.instruction }] };

@@ -1,10 +1,18 @@
 import { DecisionSession, createDecisionSession, isNearTie } from './sdk/decisions.js';
-import { RunResources } from './sdk/resources.js';
+import { RunResources, type RunLimits } from './sdk/resources.js';
 import { DecisionError, LimitError, type DecisionProvider, type DecisionResult, type JsonObject } from './sdk/types.js';
 import { defaultRunContext, type PathChoice, type PathDecisionRequest, type RunContext } from './run-context.js';
 import type { DecisionEventData } from './types.js';
 
 export type State = Record<string, unknown>;
+
+/**
+ * Caller-supplied retry-state builder for the `max_tokens_exceeded` recovery: it returns the
+ * compacted state used for the single retry. An already-minimal state is returned unchanged, in
+ * which case the retry is still attempted once (a byte-proxy mismatch can be transient).
+ * Harness/generation call sites pass a decision-context builder.
+ */
+export type RetryStateBuilder = (state: State) => State;
 
 const projectJson = (value: unknown, ancestors: Set<object>): unknown => {
   if (value === undefined) return undefined;
@@ -57,9 +65,10 @@ export class Decisions {
     concurrency = 4,
     resources?: RunResources,
     context?: RunContext,
+    initial?: Partial<RunLimits>,
   ) {
     this.runContext = context ?? defaultRunContext();
-    this.resources = resources ?? new RunResources({ limits: { decisions: maxRequests }, signal, concurrency });
+    this.resources = resources ?? new RunResources({ limits: { decisions: maxRequests }, signal, concurrency, ...(initial === undefined ? {} : { initial }) });
     this.session = createDecisionSession(provider, this.resources, undefined, undefined, this.runContext);
     this.signal = this.resources.signal;
   }
@@ -105,11 +114,6 @@ export class Decisions {
     });
   }
 
-  async choose(state: State, instructions: string, criteria: Record<string, string>): Promise<string> {
-    const result = await this.observed(state).choose(jsonState(state), instructions, criteria);
-    return result.value;
-  }
-
   /**
    * Alternatives-aware choice: records the pick, its retained alternatives, and the canonical
    * near-tie flag in the run context, and attaches `decisionId`/`nearTie` to the decision event.
@@ -140,14 +144,37 @@ export class Decisions {
     return captured;
   }
 
-  async probability(state: State, instructions: string): Promise<number> {
-    const result = await this.observed(state).probability(jsonState(state), instructions);
-    return result.value;
+  /**
+   * Run one single-question decision with `max_tokens_exceeded` recovery: when the platform
+   * rejects the request for exceeding its token budget, the caller-supplied builder compacts the
+   * state and the decision retries once; a second rejection fails that decision only. The builder
+   * receives the same state the failed attempt was built from.
+   */
+  private async withTokenRecovery<T>(state: State, retryState: RetryStateBuilder | undefined, attempt: (state: State) => Promise<T>): Promise<T> {
+    try {
+      return await attempt(state);
+    } catch (error) {
+      if (retryState === undefined || !(error instanceof DecisionError) || !/max_tokens_exceeded/.test(error.message)) throw error;
+      this.signal.throwIfAborted();
+      return attempt(retryState(state));
+    }
   }
 
-  async score(state: State, instructions: string, levels: string[]): Promise<{ expected: number; probabilities: number[] }> {
-    const result = await this.observed(state).score(jsonState(state), instructions, levels);
-    return { expected: result.value.expected, probabilities: [...result.value.probabilities] };
+  async choose(state: State, instructions: string, criteria: Record<string, string>, retryState?: RetryStateBuilder): Promise<string> {
+    return this.withTokenRecovery(state, retryState, async candidate =>
+      (await this.observed(candidate).choose(jsonState(candidate), instructions, criteria)).value);
+  }
+
+  async probability(state: State, instructions: string, retryState?: RetryStateBuilder): Promise<number> {
+    return this.withTokenRecovery(state, retryState, async candidate =>
+      (await this.observed(candidate).probability(jsonState(candidate), instructions)).value);
+  }
+
+  async score(state: State, instructions: string, levels: string[], retryState?: RetryStateBuilder): Promise<{ expected: number; probabilities: number[] }> {
+    return this.withTokenRecovery(state, retryState, async candidate => {
+      const result = await this.observed(candidate).score(jsonState(candidate), instructions, levels);
+      return { expected: result.value.expected, probabilities: [...result.value.probabilities] };
+    });
   }
 
   /** Parallel positions, each with a scored categorical distribution over characters. */

@@ -45,6 +45,7 @@ const renderDecision = (d: Decision): string => {
 export function renderItem(item: Item, opts: RenderOpts): string[] {
   switch (item.kind) {
     case 'prompt': { const [first = '', ...rest] = item.text.split('\n'); return [paint(fit(`› ${first}`, opts), 1, opts.color), ...rest.map(line => fit(`  ${line}`, opts))]; }
+    case 'resume': return [paint(fit(`⤵ resume · ${item.text}`, opts), 36, opts.color)];
     case 'tool': return [header(item, opts), ...(item.body ? renderBody(item.body, opts) : [])];
     case 'turn': { const plan = item.plan.split('\n')[0]; return [dim(fit(`── turn ${item.turn} · ${plural(item.files, 'file')}${plan ? ` · plan: ${plan}` : ''}`, opts), opts)]; }
     case 'update': return [paint(fit(`↳ update · ${item.text}`, opts), 36, opts.color)];

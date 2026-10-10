@@ -7,6 +7,7 @@ import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import type { AstAdapter } from '../src/ast-adapters.js';
 import { MAX_DECISION_REQUEST_BYTES } from '../src/decision-context.js';
 import { Harness } from '../src/harness.js';
+import { prepareResume } from '../src/replay.js';
 import { attemptScope, createRunContext, type RunContext } from '../src/run-context.js';
 import { builtInTools } from '../src/tools.js';
 import type { DecisionProvider, Tool } from '../src/types.js';
@@ -799,3 +800,125 @@ class SizeRecordingProvider implements DecisionProvider {
     return this.inner.decide(input, questions, signal);
   }
 }
+
+test('a completion decision rejected for size retries once with a compacted state', async t => {
+  const root = await workspace(t);
+  let completionCalls = 0;
+  const base = new ScriptedProvider([
+    ...Array.from({ length: 5 }, () => ({ action: 'probe' as const })),
+    { action: 'finish', verdict: 1 },
+  ]);
+  const provider: DecisionProvider = { decide: async (input, questions, signal) => {
+    if ((input as unknown as { completionCheck?: boolean }).completionCheck === true) {
+      completionCalls++;
+      if (completionCalls === 1) throw new Error('max_tokens_exceeded: request exceeds the model token budget');
+    }
+    return base.decide(input, questions, signal);
+  } };
+  let probes = 0;
+  const probe: Tool = { name: 'probe', effect: 'read', description: 'Record a probe observation.', fields: {},
+    async execute() { probes++; return { ok: true, output: `probe ${probes}` }; } };
+  const result = await new Harness({ workspace: root, provider, tools: [...builtInTools(), probe], journalDirectory: false }).run('Probe five times, then finish.');
+
+  assert.equal(result.status, 'completed', result.summary);
+  assert.equal(completionCalls, 2, 'one rejection plus exactly one retry');
+  const completionStates = base.states.filter(state => state.completionCheck);
+  assert.equal(completionStates.length, 1, 'only the retry reaches the scripted provider');
+  assert.equal((completionStates[0] as unknown as { recent: unknown[] }).recent.length, 2, 'the retry state was compacted');
+});
+
+test('a repeated size rejection fails the completion decision without another retry', async t => {
+  const root = await workspace(t);
+  let completionCalls = 0;
+  const base = new ScriptedProvider([{ action: 'finish', verdict: 1 }]);
+  const provider: DecisionProvider = { decide: async (input, questions, signal) => {
+    if ((input as unknown as { completionCheck?: boolean }).completionCheck === true) {
+      completionCalls++;
+      throw new Error('max_tokens_exceeded: still over budget');
+    }
+    return base.decide(input, questions, signal);
+  } };
+  const result = await new Harness({ workspace: root, provider, journalDirectory: false }).run('Finish immediately.');
+
+  assert.equal(result.status, 'error');
+  assert.match(result.summary, /max_tokens_exceeded: still over budget/);
+  assert.equal(completionCalls, 2, 'the failure propagates after one retry');
+});
+
+test('seeded decision paths preserve journaled ids and advance the allocator', async () => {
+  const context = createRunContext();
+  context.seedDecisions([{ decisionId: 7, scope: attemptScope('content', 'greet'), questionKey: 'string',
+    identity: { field: 'content', unit: 'greet' }, chosen: 'value_0', nearTie: true,
+    alternatives: [{ label: 'value_0', probability: 0.6 }, { label: 'value_1', probability: 0.4 }] }]);
+  assert.equal(context.decisionEntry(7)?.chosen, 'value_0');
+  assert.equal(context.decisionEntry(7)?.kind, 'structural', 'seeded entries never enable forced-answer replay');
+  assert.deepEqual(context.pathFor(attemptScope('content', 'greet')).map(entry => entry.decisionId), [7]);
+  assert.equal(context.allocateDecisionId(), 8, 'new ids continue above the seeded floor');
+  await context.dispose();
+});
+
+test('an interrupted run resumes at the next turn without replaying journaled tool effects', async t => {
+  const root = await workspace(t);
+  const controller = new AbortController();
+  const firstProvider = new ScriptedProvider([
+    { action: 'write_file', args: { path: 'note.txt', content: 'hello' } },
+    { action: 'read_file', args: { path: 'note.txt', offset: '', limit: '' } },
+  ]);
+  const first = await new Harness({ workspace: root, provider: firstProvider,
+    onEvent: event => { if (event.type === 'tool_end' && event.data.tool === 'write_file') controller.abort(new Error('Interrupted by user.')); },
+  }).run('Write note.txt, then read it back.', controller.signal);
+  assert.equal(first.status, 'cancelled', first.summary);
+  assert.equal(first.turns, 2, 'the aborted turn still emits its zero-request turn_end');
+  assert.equal(await readFile(join(root, 'note.txt'), 'utf8'), 'hello');
+
+  const plan = await prepareResume({ journalPath: join(root, '.jev', 'runs', `${first.id}.jsonl`), workspace: root,
+    effectOf: name => builtInTools().find(tool => tool.name === name)?.effect });
+  assert.equal(plan.turn, 3, 'resume at max(turn_end) + 1');
+  assert.equal(plan.turns, 2);
+  assert.equal(plan.requests, first.requests, 'carried request usage is summed from turn_end events');
+  assert.deepEqual(plan.records.map(record => [record.turn, record.tool]), [[1, 'write_file']]);
+  assert.deepEqual(plan.warnings, ['ignored 1 journal event after the last complete turn_end']);
+
+  const secondProvider = new ScriptedProvider([
+    { action: 'blocked', args: { summary: 'unused placeholder' } },
+    { action: 'blocked', args: { summary: 'unused placeholder' } },
+    { action: 'read_file', args: { path: 'note.txt', offset: '', limit: '' } },
+    { action: 'finish', verdict: 1 },
+  ]);
+  const second = await new Harness({ workspace: root, provider: secondProvider, resume: plan }).run(plan.prompt);
+  assert.equal(second.status, 'completed', second.summary);
+  assert.equal(second.turns, 4, 'turn numbering continues from the resume point');
+  assert.equal(second.records[0]?.tool, 'write_file', 'the journaled record is carried into the resumed run');
+  assert.equal(second.records.filter(record => record.tool === 'write_file').length, 1, 'the journaled write was not replayed');
+
+  const journal = await journalOf(root, second.id);
+  assert.deepEqual(journal[0]!.data.resume, { from: first.id, turns: 2, requests: first.requests });
+  assert.deepEqual(journal.filter(event => event.type === 'tool_start').map(event => (event.data as { tool: string }).tool), ['read_file'],
+    'the resumed journal only runs new tool calls');
+  assert.equal(journal.at(-1)!.type, 'end');
+  assert.equal(journal.at(-1)!.data.requests, second.requests, 'end.requests agrees with the live counter');
+  const resumedState = secondProvider.states.find(state => state.task.turn === 3) as unknown as { rules: string[] };
+  assert.ok(resumedState.rules.some(rule => /resumed from journal/.test(rule)), JSON.stringify(resumedState.rules));
+  assert.match(second.summary, /Wrote note.txt\./, 'the carried record feeds the completion summary');
+});
+
+test('a resumed run carries request usage into the enforced budget', async t => {
+  const root = await workspace(t);
+  const firstProvider = new ScriptedProvider([{ action: 'write_file', args: { path: 'a.txt', content: 'a' } }]);
+  const first = await new Harness({ workspace: root, provider: firstProvider, maxTurns: 1 }).run('Write a.txt.');
+  assert.equal(first.status, 'limited');
+  assert.match(first.summary, /Resume this run with jev-code --resume /, 'non-completed runs name their resume command');
+
+  const plan = await prepareResume({ journalPath: join(root, '.jev', 'runs', `${first.id}.jsonl`), workspace: root,
+    effectOf: name => builtInTools().find(tool => tool.name === name)?.effect });
+  assert.equal(plan.requests, first.requests);
+
+  const secondProvider = new ScriptedProvider([
+    { action: 'blocked', args: { summary: 'unused placeholder' } },
+    { action: 'blocked', args: { summary: 'Budget exhausted.' } },
+  ]);
+  const second = await new Harness({ workspace: root, provider: secondProvider, resume: plan, maxRequests: plan.requests + 1, maxTurns: 5 }).run(plan.prompt);
+  assert.equal(second.requests, plan.requests + 1, 'the carried requests count against the enforced budget');
+  assert.equal(second.status, 'limited', second.summary);
+  assert.match(second.summary, /budget exhausted/);
+});

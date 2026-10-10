@@ -99,6 +99,28 @@ export const COMPLETION_COMPACTION: DecisionCompaction = {
   plan: 1000,
 };
 
+/**
+ * Harder compaction applied once when a single decision request is rejected by the platform's
+ * token budget (`max_tokens_exceeded`). The state shape is preserved, so the question keeps its
+ * meaning; only the context keys the standard profiles already bound are trimmed further.
+ */
+export const RETRY_COMPACTION: DecisionCompaction = {
+  history: { keep: 4, output: 120 },
+  recent: { keep: 2, args: 256, output: 400, data: 256 },
+  observations: { keep: 2, args: 256, output: 400, data: 256 },
+  conversation: { prompt: 200, summary: 300 },
+  plan: 400,
+};
+
+/**
+ * Retry-state builder for the facade's `max_tokens_exceeded` recovery: one harder compaction pass
+ * over the state that was rejected. The state shape is preserved, so the question keeps its
+ * meaning; when nothing can be trimmed the state is returned unchanged and the single retry is
+ * still attempted.
+ */
+export const compactRetryState = (state: Record<string, unknown>): Record<string, unknown> =>
+  compactDecisionState(state, RETRY_COMPACTION).state;
+
 /** Request bytes for one Choice question, matching the payload DecisionSession.choose sends. */
 export function decisionChoiceBytes(state: unknown, instructions: string, criteria: Record<string, string>): number {
   return Buffer.byteLength(JSON.stringify({ state, questions: { selection: { type: 'choice', instructions, criteria } } }));

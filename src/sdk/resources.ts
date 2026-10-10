@@ -10,6 +10,11 @@ export interface RunResourceOptions {
   concurrency?: number;
   signal?: AbortSignal;
   timeoutMs?: number;
+  /**
+   * Usage pre-charged into the run's budget. Journal-backed resume seeds this from the resumed
+   * journal so the carried requests count against the enforced limit.
+   */
+  initial?: Partial<RunLimits>;
 }
 
 export interface RunResourceSnapshot {
@@ -96,6 +101,8 @@ export class RunResources {
   constructor(options: RunResourceOptions = {}) {
     const limits = { ...DEFAULT_LIMITS, ...options.limits };
     for (const [name, value] of Object.entries(limits)) validateCount(name, value);
+    const initial = { decisions: options.initial?.decisions ?? 0, nodes: options.initial?.nodes ?? 0 };
+    for (const [name, value] of Object.entries(initial)) validateCount(name, value);
     const concurrency = options.concurrency ?? 4;
     if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new Error('concurrency must be a positive safe integer.');
     if (options.timeoutMs !== undefined && (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0)) {
@@ -112,7 +119,7 @@ export class RunResources {
     this.shared = {
       limits,
       concurrency,
-      used: { decisions: 0, nodes: 0 },
+      used: { ...initial },
       usage: { inputTokens: 0, outputTokens: 0 },
       providerGate: { inflight: 0, head: 0, waiters: [] },
       nodeGate: { inflight: 0, head: 0, waiters: [] },
