@@ -3,7 +3,13 @@ import type { EntryType, Question, Questions, SystemOneResult } from '@typesafe-
 import type { DecisionProvider } from '../src/types.js';
 
 export type SlotAnswer = string | { value: string | number } | { score: number } | { noul: number };
-export interface SlotEntry { phase?: string; slot?: string | RegExp; unit?: string; candidate?: number; answer: SlotAnswer; once?: boolean }
+export interface SlotEntry { phase?: string; slot?: string | RegExp; unit?: string; candidate?: number; answer: SlotAnswer; once?: boolean;
+  /**
+   * Emit a near-tie distribution for the choice: the chosen label at 0.5 and this runner-up at
+   * 0.45 (the rest at 0.05), so the canonical near-tie rule marks the recorded decision and repair
+   * may consume its alternatives. The value matches the criterion text directly or as JSON.
+   */
+  runnerUp?: string | number }
 interface SlotState { generation?: { phase?: string; slot?: string; unit?: string; candidate?: number } }
 
 const full = (labels: string[], hit: string | number): Record<string, number> => Object.fromEntries(labels.map(label => [label, String(label) === String(hit) ? 1 : 0]));
@@ -42,7 +48,18 @@ export class SlotProvider implements DecisionProvider {
       selected = labels.find(label => question.criteria[label] === JSON.stringify(value) || question.criteria[label] === value);
     }
     if (selected === undefined || !labels.includes(selected)) throw new Error(`SlotProvider: ${where} answer ${JSON.stringify(answer)} not in criteria [${labels.join(', ')}]`);
-    return { type: 'choice', choice: selected, confidence: 1, probabilities: full(labels, selected) };
+    const probabilities = full(labels, selected);
+    if (entry?.runnerUp !== undefined) {
+      const runnerUp = labels.find(label => question.criteria[label] === entry.runnerUp || question.criteria[label] === JSON.stringify(entry.runnerUp));
+      if (runnerUp === undefined) throw new Error(`SlotProvider: ${where} near-tie runner-up ${JSON.stringify(entry.runnerUp)} not in criteria`);
+      if (runnerUp === selected) throw new Error(`SlotProvider: ${where} near-tie runner-up ${JSON.stringify(entry.runnerUp)} is the chosen label`);
+      const rest = labels.filter(label => label !== selected && label !== runnerUp);
+      for (const label of labels) probabilities[label] = 0;
+      probabilities[selected] = 0.5;
+      probabilities[runnerUp] = rest.length ? 0.45 : 0.5;
+      if (rest.length) probabilities[rest[0]!] = 0.05;
+    }
+    return { type: 'choice', choice: selected, confidence: 1, probabilities };
   }
 
   async decide<Q extends Questions>(input: EntryType, questions: Q, _signal?: AbortSignal): Promise<SystemOneResult<Q>> {

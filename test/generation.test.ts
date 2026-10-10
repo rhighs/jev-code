@@ -107,6 +107,7 @@ const contentOptions = (registry: AstRegistry) => ({ fragments: [], maxSteps: 8,
 test('a JS/TS validation failure retries once with the diagnostics in state and accepts the retry', async () => {
   let calls = 0;
   const states: Array<{ generation?: { syntax?: unknown; reason?: unknown } }> = [];
+  const notes: string[] = [];
   const adapter: AstAdapter = {
     id: 'typescript', extensions: ['.ts'], languages: ['typescript'],
     async generate(_decisions, state) { states.push(state as never); calls++; return calls === 1 ? 'f(1 2);\n' : 'const value = 1;\n'; },
@@ -114,12 +115,13 @@ test('a JS/TS validation failure retries once with the diagnostics in state and 
   };
   const registry = new AstRegistry([adapter], false);
   const actual = await generateText(new Decisions(new ScriptedProvider([{ action: 'write_file', args: { path: 'main.ts', content: 'const value = 1;\n' } }]), 100, new AbortController().signal),
-    contentState('main.ts'), 'content', 'Contents.', contentOptions(registry));
+    contentState('main.ts'), 'content', 'Contents.', { ...contentOptions(registry), note: async message => { notes.push(message); } });
   assert.equal(actual, 'const value = 1;\n');
   assert.equal(calls, 2, 'exactly one retry');
   assert.deepEqual(states[1]?.generation?.syntax, [{ message: "',' expected.", offset: 4 }]);
   assert.equal(states[1]?.generation?.reason, "',' expected.");
   assert.equal(states[0]?.generation, undefined, 'the first attempt carries no syntax hint');
+  assert.deepEqual(notes, ["JS/TS validation failed (',' expected.); retrying once with the failing construct narrowed."], 'the narrowed retry is journaled once');
 });
 
 test('a JS/TS retry that fails again surfaces the second diagnostic without looping', async () => {
@@ -134,11 +136,13 @@ test('a JS/TS retry that fails again surfaces the second diagnostic without loop
 
 test('validation failures on other dialects do not retry', async () => {
   let calls = 0;
+  const notes: string[] = [];
   const adapter = adapterFor('rust', '.rs', () => { calls++; return 'fn main() {}\n'; }, () => { throw new Error('rustc rejected the source'); });
   const registry = new AstRegistry([adapter], false);
   await assert.rejects(generateText(new Decisions(new ScriptedProvider([{ action: 'write_file', args: { path: 'main.rs', content: 'x' } }]), 100, new AbortController().signal),
-    contentState('main.rs'), 'content', 'Contents.', contentOptions(registry)), /rustc rejected the source/);
+    contentState('main.rs'), 'content', 'Contents.', { ...contentOptions(registry), note: async message => { notes.push(message); } }), /rustc rejected the source/);
   assert.equal(calls, 1, 'only JS/TS gets the narrowed retry');
+  assert.deepEqual(notes, [], 'other dialects are not journaled as a narrowed retry');
 });
 
 test('a JS/TS syntax hint drops productions matching the diagnostic in the retry', async () => {

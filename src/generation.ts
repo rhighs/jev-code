@@ -98,7 +98,9 @@ export async function generateText(decisions: Decisions, state: State, field: st
       const syntax = repairDiagnostics(adapter, state, first.source);
       if (!syntax.length) throw first.failure;
       // One narrowed retry: the diagnostics ride in generation.syntax, which lang/core.ts consumes
-      // to drop matching productions, and stay in the decision state for the model.
+      // to drop matching productions, and stay in the decision state for the model. The retry is
+      // journaled additively through the host note hook.
+      await options.note?.(`JS/TS validation failed (${syntax[0]!.message.slice(0, 200)}); retrying once with the failing construct narrowed.`);
       const generation = state.generation && typeof state.generation === 'object' ? state.generation as Record<string, unknown> : {};
       const retryState: State = { ...state, generation: { ...generation, field, syntax, reason: errorText(first.failure) } };
       const second = await attempt(retryState);

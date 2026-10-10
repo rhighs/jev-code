@@ -47,9 +47,15 @@ const decomposition: SlotEntry[] = [
   { slot: 'unit_1_name', answer: { value: 'shout' } }, { slot: 'unit_1_arity', answer: '1' }, { slot: 'unit_1_purpose', answer: { value: 'shout' } }, { slot: 'unit_1_parameter_0', answer: { value: 'name' } },
 ];
 const bodies: SlotEntry[] = [
-  { unit: 'greet', slot: 'function_body', answer: 'return' }, { unit: 'greet', slot: 'expression', answer: 'string' }, { unit: 'greet', slot: 'string', answer: { value: 'greet' } },
+  { unit: 'greet', slot: 'function_body', answer: 'return' }, { unit: 'greet', slot: 'expression', answer: 'string' }, { unit: 'greet', slot: 'string', answer: { value: 'greet' }, runnerUp: 'shout' },
   { unit: 'shout', slot: 'function_body', answer: 'return' }, { unit: 'shout', slot: 'expression', answer: 'name' }, { unit: 'shout', slot: 'reference', answer: 'name_0' },
 ];
+/** The same fixture with confident (non-near-tie) distributions: repair must skip its alternatives. */
+const confident = (script: SlotEntry[]): SlotEntry[] => script.map(entry => {
+  const copy: SlotEntry = { ...entry };
+  delete copy.runnerUp;
+  return copy;
+});
 const main: SlotEntry[] = [
   { slot: 'module_body', answer: 'expr', once: true }, { slot: 'expression', answer: 'call' }, { slot: 'callee', answer: { value: 'print' }, once: true }, { slot: 'argument_count', answer: '1' },
   { slot: 'argument_0', answer: 'call', once: true }, { slot: 'callee', answer: { value: 'greet' } }, { slot: 'argument_0', answer: 'string' }, { slot: 'string', answer: { value: 'greet' } },
@@ -299,7 +305,9 @@ test('at most four unit requests are in flight with six units', async () => {
   // A two-arrival barrier guarantees overlap without a timing-dependent sleep.
   let arrived = 0, release!: () => void;
   const both = new Promise<void>(resolve => { release = resolve; });
-  const provider = new GateProvider([...units, ...names.map(() => ({ slot: 'function_body', answer: 'pass', once: true })), { slot: 'function_body', answer: 'finish' },
+  // Each unit's first body question matches its own scripted `pass`; later questions fall through
+  // to the shared `finish`, so a concurrent second question cannot steal another unit's entry.
+  const provider = new GateProvider([...units, ...names.map(n => ({ unit: n, slot: 'function_body', answer: 'pass', once: true })), { slot: 'function_body', answer: 'finish' },
     { slot: 'module_body', answer: 'finish' }], async s => {
     if (!s.generation.unit) return;
     if (++arrived === 2) release();
@@ -540,6 +548,7 @@ test('a unit-body traceback maps to the failing leaf and replay rebuilds the sou
   context.adoptWrittenFile('content', 'main.py');
   const leaf = context.pathFor(attemptScope('content', 'greet')).find(candidate => candidate.kind === 'leaf')!;
   assert.ok(leaf.answer !== undefined && leaf.alternatives.length >= 2);
+  assert.equal(leaf.nearTie, true, 'the fixture distribution is a near-tie, so its alternatives are consumable');
 
   const text = traceback([{ path: '/ws/main.py', line: 3, source: "print(greet('greet'))" }, { path: '/ws/main.py', line: 2, source: "return 'greet'" }], 'TypeError: broken');
   const attribution = attributeFailure(context, text, '/ws');
@@ -577,7 +586,7 @@ test('a module-slot traceback substitutes the failing leaf in the assembled prog
     { slot: 'argument_0', answer: 'binary' },
     { slot: 'operator', answer: 'Div' },
     { slot: 'left', answer: 'number' }, { slot: 'number', answer: { value: 1 }, once: true },
-    { slot: 'right', answer: 'number' }, { slot: 'number', answer: { value: 0 }, once: true },
+    { slot: 'right', answer: 'number' }, { slot: 'number', answer: { value: 0 }, once: true, runnerUp: 1 },
     { slot: 'module_body', answer: 'finish' },
   ]);
   const d = inContext(provider, context);
@@ -585,6 +594,7 @@ test('a module-slot traceback substitutes the failing leaf in the assembled prog
   assert.equal(source, 'print(1 / 0)\n');
   context.adoptWrittenFile('content', 'main.py');
   const leaf = context.pathFor(attemptScope('content')).filter(candidate => candidate.kind === 'leaf').at(-1)!;
+  assert.equal(leaf.nearTie, true, 'the fixture distribution is a near-tie');
   const attribution = attributeFailure(context, traceback([{ path: '/ws/main.py', line: 1, source: 'print(1 / 0)' }], 'ZeroDivisionError: division by zero'), '/ws');
   assert.ok(attribution);
   assert.equal(attribution.unit, undefined, 'the failing frame is a module line');
@@ -596,6 +606,93 @@ test('a module-slot traceback substitutes the failing leaf in the assembled prog
   assert.equal(repaired.outcome.kind, 'module-substitution');
   assert.equal(repaired.files['main.py'], 'print(1 / 1)\n');
   assert.equal(provider.calls, before, 'module substitution asks no provider questions');
+  await context.dispose();
+});
+
+test('a non-near-tie failure skips the alternatives and regenerates the unit', async () => {
+  const context = createRunContext();
+  const provider = new GateProvider([...decomposition, ...confident(bodies), ...main]);
+  const d = inContext(provider, context);
+  await generatePythonAst(d, state, 'content', options);
+  context.adoptWrittenFile('content', 'main.py');
+  const leaf = context.pathFor(attemptScope('content', 'greet')).find(candidate => candidate.kind === 'leaf')!;
+  assert.equal(leaf.nearTie, false, 'the confident fixture is not a near-tie');
+  const attribution = attributeFailure(context, traceback([{ path: '/ws/main.py', line: 3, source: "print(greet('greet'))" }, { path: '/ws/main.py', line: 2, source: "return 'greet'" }], 'TypeError: broken'), '/ws');
+  assert.ok(attribution);
+  assert.equal(attribution.decisionId, leaf.decisionId);
+  assert.ok(attribution.forced.length > 0, 'attribution still reports the runner-ups');
+
+  const before = provider.inner.calls;
+  const repaired = await repairPythonFailure(d, context, attribution, { ...options, context });
+  assert.ok(repaired);
+  assert.equal(repaired.outcome.kind, 'unit-regeneration', 'a confident failure skips the alternatives');
+  assert.ok(provider.inner.calls > before, 'the unit regenerates with provider requests');
+  assert.ok(repaired.outcome.notes.some(note => /not a near-tie/.test(note)), `skip note: ${JSON.stringify(repaired.outcome.notes)}`);
+  assert.match(repaired.files['main.py']!, /def greet\(name\):\n    return 'greet'\n/);
+  await context.dispose();
+});
+
+test('a non-near-tie module failure regenerates the module block', async () => {
+  const context = createRunContext();
+  const provider = new SlotProvider([
+    { slot: 'unit_count', answer: '0', once: true },
+    { slot: 'module_body', answer: 'expr', once: true },
+    { slot: 'expression', answer: 'call', once: true },
+    { slot: 'callee', answer: { value: 'print' }, once: true },
+    { slot: 'argument_count', answer: '1', once: true },
+    { slot: 'argument_0', answer: 'binary', once: true },
+    { slot: 'operator', answer: 'Div', once: true },
+    { slot: 'left', answer: 'number', once: true }, { slot: 'number', answer: { value: 1 }, once: true },
+    { slot: 'right', answer: 'number', once: true }, { slot: 'number', answer: { value: 0 }, once: true },
+    { slot: 'module_body', answer: 'finish', once: true },
+    // Regeneration after the confident failure: a corrected division.
+    { slot: 'module_body', answer: 'expr', once: true },
+    { slot: 'expression', answer: 'call', once: true },
+    { slot: 'callee', answer: { value: 'print' }, once: true },
+    { slot: 'argument_count', answer: '1', once: true },
+    { slot: 'argument_0', answer: 'binary', once: true },
+    { slot: 'operator', answer: 'Div', once: true },
+    { slot: 'left', answer: 'number', once: true }, { slot: 'number', answer: { value: 1 }, once: true },
+    { slot: 'right', answer: 'number', once: true }, { slot: 'number', answer: { value: 1 }, once: true },
+    { slot: 'module_body', answer: 'finish', once: true },
+  ]);
+  const d = inContext(provider, context);
+  const source = await generatePythonAst(d, { task: { prompt: 'Print a division result.', turn: 1, updates: [] } }, 'content', options);
+  assert.equal(source, 'print(1 / 0)\n');
+  context.adoptWrittenFile('content', 'main.py');
+  const leaf = context.pathFor(attemptScope('content')).filter(candidate => candidate.kind === 'leaf').at(-1)!;
+  assert.equal(leaf.nearTie, false, 'the confident fixture is not a near-tie');
+  const attribution = attributeFailure(context, traceback([{ path: '/ws/main.py', line: 1, source: 'print(1 / 0)' }], 'ZeroDivisionError: division by zero'), '/ws');
+  assert.ok(attribution);
+  assert.equal(attribution.decisionId, leaf.decisionId);
+
+  const before = provider.calls;
+  const repaired = await repairPythonFailure(d, context, attribution, { ...options, context });
+  assert.ok(repaired);
+  assert.equal(repaired.outcome.kind, 'module-regeneration');
+  assert.ok(provider.calls > before, 'the module block regenerates with provider requests');
+  assert.equal(repaired.files['main.py'], 'print(1 / 1)\n');
+  assert.ok(repaired.outcome.notes.some(note => /not a near-tie/.test(note)), `skip note: ${JSON.stringify(repaired.outcome.notes)}`);
+  await context.dispose();
+});
+
+test('an exhausted alternative list regenerates the unit once', async () => {
+  const context = createRunContext();
+  const provider = new GateProvider([...decomposition, ...bodies, ...main]);
+  const d = inContext(provider, context);
+  await generatePythonAst(d, state, 'content', options);
+  context.adoptWrittenFile('content', 'main.py');
+  const leaf = context.pathFor(attemptScope('content', 'greet')).find(candidate => candidate.kind === 'leaf')!;
+  assert.equal(leaf.nearTie, true, 'the near-tie gate opens the replay loop');
+
+  const attribution = { target: 'content', path: 'content', field: 'content', scope: attemptScope('content', 'greet'), unit: 'greet', decisionId: leaf.decisionId, chosen: leaf.chosen, forced: ['missing_alternative'], reason: 'x' };
+  const before = provider.criteria.filter(entry => entry.unit === 'greet' && entry.slot === 'function_body').length;
+  const repaired = await repairPythonFailure(d, context, attribution, { ...options, context });
+  assert.ok(repaired);
+  assert.equal(repaired.outcome.kind, 'unit-regeneration', 'every unusable alternative falls through to one regeneration');
+  const after = provider.criteria.filter(entry => entry.unit === 'greet' && entry.slot === 'function_body').length;
+  assert.equal(after - before, 1, 'the unit is regenerated exactly once');
+  assert.match(repaired.files['content']!, /def greet\(name\):\n    return 'greet'\n/);
   await context.dispose();
 });
 

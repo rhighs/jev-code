@@ -504,6 +504,8 @@ test('disposing a run context shuts its worker down and rejects later use', asyn
 /** Scripts actions and non-AST fields; Python generation is delegated to a SlotProvider. */
 class RepairProvider implements DecisionProvider {
   readonly astStates: Array<{ slot: string; unit?: string }> = [];
+  /** Offered action criteria per action selection, so actionCriteria dedup is observable. */
+  readonly offered: Array<{ turn: number; offered: string[] }> = [];
   constructor(private readonly slot: SlotProvider, private readonly actions: string[]) {}
   async decide<Q extends Questions>(input: EntryType, questions: Q, signal?: AbortSignal): Promise<SystemOneResult<Q>> {
     const state = input as unknown as { task: { turn: number }; generation?: { slot?: string; unit?: string }; completionCheck?: boolean; field?: string };
@@ -513,6 +515,7 @@ class RepairProvider implements DecisionProvider {
     }
     const question = (questions as Record<string, { type: string; criteria: Record<string, string> }>).selection;
     if (question === undefined || question.type !== 'choice') throw new Error('RepairProvider: unexpected question');
+    if (!state.completionCheck && state.field === undefined) this.offered.push({ turn: state.task.turn, offered: Object.keys(question.criteria) });
     const selected = state.completionCheck ? 'complete' : state.field !== undefined ? (state.field === 'timeout_ms' ? 'default' : 'plan_0') : this.actions[state.task.turn - 1]!;
     return { model: 'repair-test', usage: { input_tokens: 1, output_tokens: 0 }, answers: {
       selection: { type: 'choice', choice: selected, confidence: 1, probabilities: Object.fromEntries(Object.keys(question.criteria).map(label => [label, label === selected ? 1 : 0])) },
@@ -533,7 +536,7 @@ test('a failing Python run is attributed to its leaf, replayed in place, and re-
     { slot: 'unit_0_name', answer: { value: 'compute' } }, { slot: 'unit_0_arity', answer: '0' }, { slot: 'unit_0_purpose', answer: { value: 'compute' } },
     { unit: 'compute', slot: 'function_body', answer: 'return' }, { unit: 'compute', slot: 'expression', answer: 'call' },
     { unit: 'compute', slot: 'callee', answer: { value: 'int' } }, { unit: 'compute', slot: 'argument_count', answer: '1' },
-    { unit: 'compute', slot: 'argument_0', answer: 'string' }, { unit: 'compute', slot: 'string', answer: { value: 'x' } },
+    { unit: 'compute', slot: 'argument_0', answer: 'string' }, { unit: 'compute', slot: 'string', answer: { value: 'x' }, runnerUp: '5' },
     { slot: 'module_body', answer: 'expr', once: true }, { slot: 'expression', answer: 'call' }, { slot: 'callee', answer: { value: 'print' }, once: true },
     { slot: 'argument_count', answer: '1' }, { slot: 'argument_0', answer: 'call', once: true }, { slot: 'callee', answer: { value: 'compute' } },
     { slot: 'module_body', answer: 'finish' },
@@ -547,6 +550,7 @@ test('a failing Python run is attributed to its leaf, replayed in place, and re-
   assert.match(bash.result.output, /^5$/m, 'the repaired program prints the runner-up literal');
   assert.ok((await readFile(join(root, 'main.py'), 'utf8')).includes("return int('5')"));
   assert.equal(provider.astStates.filter(state => state.unit === 'compute').length, 6, 'the replay asked no unit questions');
+  assert.ok(provider.offered.find(selection => selection.turn === 3)!.offered.includes('bash'), 'the repaired failure counts once, so actionCriteria keeps the tool available');
 
   const repairs = (await journalOf(root, result.id)).filter(event => event.type === 'tool_end' && event.data.repair !== undefined).map(event => event.data.repair as Record<string, unknown>);
   assert.ok(repairs.some(repair => repair.kind === 'unit-replay' && typeof repair.decisionId === 'number' && repair.forced === 'value_0'), `journaled repair: ${JSON.stringify(repairs)}`);
@@ -565,7 +569,7 @@ test('a module-slot failure substitutes the failing leaf in place and re-runs in
     { slot: 'argument_0', answer: 'binary' },
     { slot: 'operator', answer: 'Div' },
     { slot: 'left', answer: 'number' }, { slot: 'number', answer: { value: 1 }, once: true },
-    { slot: 'right', answer: 'number' }, { slot: 'number', answer: { value: 0 }, once: true },
+    { slot: 'right', answer: 'number' }, { slot: 'number', answer: { value: 0 }, once: true, runnerUp: 1 },
     { slot: 'module_body', answer: 'finish' },
   ];
   const provider = new RepairProvider(new SlotProvider(script), ['write_file', 'bash', 'finish']);
@@ -630,7 +634,7 @@ test('a repair that cannot fix the failure journals a note and leaves the failur
     { slot: 'unit_0_name', answer: { value: 'compute' } }, { slot: 'unit_0_arity', answer: '0' }, { slot: 'unit_0_purpose', answer: { value: 'compute' } },
     { unit: 'compute', slot: 'function_body', answer: 'return' }, { unit: 'compute', slot: 'expression', answer: 'call' },
     { unit: 'compute', slot: 'callee', answer: { value: 'int' } }, { unit: 'compute', slot: 'argument_count', answer: '1' },
-    { unit: 'compute', slot: 'argument_0', answer: 'string' }, { unit: 'compute', slot: 'string', answer: { value: 'x' } },
+    { unit: 'compute', slot: 'argument_0', answer: 'string' }, { unit: 'compute', slot: 'string', answer: { value: 'x' }, runnerUp: 'y' },
     { slot: 'module_body', answer: 'expr', once: true }, { slot: 'expression', answer: 'call' }, { slot: 'callee', answer: { value: 'print' }, once: true },
     { slot: 'argument_count', answer: '1' }, { slot: 'argument_0', answer: 'call', once: true }, { slot: 'callee', answer: { value: 'compute' } },
     { slot: 'module_body', answer: 'finish' },
@@ -646,6 +650,7 @@ test('a repair that cannot fix the failure journals a note and leaves the failur
   assert.ok(notes.some(note => /Repair budget exhausted for content after 2 cycles/.test(note)), `journal notes: ${JSON.stringify(notes)}`);
   const repairs = journal.filter(event => event.type === 'tool_end' && event.data.repair !== undefined).map(event => event.data.repair as Record<string, unknown>);
   assert.ok(repairs.some(repair => repair.kind === 'unit-replay' && repair.cycle === 1) && repairs.some(repair => repair.cycle === 2), `journaled repair cycles: ${JSON.stringify(repairs)}`);
+  assert.ok(provider.offered.find(selection => selection.turn === 3)!.offered.includes('bash'), 'the repair cycles count once per failure, so actionCriteria still offers the shell tool');
 });
 
 test('a Python traceback that maps to no generated file journals an unattributed-failure note', async t => {

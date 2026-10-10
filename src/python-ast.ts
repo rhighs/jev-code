@@ -764,8 +764,13 @@ async function generate(decisions: Decisions, state: State, field: string, optio
       const attempt = unitAttemptPath(runContext, field, unit.name, attribution?.scope);
       const path = attempt.entries;
       const failingEntry = attribution?.decisionId === undefined ? undefined : path.find(entry => entry.decisionId === attribution.decisionId);
+      // Near-tie consumption (U10): only a failing leaf marked near-tie has runner-ups worth
+      // replaying; a confident pick's alternatives were explicitly rejected, so its failure skips
+      // them and regenerates instead. The skip is journaled on the outcome.
+      const leaf = failingEntry?.kind === 'leaf' ? failingEntry : undefined;
+      if (leaf !== undefined && !leaf.nearTie) repair?.outcome.notes.push(`the failing decision ${leaf.decisionId} is not a near-tie; its alternatives are skipped`);
       // Leaf-only contract: a structural failure never replays; it regenerates instead.
-      if (attribution?.decisionId !== undefined && failingEntry?.kind === 'leaf') {
+      if (attribution?.decisionId !== undefined && leaf?.nearTie === true) {
         for (const label of attribution.forced) {
           const body: PythonNode[] = [];
           try {
@@ -846,8 +851,12 @@ async function generate(decisions: Decisions, state: State, field: string, optio
     const failingEntry = attribution?.decisionId === undefined ? undefined : modulePath.find(entry => entry.decisionId === attribution.decisionId);
     // Leaf-only contract: only a leaf decision can be substituted, and a module-scope failure
     // without a usable forced alternative cannot be fixed by replaying the module path unchanged.
+    // Near-tie consumption (U10): alternatives are consumed only for a near-tie leaf; a confident
+    // pick's alternatives are skipped and the module block regenerates instead.
     const moduleRepair = attribution !== undefined && attribution.unit === undefined;
-    const forced = moduleRepair && failingEntry?.kind === 'leaf' ? attribution.forced : [];
+    const leaf = moduleRepair && failingEntry?.kind === 'leaf' ? failingEntry : undefined;
+    if (leaf !== undefined && !leaf.nearTie) repair?.outcome.notes.push(`the failing decision ${leaf.decisionId} is not a near-tie; its alternatives are skipped`);
+    const forced = leaf?.nearTie === true ? attribution?.forced ?? [] : [];
     const decisionId = attribution?.decisionId;
     if (modulePath.length && (!moduleRepair || forced.length > 0)) {
       for (const label of (forced.length ? forced : [undefined])) {
@@ -914,8 +923,11 @@ async function generate(decisions: Decisions, state: State, field: string, optio
 /**
  * Rebuild the file(s) for one runtime failure: unit-body failures replay the recorded leaf
  * alternatives (or a retained search candidate) and regenerate only the failing unit otherwise;
- * module-slot failures replay the module path with the failing leaf substituted. Returns undefined
- * when there is no cached tree to repair from. Non-Python runtime repair is out of scope.
+ * module-slot failures replay the module path with the failing leaf substituted. Alternatives are
+ * consumed in probability order only when the failing leaf is a near-tie (the canonical flag from
+ * U1); a confident failure skips them and regenerates, as does an exhausted alternative list.
+ * Returns undefined when there is no cached tree to repair from. Non-Python runtime repair is out
+ * of scope.
  */
 export async function repairPythonFailure(decisions: Decisions, context: RunContext, attribution: FailureAttribution, options: GenerateOptions): Promise<PythonRepairResult | undefined> {
   const entry = context.units.get(attribution.target) as UnitCacheEntry | undefined;
