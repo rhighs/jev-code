@@ -3,12 +3,13 @@ import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import type { AstAdapter } from '../src/ast-adapters.js';
 import { Harness } from '../src/harness.js';
 import { attemptScope, createRunContext, type RunContext } from '../src/run-context.js';
 import { builtInTools } from '../src/tools.js';
 import type { DecisionProvider, Tool } from '../src/types.js';
-import { ScriptedProvider, type Step } from './helpers.js';
+import { ScriptedProvider, SlotProvider, type SlotEntry, type Step } from './helpers.js';
 
 async function workspace(t: test.TestContext): Promise<string> {
   const path = await mkdtemp(join(tmpdir(), 'jev-test-'));
@@ -493,4 +494,166 @@ test('disposing a run context shuts its worker down and rejects later use', asyn
   assert.throws(() => context.pathFor('scope'), /disposed/);
   assert.throws(() => context.slotAtLine('main.py', 3), /disposed/);
   assert.throws(() => context.setWorker({ dispose() {} }), /disposed/);
+});
+
+/** Scripts actions and non-AST fields; Python generation is delegated to a SlotProvider. */
+class RepairProvider implements DecisionProvider {
+  readonly astStates: Array<{ slot: string; unit?: string }> = [];
+  constructor(private readonly slot: SlotProvider, private readonly actions: string[]) {}
+  async decide<Q extends Questions>(input: EntryType, questions: Q, signal?: AbortSignal): Promise<SystemOneResult<Q>> {
+    const state = input as unknown as { task: { turn: number }; generation?: { slot?: string; unit?: string }; completionCheck?: boolean; field?: string };
+    if (state.generation !== undefined) {
+      this.astStates.push({ slot: state.generation.slot ?? '', ...(state.generation.unit === undefined ? {} : { unit: state.generation.unit }) });
+      return this.slot.decide(input, questions, signal);
+    }
+    const question = (questions as Record<string, { type: string; criteria: Record<string, string> }>).selection;
+    if (question === undefined || question.type !== 'choice') throw new Error('RepairProvider: unexpected question');
+    const selected = state.completionCheck ? 'complete' : state.field !== undefined ? (state.field === 'timeout_ms' ? 'default' : 'plan_0') : this.actions[state.task.turn - 1]!;
+    return { model: 'repair-test', usage: { input_tokens: 1, output_tokens: 0 }, answers: {
+      selection: { type: 'choice', choice: selected, confidence: 1, probabilities: Object.fromEntries(Object.keys(question.criteria).map(label => [label, label === selected ? 1 : 0])) },
+    } } as unknown as SystemOneResult<Q>;
+  }
+}
+
+const planEntries = (): SlotEntry[] => [{ phase: 'plan', answer: 'plan_0', once: true }, { phase: 'plan', answer: 'plan_0', once: true }, { phase: 'plan', answer: 'plan_0', once: true }];
+const journalOf = async (root: string, id: string): Promise<Array<{ type: string; data: Record<string, unknown> }>> =>
+  (await readFile(join(root, '.jev', 'runs', `${id}.jsonl`), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { type: string; data: Record<string, unknown> });
+
+test('a failing Python run is attributed to its leaf, replayed in place, and re-run in the same turn', async t => {
+  const root = await workspace(t);
+  const prompt = "Write a Python program in main.py with a helper compute that prints int('5'); do not print int('x').";
+  const script: SlotEntry[] = [
+    ...planEntries(),
+    { slot: 'unit_count', answer: '1' },
+    { slot: 'unit_0_name', answer: { value: 'compute' } }, { slot: 'unit_0_arity', answer: '0' }, { slot: 'unit_0_purpose', answer: { value: 'compute' } },
+    { unit: 'compute', slot: 'function_body', answer: 'return' }, { unit: 'compute', slot: 'expression', answer: 'call' },
+    { unit: 'compute', slot: 'callee', answer: { value: 'int' } }, { unit: 'compute', slot: 'argument_count', answer: '1' },
+    { unit: 'compute', slot: 'argument_0', answer: 'string' }, { unit: 'compute', slot: 'string', answer: { value: 'x' } },
+    { slot: 'module_body', answer: 'expr', once: true }, { slot: 'expression', answer: 'call' }, { slot: 'callee', answer: { value: 'print' }, once: true },
+    { slot: 'argument_count', answer: '1' }, { slot: 'argument_0', answer: 'call', once: true }, { slot: 'callee', answer: { value: 'compute' } },
+    { slot: 'module_body', answer: 'finish' },
+  ];
+  const provider = new RepairProvider(new SlotProvider(script), ['write_file', 'bash', 'finish']);
+  const result = await new Harness({ workspace: root, provider, experimentalGrid: true }).run(prompt);
+
+  assert.equal(result.status, 'completed', result.summary);
+  const bash = result.records.find(record => record.tool === 'bash')!;
+  assert.equal(bash.result.ok, true, bash.result.output);
+  assert.match(bash.result.output, /^5$/m, 'the repaired program prints the runner-up literal');
+  assert.ok((await readFile(join(root, 'main.py'), 'utf8')).includes("return int('5')"));
+  assert.equal(provider.astStates.filter(state => state.unit === 'compute').length, 6, 'the replay asked no unit questions');
+
+  const repairs = (await journalOf(root, result.id)).filter(event => event.type === 'tool_end' && event.data.repair !== undefined).map(event => event.data.repair as Record<string, unknown>);
+  assert.ok(repairs.some(repair => repair.kind === 'unit-replay' && typeof repair.decisionId === 'number' && repair.forced === 'value_0'), `journaled repair: ${JSON.stringify(repairs)}`);
+});
+
+test('a module-slot failure substitutes the failing leaf in place and re-runs in the same turn', async t => {
+  const root = await workspace(t);
+  const prompt = 'Write a Python program in main.py that prints a division result.';
+  const script: SlotEntry[] = [
+    ...planEntries(),
+    { slot: 'unit_count', answer: '0' },
+    { slot: 'module_body', answer: 'expr', once: true },
+    { slot: 'expression', answer: 'call' },
+    { slot: 'callee', answer: { value: 'print' } },
+    { slot: 'argument_count', answer: '1' },
+    { slot: 'argument_0', answer: 'binary' },
+    { slot: 'operator', answer: 'Div' },
+    { slot: 'left', answer: 'number' }, { slot: 'number', answer: { value: 1 }, once: true },
+    { slot: 'right', answer: 'number' }, { slot: 'number', answer: { value: 0 }, once: true },
+    { slot: 'module_body', answer: 'finish' },
+  ];
+  const provider = new RepairProvider(new SlotProvider(script), ['write_file', 'bash', 'finish']);
+  const result = await new Harness({ workspace: root, provider, experimentalGrid: true }).run(prompt);
+
+  assert.equal(result.status, 'completed', result.summary);
+  const bash = result.records.find(record => record.tool === 'bash')!;
+  assert.equal(bash.result.ok, true, bash.result.output);
+  assert.match(bash.result.output, /^1\.0$/m);
+  assert.ok((await readFile(join(root, 'main.py'), 'utf8')).includes('print(1 / 1)'));
+  const repairs = (await journalOf(root, result.id)).filter(event => event.type === 'tool_end' && event.data.repair !== undefined).map(event => event.data.repair as Record<string, unknown>);
+  assert.ok(repairs.some(repair => repair.kind === 'module-substitution' && repair.forced === 'value_1'), `journaled repair: ${JSON.stringify(repairs)}`);
+});
+
+test('a failing verifier continues the run once and then stops as limited', async t => {
+  const root = await workspace(t);
+  const events: import('../src/types.js').HarnessEvent[] = [];
+  let checks = 0;
+  const provider = new ScriptedProvider([
+    { action: 'write_file', args: { path: 'a.txt', content: 'x' } },
+    { action: 'finish', verdict: 1 },
+    { action: 'set_plan', args: { plan: 'Fix the checker failure.' } },
+    { action: 'finish', verdict: 1 },
+  ]);
+  const result = await new Harness({ workspace: root, provider, journalDirectory: false,
+    verify: async () => { checks++; return { ok: false, reason: `checker says no (${checks})` }; },
+    onEvent: event => { events.push(event); } }).run('Write a file.');
+
+  assert.equal(result.status, 'limited');
+  assert.equal(checks, 2, 'the verifier runs after each accepted finish and the continuation is bounded to one');
+  assert.match(result.summary, /Verification failed after one continuation: checker says no \(2\)/);
+  const inputs = events.filter(event => event.type === 'input');
+  assert.equal(inputs.length, 1, 'the first failure is journaled as input');
+  assert.match((inputs[0]!.data as { instruction: string }).instruction, /Verification failed: checker says no \(1\)/);
+});
+
+test('a verify failure is appended as input and the next turn repairs it', async t => {
+  const root = await workspace(t);
+  const provider = new ScriptedProvider([
+    { action: 'write_file', args: { path: 'hi.txt', content: 'nope' } },
+    { action: 'finish', verdict: 1 },
+    { action: 'write_file', args: { path: 'hi.txt', content: 'hi' } },
+    { action: 'finish', verdict: 1 },
+  ]);
+  let checks = 0;
+  const result = await new Harness({ workspace: root, provider, journalDirectory: false,
+    verify: async ws => { checks++; const content = await readFile(join(ws, 'hi.txt'), 'utf8').catch(() => ''); return { ok: content === 'hi', reason: 'hi.txt must contain hi' }; } }).run('Write hi.');
+
+  assert.equal(result.status, 'completed', result.summary);
+  assert.equal(checks, 2, 'the verifier runs again after the continuation');
+  assert.equal(await readFile(join(root, 'hi.txt'), 'utf8'), 'hi');
+  const continuation = provider.states.find(state => state.task.turn === 3)!;
+  assert.ok(continuation.task.updates.some(update => /Verification failed: hi\.txt must contain hi/.test(update)), 'the reason is visible to the next turn');
+});
+
+test('a repair that cannot fix the failure journals a note and leaves the failure to the model', async t => {
+  const root = await workspace(t);
+  const prompt = "Write a Python program in main.py with a helper compute that prints int('x') and int('y').";
+  const script: SlotEntry[] = [
+    ...planEntries(), { phase: 'plan', answer: 'plan_0', once: true },
+    { slot: 'unit_count', answer: '1' },
+    { slot: 'unit_0_name', answer: { value: 'compute' } }, { slot: 'unit_0_arity', answer: '0' }, { slot: 'unit_0_purpose', answer: { value: 'compute' } },
+    { unit: 'compute', slot: 'function_body', answer: 'return' }, { unit: 'compute', slot: 'expression', answer: 'call' },
+    { unit: 'compute', slot: 'callee', answer: { value: 'int' } }, { unit: 'compute', slot: 'argument_count', answer: '1' },
+    { unit: 'compute', slot: 'argument_0', answer: 'string' }, { unit: 'compute', slot: 'string', answer: { value: 'x' } },
+    { slot: 'module_body', answer: 'expr', once: true }, { slot: 'expression', answer: 'call' }, { slot: 'callee', answer: { value: 'print' }, once: true },
+    { slot: 'argument_count', answer: '1' }, { slot: 'argument_0', answer: 'call', once: true }, { slot: 'callee', answer: { value: 'compute' } },
+    { slot: 'module_body', answer: 'finish' },
+  ];
+  const provider = new RepairProvider(new SlotProvider(script), ['write_file', 'bash', 'blocked']);
+  const result = await new Harness({ workspace: root, provider, experimentalGrid: true }).run(prompt);
+
+  assert.equal(result.status, 'blocked', result.summary);
+  const bash = result.records.find(record => record.tool === 'bash')!;
+  assert.equal(bash.result.ok, false, 'the failure stays visible after two failed repair cycles');
+  const journal = await journalOf(root, result.id);
+  const notes = journal.filter(event => event.type === 'input').map(event => String(event.data.instruction));
+  assert.ok(notes.some(note => /Repair budget exhausted for content after 2 cycles/.test(note)), `journal notes: ${JSON.stringify(notes)}`);
+  const repairs = journal.filter(event => event.type === 'tool_end' && event.data.repair !== undefined).map(event => event.data.repair as Record<string, unknown>);
+  assert.ok(repairs.some(repair => repair.kind === 'unit-replay' && repair.cycle === 1) && repairs.some(repair => repair.cycle === 2), `journaled repair cycles: ${JSON.stringify(repairs)}`);
+});
+
+test('a Python traceback that maps to no generated file journals an unattributed-failure note', async t => {
+  const root = await workspace(t);
+  const command = "python3 -c 'raise ValueError(\"boom\")'";
+  const provider = new RepairProvider(new SlotProvider([
+    { phase: 'plan', answer: 'plan_0', once: true }, { phase: 'plan', answer: 'plan_0', once: true }, { phase: 'plan', answer: 'plan_0', once: true },
+  ]), ['bash', 'blocked']);
+  const result = await new Harness({ workspace: root, provider, experimentalGrid: true }).run(`Run the command \`${command}\` and report the failure.`);
+
+  assert.equal(result.status, 'blocked', result.summary);
+  assert.equal(result.records[0]?.result.ok, false);
+  const journal = await journalOf(root, result.id);
+  const notes = journal.filter(event => event.type === 'input').map(event => String(event.data.instruction));
+  assert.ok(notes.some(note => /Python traceback could not be attributed to a generated decision/.test(note)), JSON.stringify(notes));
 });

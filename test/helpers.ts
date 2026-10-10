@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import type { EntryType, Question, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import type { DecisionProvider } from '../src/types.js';
 
-export type SlotAnswer = string | { value: string } | { score: number } | { noul: number };
+export type SlotAnswer = string | { value: string | number } | { score: number } | { noul: number };
 export interface SlotEntry { phase?: string; slot?: string | RegExp; unit?: string; candidate?: number; answer: SlotAnswer; once?: boolean }
 interface SlotState { generation?: { phase?: string; slot?: string; unit?: string; candidate?: number } }
 

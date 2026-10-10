@@ -16,7 +16,7 @@ export interface SearchHooks {
 export const wantsReturn = (purpose: string): boolean => /\b(?:returns?|compute|calculate|get|read|sum|count|total|check|parse|build|make|create|convert)\b/i.test(purpose);
 
 /** K candidates from independent forks; static pruning first, Jev score second; ties keep the first. */
-export async function searchUnit(unit: Unit, decisions: Decisions, hooks: SearchHooks): Promise<void> {
+export async function searchUnit(unit: Unit, decisions: Decisions, hooks: SearchHooks): Promise<Candidate[]> {
   const controller = new AbortController();
   const bodies = Array.from({ length: hooks.width }, () => [] as PythonNode[]);
   const outcomes = await Promise.allSettled(bodies.map(async (body, i) => {
@@ -37,4 +37,5 @@ export async function searchUnit(unit: Unit, decisions: Decisions, hooks: Search
   for (const c of candidates) await hooks.report(c);
   if (!best) throw new Error(`Unit ${unit.name}: every search candidate was dropped (${candidates.map(c => c.reason).join(', ')}).`);
   unit.body.splice(0, unit.body.length, ...best.body);
+  return candidates;
 }

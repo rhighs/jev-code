@@ -125,9 +125,12 @@ export class Decisions {
       const decisionId = context.allocateDecisionId();
       captured = { choice: result.value, decisionId, alternatives, nearTie };
       const currentIdentity = identity(state);
+      const answer = request.answer ?? request.answers?.[result.value];
       context.recordDecision(request.scope, {
         decisionId, questionKey: request.questionKey, identity: currentIdentity,
         chosen: result.value, alternatives, nearTie, kind: request.kind,
+        ...(answer === undefined ? {} : { answer }),
+        ...(request.answers === undefined ? {} : { answers: { ...request.answers } }),
       });
       await this.onDecision({ choice: result.value, confidence: result.metadata.confidence, model: result.metadata.model,
         options: alternatives, decisionId, nearTie, ...currentIdentity });

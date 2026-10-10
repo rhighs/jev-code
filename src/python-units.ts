@@ -1,7 +1,8 @@
 import type { Decisions } from './decisions.js';
 import { functionDef, node, type Builder, type PythonNode, type Scope, type Vocab } from './python-nodes.js';
 import { searchUnit, type SearchHooks } from './python-search.js';
-import type { RunContext } from './run-context.js';
+import { attemptScope, type DecisionPathEntry, type LineSlot, type RunContext } from './run-context.js';
+import { basename, isAbsolute, relative } from 'node:path';
 
 export interface Peer { name: string; arity: number; purpose: string; module?: string }
 export interface Unit extends Peer { params: string[]; def: PythonNode; body: PythonNode[] }
@@ -159,12 +160,22 @@ export async function fillUnits(units: Unit[], decisions: Decisions, makeBuilder
       onUnitStart?.(unit);
       const fork = decisions.fork(controller.signal);
       if (search && search.width > 1) {
-        await searchUnit(unit, fork, {
-          width: search.width,
-          generate: (candidateFork, body, candidate) => makeBuilder(unit, candidateFork, candidate, body).block(body, scopeFor(unit), 1, 'function_body'),
-          render: body => search.render(unit, body), check: source => search.check(unit, source),
-          score: (d, source, candidate) => search.score(unit, d, source, candidate), report: candidate => search.report(unit, candidate),
-        });
+        try {
+          await searchUnit(unit, fork, {
+            width: search.width,
+            generate: (candidateFork, body, candidate) => makeBuilder(unit, candidateFork, candidate, body).block(body, scopeFor(unit), 1, 'function_body'),
+            render: body => search.render(unit, body), check: source => search.check(unit, source),
+            score: (d, source, candidate) => search.score(unit, d, source, candidate), report: candidate => search.report(unit, candidate),
+          });
+        } catch (err) {
+          // All-dropped search failures get their own retry path: one in-place regeneration with the
+          // drop reasons in state; a second failure aborts the pool like any other retryable failure.
+          if (!(err instanceof Error) || !/every search candidate was dropped/.test(err.message)) throw err;
+          unit.body.length = 0;
+          await makeBuilder(unit, decisions.fork(controller.signal), undefined, undefined, { reason: 'search', snippet: err.message.slice(0, 1200) }).block(unit.body, scopeFor(unit), 1, 'function_body');
+          const reason = await search.check(unit, await search.render(unit, unit.body));
+          if (reason !== undefined) throw err;
+        }
         onUnitValidated?.(unit);
         return;
       }
@@ -261,4 +272,193 @@ export function assembleProject(tree: PythonNode, units: Unit[], layout: Layout)
   }
   files[`${ENTRY}.py`] = node('Module', { body: entry, type_ignores: [] });
   return files;
+}
+
+/**
+ * A runtime failure attributed to the Python decision that produced it. Repair is Python-only in
+ * this pass (non-Python runtime repair is out of scope), so attribution only resolves files the
+ * Python builder generated and recorded a line map for.
+ */
+export interface FailureAttribution {
+  /** Unit-cache target the written file belongs to. */
+  target: string;
+  /** The line-map key (written file path) named by the failure. */
+  path: string;
+  /** Generation field that produced the file. */
+  field: string;
+  /** Attempt scope whose recorded decisions produced the failing line. */
+  scope?: string;
+  /** Failing unit for unit-body failures; absent for module-slot failures. */
+  unit?: string;
+  /** Source line of the innermost mapped frame, when the failure text had one. */
+  line?: number;
+  /** The failing leaf decision, when one could be identified. */
+  decisionId?: number;
+  /** The label recorded for the failing decision. */
+  chosen?: string;
+  /** Ordered labels to force at the failing decision (runner-ups first, chosen excluded). */
+  forced: string[];
+  /** Trimmed failure text, for journal notes. */
+  reason: string;
+}
+
+interface TraceFrame { path: string; line: number; source?: string }
+
+const framePattern = /^\s*File "([^"]+)", line (\d+)(?:, in .*)?\s*$/;
+const shortFramePattern = /^\s*([^\s:]+\.py):(\d+)(?::\s|\s)/;
+
+/** Parse Python traceback frames; `<stdin>` and `<string>` pseudo-files are ignored. */
+export function parseTraceback(text: string): TraceFrame[] {
+  const lines = text.split('\n');
+  const frames: TraceFrame[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const match = framePattern.exec(line) ?? shortFramePattern.exec(line);
+    if (match === null) continue;
+    const path = match[1]!, number = Number(match[2]);
+    if (path.startsWith('<') || !Number.isFinite(number)) continue;
+    const next = lines[i + 1];
+    const source = next !== undefined && !framePattern.test(next) && /^\s+\S/.test(next) ? next.trim() : undefined;
+    frames.push({ path, line: number, ...(source === undefined ? {} : { source }) });
+  }
+  return frames;
+}
+
+/** Decode a recorded criterion text into the value a failure message would show. */
+export function decodedAnswer(answer: string): string {
+  try {
+    const value: unknown = JSON.parse(answer);
+    if (value === null) return 'None';
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value);
+  } catch { /* not JSON; the raw criterion text is the value */ }
+  return answer;
+}
+
+const escapePattern = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** Identifier-like and numeric answers must match on word boundaries; other text matches as a substring. */
+export const answerAppears = (text: string, answer: string): boolean => {
+  if (!answer) return false;
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(answer) || /^-?\d+(?:\.\d+)?$/.test(answer)) {
+    return new RegExp(`(?<![A-Za-z0-9_])${escapePattern(answer)}(?![A-Za-z0-9_])`).test(text);
+  }
+  return text.includes(answer);
+};
+
+/** Runner-up labels for a leaf entry: alternatives in probability order, the chosen label excluded. */
+export function forcedLabels(entry: DecisionPathEntry): string[] {
+  const others = entry.alternatives.filter(alternative => alternative.label !== entry.chosen);
+  return (others.length ? others : entry.alternatives).map(alternative => alternative.label);
+}
+
+const failingLeaf = (entries: readonly DecisionPathEntry[], evidence: string): { entry: DecisionPathEntry; forced: string[] } | undefined => {
+  const leaves = entries.filter(entry => entry.kind === 'leaf');
+  if (!leaves.length) return undefined;
+  const matches = leaves.filter(entry => entry.answer !== undefined && answerAppears(evidence, decodedAnswer(entry.answer)));
+  const entry = matches.at(-1) ?? leaves.at(-1)!;
+  return { entry, forced: forcedLabels(entry) };
+};
+
+const fieldOf = (slot: LineSlot): string => slot.field ?? (slot.scope === undefined ? 'content' : slot.scope.split('\0')[0]!);
+
+/**
+ * The recorded path for one unit attempt: the recorded scope while it still has entries, else the
+ * first non-empty candidate scope (search width > 1 records each candidate under its own scope).
+ */
+export function unitAttemptPath(context: RunContext, field: string, unit: string, scope?: string): { scope?: string; entries: readonly DecisionPathEntry[] } {
+  if (scope !== undefined) {
+    const entries = context.pathFor(scope);
+    if (entries.length) return { scope, entries };
+  }
+  for (let candidate = 0; candidate < 8; candidate++) {
+    const candidateScope = attemptScope(field, unit, candidate);
+    const entries = context.pathFor(candidateScope);
+    if (entries.length) return { scope: candidateScope, entries };
+  }
+  return { entries: [] };
+}
+
+const resolveKey = (context: RunContext, workspace: string, path: string): string | undefined => {
+  const normalized = path.replaceAll('\\', '/');
+  const candidates = new Set([path, normalized, basename(normalized)]);
+  if (isAbsolute(normalized)) candidates.add(relative(workspace, normalized).replaceAll('\\', '/'));
+  for (const candidate of candidates) if (candidate && context.lines.has(candidate)) return candidate;
+  const wanted = basename(normalized);
+  const matches = [...context.lines.keys()].filter(key => basename(key) === wanted);
+  return matches.length === 1 ? matches[0] : undefined;
+};
+
+const textAttribution = (context: RunContext, workspace: string, text: string, reason: string): FailureAttribution | undefined => {
+  const mentioned = new Set<string>();
+  for (const match of text.matchAll(/[\w./-]+\.py\b/g)) {
+    const key = resolveKey(context, workspace, match[0]);
+    if (key !== undefined) mentioned.add(key);
+  }
+  const keys = mentioned.size ? [...mentioned] : [...context.lines.keys()];
+  let best: { key: string; slot: LineSlot; entry: DecisionPathEntry; score: number } | undefined;
+  for (const key of keys) {
+    const map = context.lines.get(key);
+    if (map === undefined) continue;
+    const scopes = new Set<string>();
+    for (const slot of map.values()) if (slot.scope !== undefined) scopes.add(slot.scope);
+    for (const scope of scopes) {
+      for (const entry of context.pathFor(scope)) {
+        if (entry.kind !== 'leaf' || entry.answer === undefined) continue;
+        const answer = decodedAnswer(entry.answer);
+        // Short answers would match checker prose by accident; text-only attribution needs a real word.
+        if (answer.length < 2 || !answerAppears(text, answer)) continue;
+        if (best === undefined || answer.length > best.score) {
+          const slot = [...map.values()].find(candidate => candidate.scope === scope);
+          if (slot !== undefined) best = { key, slot, entry, score: answer.length };
+        }
+      }
+    }
+  }
+  if (best === undefined) return undefined;
+  return {
+    target: best.slot.target ?? best.key,
+    path: best.key,
+    field: fieldOf(best.slot),
+    ...(best.slot.scope === undefined ? {} : { scope: best.slot.scope }),
+    ...(best.slot.unit === undefined ? {} : { unit: best.slot.unit }),
+    decisionId: best.entry.decisionId,
+    chosen: best.entry.chosen,
+    forced: forcedLabels(best.entry),
+    reason,
+  };
+};
+
+/**
+ * Map a runtime failure (bash traceback, stderr, or a checker/verify reason) to the Python decision
+ * that produced it. Frames are resolved against the run context's per-file line maps; the innermost
+ * unit-body frame wins over module frames, and the failing leaf is matched by its recorded answer
+ * text against the frame's source line. Returns undefined when nothing in the text is attributable.
+ */
+export function attributeFailure(context: RunContext, text: string, workspace: string): FailureAttribution | undefined {
+  const reason = text.trim().slice(0, 600);
+  const mapped = parseTraceback(text).flatMap(frame => {
+    const key = resolveKey(context, workspace, frame.path);
+    if (key === undefined) return [];
+    const slot = context.slotAtLine(key, frame.line);
+    return slot === undefined ? [] : [{ frame, key, slot }];
+  });
+  const unitFrame = [...mapped].reverse().find(entry => entry.slot.unit !== undefined);
+  const chosen = unitFrame ?? mapped.at(-1);
+  if (chosen === undefined) return textAttribution(context, workspace, text, reason);
+  const field = fieldOf(chosen.slot);
+  const attempt = chosen.slot.unit === undefined
+    ? { scope: chosen.slot.scope, entries: chosen.slot.scope === undefined ? [] : context.pathFor(chosen.slot.scope) }
+    : unitAttemptPath(context, field, chosen.slot.unit, chosen.slot.scope);
+  const leaf = failingLeaf(attempt.entries, chosen.frame.source ?? text);
+  return {
+    target: chosen.slot.target ?? chosen.key,
+    path: chosen.key,
+    field,
+    ...(attempt.scope === undefined ? {} : { scope: attempt.scope }),
+    ...(chosen.slot.unit === undefined ? {} : { unit: chosen.slot.unit }),
+    line: chosen.frame.line,
+    forced: leaf?.forced ?? [],
+    ...(leaf === undefined ? {} : { decisionId: leaf.entry.decisionId, chosen: leaf.entry.chosen }),
+    reason,
+  };
 }

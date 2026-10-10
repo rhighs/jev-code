@@ -168,6 +168,50 @@ test('runner rejects an unknown task name', async t => {
   await assert.rejects(runEval({ tasksDir: tasks, out: tasks, provider, only: 'nope' }), /nope/);
 });
 
+test('the runner passes its checker as the verifier: one failed check continues the run and repairs it', async t => {
+  const tasks = await workspace(t);
+  const out = await workspace(t);
+  await mkdir(join(tasks, 'trivial'));
+  await writeFile(join(tasks, 'trivial', 'task.json'), JSON.stringify({ prompt: 'Write "hi" into hi.txt.', stage: 'test', limits: { maxTurns: 6 } }));
+  await writeFile(join(tasks, 'trivial', 'check.ts'), `import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+export default async (ws: string) => ({ ok: (await readFile(join(ws, 'hi.txt'), 'utf8')) === 'hi', reason: 'hi.txt content' });
+`);
+  const provider = new ScriptedProvider([
+    { action: 'write_file', args: { path: 'hi.txt', content: 'nope' } },
+    { action: 'finish', verdict: 1 },
+    { action: 'write_file', args: { path: 'hi.txt', content: 'hi' } },
+    { action: 'finish', verdict: 1 },
+  ]);
+  const records = await runEval({ tasksDir: tasks, out, provider });
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.status, 'completed', records[0]!.summary);
+  assert.deepEqual(records[0]!.check, { ok: true, reason: 'hi.txt content' });
+  assert.ok(records[0]!.turns >= 4, `the continuation added turns: ${records[0]!.turns}`);
+  const journals = join(out, '.jev', 'eval', 'journals', 'trivial');
+  const [file] = await readdir(journals);
+  const events = (await readFile(join(journals, file!), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { type: string; data: { instruction?: string } });
+  assert.ok(events.some(event => event.type === 'input' && /Verification failed: hi\.txt content/.test(event.data.instruction ?? '')), 'the checker reason is journaled as input');
+});
+
+test('the runner records a limited run when the checker keeps failing after one continuation', async t => {
+  const tasks = await workspace(t);
+  const out = await workspace(t);
+  await mkdir(join(tasks, 'trivial'));
+  await writeFile(join(tasks, 'trivial', 'task.json'), JSON.stringify({ prompt: 'Write "hi" into hi.txt.', stage: 'test', limits: { maxTurns: 8 } }));
+  await writeFile(join(tasks, 'trivial', 'check.ts'), 'export default async () => ({ ok: false, reason: "always failing" });\n');
+  const provider = new ScriptedProvider([
+    { action: 'write_file', args: { path: 'hi.txt', content: 'nope' } },
+    { action: 'finish', verdict: 1 },
+    { action: 'set_plan', args: { plan: 'Try again.' } },
+    { action: 'finish', verdict: 1 },
+  ]);
+  const records = await runEval({ tasksDir: tasks, out, provider });
+  assert.equal(records[0]!.status, 'limited');
+  assert.equal(records[0]!.check.ok, false);
+  assert.match(records[0]!.check.reason, /run limited: .*Verification failed after one continuation: always failing/s);
+});
+
 test('cli eval with an unknown task exits nonzero with a one-line error', async () => {
   const run = promisify(execFile);
   await assert.rejects(run(resolve('node_modules/.bin/tsx'), [resolve('src/cli.ts'), 'eval', 'no-such-task'], { cwd: resolve('.'), env: { ...process.env, TYPESAFE_API_KEY: 'x' } }),

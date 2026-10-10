@@ -44,7 +44,8 @@ test('width 3 drops a returnless candidate, scores the survivors, keeps the best
     { slot: 'candidate_score', candidate: 0, answer: { score: 3 } }, { slot: 'candidate_score', candidate: 2, answer: { score: 2 } },
     ...main]);
   const events: Array<{ text: string; progress: Progress }> = [];
-  const d = decisions(provider);
+  const context = createRunContext();
+  const d = new Decisions(provider, 200, new AbortController().signal, undefined, 4, undefined, context);
   const source = await generatePythonAst(d, state, 'content', { ...options, searchWidth: 3, onText: async (_f, text, _d, _c, progress) => { events.push({ text, progress: progress as Progress }); } });
   assert.equal(source, "def get_greeting(name):\n    return 'greeting'\nprint(get_greeting('name'))\n");
   const search = events.filter(e => e.progress.decoder === 'search').map(e => e.progress.ast!);
@@ -55,11 +56,32 @@ test('width 3 drops a returnless candidate, scores the survivors, keeps the best
   assert.deepEqual(scored.map(s => s.generation?.candidate).sort(), [0, 2]);
   assert.equal(d.requests, provider.calls);
   assert.ok(d.requests > 12, `candidates and scores counted: ${d.requests}`);
+  const retained = context.candidatesFor('content', unit);
+  assert.equal(retained.length, 1, 'the validated-but-dropped candidate is retained for repair');
+  assert.match(JSON.stringify(retained[0]), /"Return".*"name"/, 'the retained body is the runner-up candidate');
+  await context.dispose();
 });
 
-test('every candidate dropped fails the unit with the reasons and produces no source', async () => {
-  const provider = new SlotProvider([...decomposition,
-    { unit, slot: 'function_body', answer: 'pass', once: true }, { unit, slot: 'function_body', answer: 'pass', once: true }, { unit, slot: 'function_body', answer: 'finish' }]);
+test('every candidate dropped retries once with the drop reasons and keeps a passing retry', async () => {
+  const dropped = (candidate: number): SlotEntry[] => withCandidate(candidate, [
+    { unit, slot: 'function_body', answer: 'pass', once: true }, { unit, slot: 'function_body', answer: 'finish', once: true },
+  ]);
+  const provider = new SlotProvider([...decomposition, ...dropped(0), ...dropped(1),
+    { unit, slot: 'function_body', answer: 'return' }, { unit, slot: 'expression', answer: 'string' }, { unit, slot: 'string', answer: { value: 'greeting' } },
+    ...main]);
+  const source = await generatePythonAst(decisions(provider), state, 'content', { ...options, searchWidth: 2 });
+  assert.equal(source, "def get_greeting(name):\n    return 'greeting'\nprint(get_greeting('name'))\n");
+  const retry = provider.states.find(s => s.generation?.slot === 'expression' && s.generation.unit === unit) as { generation: { repair?: { reason: string; snippet?: string } } } | undefined;
+  assert.equal(retry?.generation.repair?.reason, 'search', 'the all-dropped retry carries its own reason');
+  assert.match(retry?.generation.repair?.snippet ?? '', /every search candidate was dropped.*return, return/);
+});
+
+test('every candidate dropped fails the unit with the reasons when the retry also fails', async () => {
+  const dropped = (candidate: number): SlotEntry[] => withCandidate(candidate, [
+    { unit, slot: 'function_body', answer: 'pass', once: true }, { unit, slot: 'function_body', answer: 'finish', once: true },
+  ]);
+  const provider = new SlotProvider([...decomposition, ...dropped(0), ...dropped(1),
+    { unit, slot: 'function_body', answer: 'pass', once: true }, { unit, slot: 'function_body', answer: 'finish', once: true }]);
   const done: boolean[] = [];
   await assert.rejects(generatePythonAst(decisions(provider), state, 'content', { ...options, searchWidth: 2, onText: async (_f, _t, d) => { done.push(d); } }), /every search candidate was dropped.*return, return/);
   assert.ok(!done.includes(true));

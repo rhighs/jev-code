@@ -1,15 +1,17 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, open, realpath, type FileHandle } from 'node:fs/promises';
+import { mkdir, open, readFile, realpath, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Decisions, jsonState, type State } from './decisions.js';
-import { createRunContext } from './run-context.js';
-import { fragmentsFrom, generateArguments, generateText } from './generation.js';
+import { createRunContext, type RunContext } from './run-context.js';
+import { fragmentsFrom, generateArguments, generateText, type GenerateOptions } from './generation.js';
+import { repairPythonFailure, type PythonRepairResult } from './python-ast.js';
+import { attributeFailure, type FailureAttribution } from './python-units.js';
 import { builtInTools, toolContext } from './tools.js';
 import { listWorkspace, resolveWorkspacePath } from './workspace.js';
 import { completionSummary } from './summary.js';
 import { AstRegistry, type AstAdapter } from './ast-adapters.js';
 import { gridCursor, type TextProgress, type TextChange } from './grid.js';
-import { DecisionError, LimitError, type DecisionProvider, type HarnessEvent, type HarnessEventData, type RunResult, type RunStatus, type Tool, type ToolRecord } from './types.js';
+import { DecisionError, LimitError, type DecisionProvider, type HarnessEvent, type HarnessEventData, type RunResult, type RunStatus, type Tool, type ToolContext, type ToolRecord } from './types.js';
 import { defineRouter, route, type RouteTable } from './sdk/index.js';
 
 export const DEFAULT_LIMITS = { maxTurns: 50, maxRequests: 512, maxGenerationSteps: 256, maxRunMs: 300_000 } as const;
@@ -36,6 +38,11 @@ export interface HarnessOptions {
   journalDirectory?: string | false;
   onEvent?: (event: HarnessEvent) => void | Promise<void>;
   authorize?: (tool: Tool, args: Record<string, string | number | boolean>, signal: AbortSignal) => boolean | Promise<boolean>;
+  /**
+   * Optional post-completion verifier (the eval checker). It runs after an accepted finish; on
+   * failure its reason is appended as input and the loop continues once, bounded per run.
+   */
+  verify?: (workspace: string) => Promise<{ ok: boolean; reason: string }>;
 }
 
 const trim = (text: string, size = 6000): string => text.length <= size ? text : text.slice(0, size) + `\n[${text.length - size} characters omitted; read a targeted range for more]`;
@@ -148,6 +155,158 @@ export class Harness {
     return feedback === undefined ? { criteria } : { criteria, feedback };
   }
 
+  /**
+   * Runtime repair for a failed shell result: attribute the failure to a Python decision, rebuild
+   * the affected file(s), write them through the normal write tool (host authorization included),
+   * and re-run the same command. Bounded to two repair cycles per target; the caller journals notes
+   * when repair is unavailable or exhausted. Non-Python runtime repair is out of scope.
+   */
+  private async repairRuntimeFailure(args: {
+    record: ToolRecord;
+    tool: Tool;
+    context: ToolContext;
+    decisions: Decisions;
+    options: Omit<GenerateOptions, 'allowEmpty' | 'maxBytes'>;
+    workspace: string;
+    runContext: RunContext;
+    signal: AbortSignal;
+    turn: number;
+    cycles: Map<string, number>;
+    noted: Set<string>;
+    emit: <K extends keyof HarnessEventData>(type: K, data: HarnessEventData[K]) => Promise<void>;
+    note: (message: string) => Promise<void>;
+  }): Promise<ToolRecord | undefined> {
+    const { tool, context, decisions, options, workspace, runContext, signal, turn, cycles, noted, emit, note } = args;
+    let record = args.record;
+    for (let cycle = 0; cycle < 2; cycle++) {
+      const attribution = attributeFailure(runContext, record.result.output, workspace);
+      if (attribution === undefined) {
+        // A Python traceback that maps to no recorded slot has no repair path; journal one note.
+        const key = record.result.output.slice(0, 160);
+        if (cycle === 0 && /Traceback \(most recent call last\)/.test(record.result.output) && !noted.has(key)) {
+          noted.add(key);
+          await note('the Python traceback could not be attributed to a generated decision; fix the failure directly.');
+        }
+        return cycle === 0 ? undefined : record;
+      }
+      const used = cycles.get(attribution.target) ?? 0;
+      if (used >= 2) {
+        await note(`Repair budget exhausted for ${attribution.target} after 2 cycles; the failure must be fixed directly.`);
+        return record;
+      }
+      cycles.set(attribution.target, used + 1);
+      const repaired = await this.applyRepair(attribution, decisions, options, workspace, runContext);
+      if (repaired === undefined) {
+        await note(`Runtime repair for ${attribution.target} found no usable decision path; fix the failure directly.`);
+        return record;
+      }
+      if (!(await this.writeRepaired(repaired, attribution, turn, workspace, runContext, context, signal, emit))) return record;
+      await emit('tool_start', { tool: record.tool, args: record.args });
+      const retry = await tool.execute(record.args, context);
+      const retryRecord: ToolRecord = { turn, tool: record.tool, args: record.args, result: retry,
+        repair: { kind: repaired.outcome.kind, ...(repaired.outcome.decisionId === undefined ? {} : { decisionId: repaired.outcome.decisionId }), ...(repaired.outcome.forced === undefined ? {} : { forced: repaired.outcome.forced }), ...(repaired.outcome.notes.length ? { notes: [...repaired.outcome.notes] } : {}), target: attribution.target, cycle: cycle + 1 } };
+      await emit('tool_end', retryRecord);
+      record = retryRecord;
+      if (retry.ok) {
+        cycles.delete(attribution.target);
+        return record;
+      }
+    }
+    const remaining = attributeFailure(runContext, record.result.output, workspace);
+    if (remaining !== undefined) await note(`Repair budget exhausted for ${remaining.target} after 2 cycles; the failure must be fixed directly.`);
+    return record;
+  }
+
+  /** Per-field generation limits for a repair rebuild, mirroring generateArguments' field handling. */
+  private repairOptions(field: string, base: Omit<GenerateOptions, 'allowEmpty' | 'maxBytes'>): GenerateOptions {
+    for (const tool of this.registry.values()) {
+      const spec = tool.fields[field];
+      if (spec !== undefined) return { ...base, maxBytes: spec.type === 'string' ? spec.maxBytes ?? 256_000 : 256_000, allowEmpty: spec.type === 'string' ? spec.allowEmpty ?? false : false };
+    }
+    return { ...base, maxBytes: 256_000, allowEmpty: false };
+  }
+
+  /**
+   * Rebuild the file(s) for one attribution. Refuses to touch any file of the target that changed
+   * after generation (the model may have edited it), and treats a rebuild error as repair unavailable.
+   */
+  private async applyRepair(attribution: FailureAttribution, decisions: Decisions, base: Omit<GenerateOptions, 'allowEmpty' | 'maxBytes'>, workspace: string, runContext: RunContext): Promise<PythonRepairResult | undefined> {
+    const files = new Set<string>([attribution.path]);
+    for (const [key, map] of runContext.lines) {
+      const slot = [...map.values()][0];
+      if (slot?.target === attribution.target) files.add(key);
+    }
+    for (const key of files) {
+      const expected = runContext.sourceFor(key);
+      if (expected === undefined) continue;
+      const current = await readFile(join(workspace, key), 'utf8').catch(() => undefined);
+      if (current !== expected) return undefined;
+    }
+    try { return await repairPythonFailure(decisions, runContext, attribution, this.repairOptions(attribution.field, base)); }
+    catch { return undefined; }
+  }
+
+  /** Write repaired files through the registry's write tool; returns false when the host declines or the write fails. */
+  private async writeRepaired(repaired: PythonRepairResult, attribution: FailureAttribution, turn: number, workspace: string, runContext: RunContext, context: ToolContext, signal: AbortSignal,
+    emit: <K extends keyof HarnessEventData>(type: K, data: HarnessEventData[K]) => Promise<void>): Promise<boolean> {
+    const entries = Object.entries(repaired.files);
+    if (!entries.length) return false;
+    const tool = entries.length > 1 ? this.registry.get('write_files') : this.registry.get('write_file');
+    if (tool === undefined) return false;
+    const args: ToolRecord['args'] = entries.length > 1 ? { files: JSON.stringify(repaired.files) } : { path: entries[0]![0], content: entries[0]![1] };
+    const authorized = await this.options.authorize?.(tool, args, signal) ?? true;
+    if (!authorized) return false;
+    signal.throwIfAborted();
+    await emit('tool_start', { tool: tool.name, args });
+    const result = await tool.execute(args, context);
+    const record: ToolRecord = { turn, tool: tool.name, args, result,
+      repair: { kind: repaired.outcome.kind, ...(repaired.outcome.decisionId === undefined ? {} : { decisionId: repaired.outcome.decisionId }), ...(repaired.outcome.forced === undefined ? {} : { forced: repaired.outcome.forced }), ...(repaired.outcome.notes.length ? { notes: [...repaired.outcome.notes] } : {}), target: attribution.target } };
+    await emit('tool_end', record);
+    if (!result.ok) return false;
+    if (tool.name === 'write_file') {
+      // Single-file writes know the concrete path only now; move the recorded lines/source to it.
+      const bodyField = Object.keys(tool.fields).find(name => name !== 'path' && tool.fields[name]!.type === 'string');
+      if (bodyField !== undefined) runContext.adoptWrittenFile(bodyField, String(args.path));
+    }
+    return true;
+  }
+
+  /**
+   * Post-completion verification: run the verify hook, then repair attributable failures (up to two
+   * cycles per target) and verify again. Returns the last verification result.
+   */
+  private async verifyRun(args: {
+    workspace: string;
+    decisions: Decisions;
+    options: Omit<GenerateOptions, 'allowEmpty' | 'maxBytes'>;
+    runContext: RunContext;
+    signal: AbortSignal;
+    context: ToolContext;
+    turn: number;
+    cycles: Map<string, number>;
+    emit: <K extends keyof HarnessEventData>(type: K, data: HarnessEventData[K]) => Promise<void>;
+  }): Promise<{ ok: boolean; reason: string }> {
+    const verify = this.options.verify;
+    if (verify === undefined) return { ok: true, reason: '' };
+    const run = async (): Promise<{ ok: boolean; reason: string }> => verify(args.workspace)
+      .then(result => ({ ok: result.ok === true, reason: typeof result.reason === 'string' ? result.reason : '' }))
+      .catch((error: unknown) => ({ ok: false, reason: `verifier threw: ${error instanceof Error ? error.message : String(error)}` }));
+    let result = await run();
+    for (let cycle = 0; !result.ok && cycle < 2; cycle++) {
+      const attribution = attributeFailure(args.runContext, result.reason, args.workspace);
+      if (attribution === undefined) break;
+      const used = args.cycles.get(attribution.target) ?? 0;
+      if (used >= 2) break;
+      args.cycles.set(attribution.target, used + 1);
+      const repaired = await this.applyRepair(attribution, args.decisions, args.options, args.workspace, args.runContext);
+      if (repaired === undefined) break;
+      if (!(await this.writeRepaired(repaired, attribution, args.turn, args.workspace, args.runContext, args.context, args.signal, args.emit))) break;
+      result = await run();
+      if (result.ok) args.cycles.delete(attribution.target);
+    }
+    return result;
+  }
+
   async run(prompt: string, externalSignal?: AbortSignal): Promise<RunResult> {
     if (this.running) throw new Error('A harness instance supports one active run.');
     if (!prompt.trim() || prompt.length > 32_000) throw new Error('Prompt must contain 1–32000 characters.');
@@ -162,7 +321,9 @@ export class Harness {
     const records: ToolRecord[] = [];
     const turnTimings: RunResult['turnTimings'] = [];
     const messages = [/^(?:retry|try again)[.!]?$/i.test(prompt.trim()) ? this.conversation.at(-1)?.prompt ?? prompt : prompt];
-    let turn = 0, plan = '', completionRejections = 0;
+    const repairCycles = new Map<string, number>();
+    const unattributedNotes = new Set<string>();
+    let turn = 0, plan = '', completionRejections = 0, verifyContinuations = 0;
     let journal: string | undefined;
     let journalHandle: FileHandle | undefined;
     let eventQueue = Promise.resolve();
@@ -174,6 +335,13 @@ export class Harness {
       });
       eventQueue = write.catch(() => {});
       return write;
+    };
+    // A repair note is journaled as input and carried into the conversation, so the model knows
+    // automatic repair was attempted (and why it stopped) before it chooses the next action.
+    const repairNote = async (message: string): Promise<void> => {
+      const instruction = `Repair note: ${message}`;
+      messages.push(instruction);
+      await emit('input', { instruction });
     };
     const decisions = new Decisions(this.options.provider, this.options.maxRequests ?? DEFAULT_LIMITS.maxRequests, signal, data => emit('decision', data), this.options.concurrency ?? 4, undefined, runContext);
     let status: RunStatus = 'limited', summary = 'Turn budget exhausted; task was not reported complete.';
@@ -282,6 +450,24 @@ export class Harness {
               }
               continue;
             }
+            // Checker-driven continuation: the verifier runs after an accepted finish; a failure is
+            // repaired when attributable, otherwise appended as input and the loop continues once.
+            if (this.options.verify) {
+              const verification = await this.verifyRun({ workspace, decisions, options: generationOptions, runContext, signal, context, turn, cycles: repairCycles, emit });
+              if (!verification.ok) {
+                if (verifyContinuations >= 1) {
+                  status = 'limited';
+                  summary = `${completionSummary(records)}\nVerification failed after one continuation: ${trim(verification.reason, 2000)}`;
+                  break;
+                }
+                verifyContinuations++;
+                const reason = `Verification failed: ${verification.reason} Repair the cause and finish again.`;
+                messages.push(reason);
+                await emit('input', { instruction: reason });
+                await fail(reason);
+                continue;
+              }
+            }
           }
           if (this.pendingInputs.length) {
             await fail('New user instructions arrived. Apply them before ending the run.');
@@ -314,7 +500,17 @@ export class Harness {
           records.push(record);
           if (result.ok && tool.effect === 'write' && action !== 'set_plan') completionRejections = 0;
           if (result.ok && typeof result.data?.plan === 'string') plan = result.data.plan;
+          if (result.ok && action === 'write_file' && typeof args.path === 'string') {
+            // Single-file Python writes are generated under the body field name; the concrete path
+            // is known only now, so move the recorded line map/source for runtime attribution.
+            const bodyField = Object.keys(tool.fields).find(name => name !== 'path' && tool.fields[name]!.type === 'string');
+            if (bodyField !== undefined) runContext.adoptWrittenFile(bodyField, args.path);
+          }
           await emit('tool_end', record);
+          if (!result.ok && tool.effect === 'shell') {
+            const repaired = await this.repairRuntimeFailure({ record, tool, context, decisions, options: generationOptions, workspace, runContext, signal, turn, cycles: repairCycles, noted: unattributedNotes, emit, note: repairNote });
+            if (repaired !== undefined) records[records.length - 1] = repaired;
+          }
         } catch (error) {
           if (signal.aborted || error instanceof DecisionError || (error instanceof LimitError && decisions.exhausted)) throw error;
           await fail(error instanceof Error ? error.message : String(error), args);

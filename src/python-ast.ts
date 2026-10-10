@@ -4,12 +4,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Decisions, State } from './decisions.js';
 import type { GenerateOptions } from './generation.js';
-import { assemble, assembleProject, cachedPeer, decompose, decomposeLayout, dropUnitCache, fillUnits, invalidateCachedBodies, isEntry, loadUnitCache, normalizeUnitTask, peersOf, saveUnitCache, unitFromCached, unitToCached, type Layout, type Peer, type Unit, type UnitCheck, type UnitRepair } from './python-units.js';
+import { assemble, assembleProject, cachedPeer, commitRepairedUnit, decompose, decomposeLayout, dropUnitCache, ENTRY, fillUnits, invalidateCachedBodies, isEntry, loadUnitCache, normalizeUnitTask, peersOf, saveUnitCache, unitAttemptPath, unitFromCached, unitToCached, type FailureAttribution, type Layout, type Peer, type Unit, type UnitCacheEntry, type UnitCheck, type UnitRepair } from './python-units.js';
 import { RUBRIC, wantsReturn } from './python-search.js';
 import { gridCursor } from './grid.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
 import { astDecisionState, PENDING } from './decision-context.js';
-import { attemptScope, type DecisionKind } from './run-context.js';
+import { attemptScope, type DecisionKind, type DecisionPathEntry, type LineSlot, type RunContext } from './run-context.js';
 import { sanitizedEnv } from './env.js';
 import { LimitError } from './types.js';
 import { identifierCandidates, numberCandidates, objectiveWords, phraseLiterals, quotedLiterals, stringCandidates } from './vocab.js';
@@ -234,7 +234,14 @@ export async function checkCandidate(source: string, spec: CandidateSpec, signal
 
 export interface Shared { field: string; options: GenerateOptions; objective: string; context: State; budget: { step: number }; vocab: Vocab; maxDepth: number }
 export interface StepInfo { slot: string; production: string; symbols: string[] }
-export interface BuilderInput { decisions: Decisions; render: () => Promise<string>; report: (preview: string, info: StepInfo) => Promise<void>; unit?: string; peers?: Peer[]; candidate?: number; repair?: UnitRepair }
+/** Deterministic replay of a recorded decision path with one forced leaf answer. */
+export interface BuilderReplay {
+  path: readonly DecisionPathEntry[];
+  /** Decision to override; other decisions use their recorded labels. */
+  forceId?: number;
+  forced?: string;
+}
+export interface BuilderInput { decisions: Decisions; render: () => Promise<string>; report: (preview: string, info: StepInfo) => Promise<void>; unit?: string; peers?: Peer[]; candidate?: number; repair?: UnitRepair; replay?: BuilderReplay }
 
 const seeds = ['message', 'result', 'value', 'i', 'main', 'add', 'a', 'b', 'guess', 'target', 'attempts', 'randint', 'append', 'read', 'write', 'strip', 'lower'];
 
@@ -249,7 +256,7 @@ export function vocabulary(objective: string): Vocab {
 }
 
 export function createBuilder(shared: Shared, input: BuilderInput): Builder {
-  const { decisions, render, report, unit, peers, candidate, repair } = input;
+  const { decisions, render, report, unit, peers, candidate, repair, replay } = input;
   const { field, options, objective, context, budget, vocab, maxDepth } = shared;
   const { words, identifiers, strings, numbers } = vocab;
   const runContext = options.context ?? decisions.runContext;
@@ -260,13 +267,26 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
   const referenceForbidden = new Set<string>(repair?.reason === 'undefined' && repair.symbol !== undefined ? [repair.symbol] : []);
   const calleeForbidden = new Set<string>(repair?.reason === 'arity' && repair.symbol !== undefined ? [repair.symbol] : []);
   // A regenerated attempt starts a fresh decision path; its previous entries are invalidated.
-  runContext.beginAttempt(pathScope);
+  // A replay consumes the recorded path instead, so its entries must stay valid.
+  if (replay === undefined) runContext.beginAttempt(pathScope);
+  let replayIndex = 0;
 
   async function pick(slot: string, scope: Scope, criteria: Record<string, string>, depth = 0, kind: DecisionKind = 'structural'): Promise<string> {
     decisions.signal.throwIfAborted();
     if (++budget.step > options.maxSteps) throw new LimitError(`Python AST production budget exhausted (${options.maxSteps}).`);
     const keys = Object.keys(criteria);
     if (!keys.length) throw new Error(`No valid Python AST production for ${slot}.`);
+    if (replay !== undefined) {
+      // Deterministic replay: recorded labels answer the question; a single-label production is
+      // host-derived in both modes and never consumes a path entry. No provider request, no render.
+      if (keys.length === 1) return keys[0]!;
+      const entry = replay.path[replayIndex];
+      if (entry === undefined || entry.questionKey !== slot) throw new Error(`Replay path does not match the ${slot} decision.`);
+      replayIndex++;
+      const selected = entry.decisionId === replay.forceId && replay.forced !== undefined ? replay.forced : entry.chosen;
+      if (!Object.hasOwn(criteria, selected)) throw new Error(`Replay answer ${selected} is not a valid production for ${slot}.`);
+      return selected;
+    }
     const preview = await render();
     const instruction = `Choose the next valid Python AST production for ${slot}. The rendered source marks the slot being filled with ${PENDING}. Satisfy the objective with the smallest sufficient program. Complete the current slot only; do not add unrequested behavior.`;
     const symbols = visible(scope);
@@ -276,7 +296,7 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
       constraints: { depth, maxDepth, inFunction: scope.function, inLoop: scope.loop, remainingSteps: options.maxSteps - budget.step } };
     const state = astDecisionState({ objective, context, preview, core, questions, cap: MAX_GRID_REQUEST_BYTES });
     const selected = keys.length === 1 ? keys[0]!
-      : (await decisions.chooseWithAlternatives(state, instruction, criteria, { scope: pathScope, questionKey: slot, kind, context: runContext })).choice;
+      : (await decisions.chooseWithAlternatives(state, instruction, criteria, { scope: pathScope, questionKey: slot, kind, context: runContext, answers: criteria })).choice;
     await report(preview, { slot, production: selected, symbols });
     return selected;
   }
@@ -450,8 +470,55 @@ export function unitCacheTarget(state: State, field: string): string {
   return typeof path === 'string' && path ? path : field;
 }
 
+/** Runtime-repair outcome, readable by the caller that requested the repair. */
+export interface RepairOutcome {
+  kind: 'unit-replay' | 'candidate-reuse' | 'module-substitution' | 'unit-regeneration' | 'module-regeneration' | 'none';
+  decisionId?: number;
+  forced?: string;
+  notes: string[];
+}
+
+export interface PythonRepairResult { files: Record<string, string>; outcome: RepairOutcome }
+
+interface RepairExecution { attribution: FailureAttribution; outcome: RepairOutcome }
+
+const decompositionSlot = (slot: string): boolean =>
+  slot === 'unit_count' || slot === 'package_name' || slot === 'module_count' || /^module_\d+_name$/.test(slot) || /^unit_\d+_/.test(slot);
+
+const moduleNameOf = (layout: Layout, path: string): string | undefined => {
+  if (path === `${ENTRY}.py`) return ENTRY;
+  const prefix = `${layout.pkg}/`;
+  return path.startsWith(prefix) ? `${layout.pkg}.${path.slice(prefix.length).replace(/\.py$/, '')}` : undefined;
+};
+
+/**
+ * Rebuild one file's line-to-slot map after assembly: a unit definition span (its `def` line plus
+ * every indented or blank line that follows) maps to that unit; every other line maps to the module
+ * block. The map is keyed by the written path so tracebacks resolve back to decisions.
+ */
+function recordFileLines(context: RunContext, key: string, target: string, field: string, source: string, fileUnits: readonly Unit[]): void {
+  const lines = source.split('\n');
+  const spans: Array<{ unit: string; start: number; end: number }> = [];
+  for (const unit of fileUnits) {
+    const at = lines.findIndex(line => line.startsWith(`def ${unit.name}(`));
+    if (at < 0) continue;
+    let end = at + 1;
+    while (end < lines.length && (lines[end]!.trim() === '' || /^\s/.test(lines[end]!))) end++;
+    spans.push({ unit: unit.name, start: at + 1, end });
+  }
+  const map = new Map<number, LineSlot>();
+  for (let line = 1; line <= lines.length; line++) {
+    const span = spans.find(candidate => line >= candidate.start && line <= candidate.end);
+    map.set(line, span === undefined
+      ? { slot: 'module_body', scope: attemptScope(field), target, field }
+      : { slot: 'function_body', unit: span.unit, scope: attemptScope(field, span.unit), target, field });
+  }
+  context.recordLineMap(key, map);
+  context.recordSource(key, source);
+}
+
 /** Decomposition first, then unit bodies concurrently, then the main block; zero units is the plain single-scope path. */
-async function generate(decisions: Decisions, state: State, field: string, options: GenerateOptions, project: boolean): Promise<string> {
+async function generate(decisions: Decisions, state: State, field: string, options: GenerateOptions, project: boolean, repair?: RepairExecution): Promise<string> {
   const task = state.task as { prompt?: string; updates?: string[] } | undefined;
   const objective = [task?.prompt ?? '', ...(task?.updates ?? [])].join('\n');
   const shared: Shared = { field, options, objective, context: compactContext(state), budget: { step: 0 }, vocab: vocabulary(objective), maxDepth: 8 };
@@ -463,14 +530,23 @@ async function generate(decisions: Decisions, state: State, field: string, optio
   const rootScope: Scope = { names: new Map(), function: false, loop: false };
   const peers: Peer[] = [];
   const runContext = options.context ?? decisions.runContext;
-  const root = createBuilder(shared, { decisions, peers, render: () => previewOf(tree), report: (preview, info) => emit(preview, info) });
   const target = unitCacheTarget(state, field);
   const taskText = normalizeUnitTask(objective);
-  const cached = loadUnitCache(runContext, target, taskText);
+  runContext.recordGenerationTask(target, taskText, project);
+  const attribution = repair?.attribution;
+  // Repair trusts the cached entry directly: the failure names the exact generation being repaired.
+  const cached = attribution === undefined ? loadUnitCache(runContext, target, taskText) : runContext.units.get(target) as UnitCacheEntry | undefined;
+  // A cache-less repair is only possible for a single file whose whole program is module statements.
+  if (attribution !== undefined && cached === undefined && project) throw new Error(`No validated unit tree for ${target}; runtime repair is unavailable.`);
+  const repairWithoutTree = attribution !== undefined && cached === undefined;
+  const makeRoot = (replay?: BuilderReplay): Builder => createBuilder(shared, {
+    decisions, peers, ...(replay === undefined ? {} : { replay }), render: () => previewOf(tree), report: (preview, info) => emit(preview, info),
+  });
   let layout: Layout | undefined;
   let units: Unit[];
   let pending: Unit[];
   let reused = false;
+  let root: Builder | undefined;
   if (cached !== undefined && (project ? cached.layout !== undefined : cached.layout === undefined)) {
     // Within-run reuse: restore the validated unit tree, then revalidate each unit before trusting it.
     reused = true;
@@ -483,12 +559,20 @@ async function generate(decisions: Decisions, state: State, field: string, optio
       units.push(unit);
       if (item.body === undefined) pending.push(unit);
     }
+    // A repair replays the recorded module path instead of invalidating it with a fresh attempt.
+    if (attribution === undefined) root = makeRoot();
+  } else if (repairWithoutTree) {
+    // Zero-unit single file: no cache entry exists, and the recorded module path is the whole program.
+    units = [];
+    pending = [];
   } else {
     if (cached !== undefined) dropUnitCache(runContext, target);
+    root = makeRoot();
     layout = project ? await decomposeLayout(root, rootScope) : undefined;
     units = await decompose(root, rootScope, shared.vocab, peers, layout);
     pending = units;
   }
+  let repairedUnit: Unit | undefined;
   if (units.length) {
     for (const unit of units) rootScope.names.set(unit.name, { kind: 'function', arity: unit.arity });
     (tree.body as PythonNode[]).push(...units.map(unit => unit.def));
@@ -505,6 +589,7 @@ async function generate(decisions: Decisions, state: State, field: string, optio
         return diagnosis === undefined ? undefined : { reason: diagnosis.reason, ...(diagnosis.symbol === undefined ? {} : { symbol: diagnosis.symbol }) };
       },
     };
+    const scopeFor = (unit: Unit): Scope => ({ names: new Map(unit.params.map(p => [p, { kind: 'parameter' as const }])), parent: parentFor(unit), function: true, loop: false });
     const validated = new Set<string>();
     if (reused) {
       // A cached unit that fails its check is regenerated in this attempt instead of being reused.
@@ -513,6 +598,60 @@ async function generate(decisions: Decisions, state: State, field: string, optio
         const source = await unitCheck.render(unit, unit.body);
         if ((await unitCheck.check(unit, source)) === undefined) validated.add(unit.name);
         else { unit.body.length = 0; pending.push(unit); }
+      }
+    }
+    // Repair for a unit-body failure: replay the recorded leaf alternatives (or reuse a retained
+    // search candidate) before falling back to regenerating this one unit.
+    const replayUnitRepair = async (unit: Unit): Promise<{ kind: 'replay'; body: PythonNode[]; decisionId: number; forced: string } | { kind: 'candidate'; body: PythonNode[] } | undefined> => {
+      const attempt = unitAttemptPath(runContext, field, unit.name, attribution?.scope);
+      const path = attempt.entries;
+      const failingEntry = attribution?.decisionId === undefined ? undefined : path.find(entry => entry.decisionId === attribution.decisionId);
+      // Leaf-only contract: a structural failure never replays; it regenerates instead.
+      if (attribution?.decisionId !== undefined && failingEntry?.kind === 'leaf') {
+        for (const label of attribution.forced) {
+          const body: PythonNode[] = [];
+          try {
+            await createBuilder(shared, {
+              decisions, unit: unit.name, peers: peersOf(unit, peers), replay: { path, forceId: attribution.decisionId, forced: label },
+              render: () => previewOf(node('Module', { body: [defOf(unit, body)], type_ignores: [] })), report: async () => {},
+            }).block(body, scopeFor(unit), 1, 'function_body');
+          } catch { continue; }
+          try {
+            const source = await unitCheck.render(unit, body);
+            if ((await unitCheck.check(unit, source)) === undefined) return { kind: 'replay', body, decisionId: attribution.decisionId, forced: label };
+          } catch { continue; }
+        }
+      }
+      // Retained validated search candidates are repair candidates; revalidate before reuse.
+      for (const candidate of runContext.candidatesFor(target, unit.name)) {
+        const body = structuredClone(candidate) as PythonNode[];
+        try {
+          const source = await unitCheck.render(unit, body);
+          if ((await unitCheck.check(unit, source)) === undefined) return { kind: 'candidate', body };
+        } catch { continue; }
+      }
+      return undefined;
+    };
+    if (attribution?.unit !== undefined) {
+      const unit = units.find(candidate => candidate.name === attribution.unit);
+      if (unit === undefined) repair?.outcome.notes.push(`the failing unit ${attribution.unit} is not in the cached tree`);
+      else {
+        const attempt = await replayUnitRepair(unit);
+        if (attempt !== undefined) {
+          unit.body.splice(0, unit.body.length, ...attempt.body);
+          validated.add(unit.name);
+          pending = pending.filter(candidate => candidate !== unit);
+          if (attempt.kind === 'replay') {
+            repairedUnit = unit;
+            if (repair) { repair.outcome.kind = 'unit-replay'; repair.outcome.decisionId = attempt.decisionId; repair.outcome.forced = attempt.forced; }
+          } else if (repair) { repair.outcome.kind = 'candidate-reuse'; repair.outcome.notes.push(`reused a retained search candidate for ${unit.name}`); }
+        } else {
+          // Terminal fallback: regenerate the narrowest unit (this one), cache invalidated.
+          invalidateCachedBodies(runContext, target, [unit.name]);
+          unit.body.length = 0;
+          if (!pending.includes(unit)) pending.push(unit);
+          if (repair) { repair.outcome.kind = 'unit-regeneration'; repair.outcome.notes.push(`no replay alternative for ${unit.name}; the unit is regenerated`); }
+        }
       }
     }
     try {
@@ -528,40 +667,113 @@ async function generate(decisions: Decisions, state: State, field: string, optio
           task: { prompt: objective },
           generation: { field, phase: 'search', slot: 'candidate_score', unit: unit.name, candidate, spec: { name: unit.name, arity: unit.arity, purpose: unit.purpose, params: unit.params }, peers: peersOf(unit, peers).map(p => ({ ...p })), candidateSource: source },
         }, `Rate how well this candidate body for ${unit.name} fulfils its purpose: ${unit.purpose}. Judge correctness for the objective and minimality; unrequested behavior lowers the level.`, RUBRIC)).expected,
-        report: async (unit, c) => options.onText?.(field, c.source, false, { replace: c.source }, {
-          decoder: 'search', step: shared.budget.step, cursor: gridCursor(c.source), bytes: Buffer.byteLength(c.source),
-          ast: { slot: 'candidate', production: c.kept ? 'kept' : 'dropped', symbols: [], unit: unit.name, candidate: c.index, kept: c.kept, ...(c.reason === undefined ? {} : { reason: c.reason }) },
-        }),
+        report: async (unit, c) => {
+          // Validated-but-dropped candidates are retained as repair candidates and journaled below.
+          if (c.reason === undefined && !c.kept) runContext.retainCandidates(target, unit.name, [structuredClone(c.body)]);
+          options.onText?.(field, c.source, false, { replace: c.source }, {
+            decoder: 'search', step: shared.budget.step, cursor: gridCursor(c.source), bytes: Buffer.byteLength(c.source),
+            ast: { slot: 'candidate', production: c.kept ? 'kept' : 'dropped', symbols: [], unit: unit.name, candidate: c.index, kept: c.kept, ...(c.reason === undefined ? {} : { reason: c.reason }) },
+          });
+        },
       } : undefined, unit => runContext.invalidateUnitAttempts(field, unit.name), unit => validated.add(unit.name));
     } finally {
       // A failed write keeps every unit that validated before the failure; only the rest regenerate.
       saveUnitCache(runContext, target, { task: taskText, ...(layout === undefined ? {} : { layout: structuredClone(layout) }), units: units.map(unit => unitToCached(unit, validated.has(unit.name))) });
     }
   }
-  await root.block(tree.body as PythonNode[], rootScope, 0, 'module_body');
+  // Module block: normal generation, or for a repair the recorded module path replayed with the
+  // failing leaf substituted (a unit-scope failure replays the module path unchanged, no requests).
+  const replayModuleBlock = async (): Promise<void> => {
+    const modulePath = runContext.pathFor(attemptScope(field)).filter(entry => !decompositionSlot(entry.questionKey));
+    const failingEntry = attribution?.decisionId === undefined ? undefined : modulePath.find(entry => entry.decisionId === attribution.decisionId);
+    // Leaf-only contract: only a leaf decision can be substituted, and a module-scope failure
+    // without a usable forced alternative cannot be fixed by replaying the module path unchanged.
+    const moduleRepair = attribution !== undefined && attribution.unit === undefined;
+    const forced = moduleRepair && failingEntry?.kind === 'leaf' ? attribution.forced : [];
+    const decisionId = attribution?.decisionId;
+    if (modulePath.length && (!moduleRepair || forced.length > 0)) {
+      for (const label of (forced.length ? forced : [undefined])) {
+        const snapshot = [...(tree.body as PythonNode[])];
+        try {
+          const builder = makeRoot({ path: modulePath, ...(label === undefined || decisionId === undefined ? {} : { forceId: decisionId, forced: label }) });
+          await builder.block(tree.body as PythonNode[], rootScope, 0, 'module_body');
+          if (repair !== undefined && label !== undefined && decisionId !== undefined) {
+            repair.outcome.kind = 'module-substitution';
+            repair.outcome.decisionId = decisionId;
+            repair.outcome.forced = label;
+          }
+          return;
+        } catch {
+          (tree.body as PythonNode[]).length = 0;
+          (tree.body as PythonNode[]).push(...snapshot);
+        }
+      }
+    }
+    // No usable recorded path, or every forced alternative mismatched: regenerate the module block.
+    runContext.invalidateScope(attemptScope(field));
+    await makeRoot().block(tree.body as PythonNode[], rootScope, 0, 'module_body');
+    if (repair !== undefined && moduleRepair && repair.outcome.kind === 'none') {
+      repair.outcome.kind = 'module-regeneration';
+      repair.outcome.notes.push('module replay was unavailable; the module block was regenerated');
+    }
+  };
+  const commitRepair = (): void => {
+    if (repair === undefined) return;
+    if (repairedUnit !== undefined) commitRepairedUnit(runContext, target, repairedUnit, units);
+    if (repair.outcome.decisionId !== undefined && repair.outcome.forced !== undefined) runContext.consumeAlternative(repair.outcome.decisionId, repair.outcome.forced);
+  };
+  if (attribution !== undefined) await replayModuleBlock();
+  else await root!.block(tree.body as PythonNode[], rootScope, 0, 'module_body');
   if (layout) {
     const files = assembleProject(tree, units, layout);
     const manifest: Record<string, string> = {};
     for (const [path, module] of Object.entries(files)) manifest[path] = (module.body as PythonNode[]).length ? await unparsePython(module, decisions.signal, options.maxBytes) : '';
     const text = JSON.stringify(manifest);
     if (Buffer.byteLength(text) > options.maxBytes) throw new LimitError('Python project exceeds its byte budget.');
-    if (reused) {
+    if (reused || repair !== undefined) {
       // Reused units skip per-attempt checks, so revalidate the assembled project before returning it.
       try { await validatePythonProject(manifest, decisions.signal); }
       catch (error) { invalidateCachedBodies(runContext, target); throw error; }
     }
+    for (const [path, source] of Object.entries(manifest)) recordFileLines(runContext, path, target, field, source, units.filter(unit => unit.module === moduleNameOf(layout!, path)));
+    commitRepair();
     await options.onText?.(field, text, true, { replace: text }, { decoder: 'ast', step: shared.budget.step, cursor: gridCursor(text), bytes: Buffer.byteLength(text) });
     return text;
   }
   if (units.length) assemble(tree, units);
   const source = await unparsePython(tree, decisions.signal, options.maxBytes);
-  if (reused) {
+  if (reused || repair !== undefined) {
     // Reused units skip per-attempt checks, so revalidate the assembled source before returning it.
     try { await validatePythonSource(source, decisions.signal); }
     catch (error) { invalidateCachedBodies(runContext, target); throw error; }
   }
+  recordFileLines(runContext, target, target, field, source, units);
+  commitRepair();
   await options.onText?.(field, source, true, { replace: source }, { decoder: 'ast', step: shared.budget.step, cursor: gridCursor(source), bytes: Buffer.byteLength(source) });
   return source;
+}
+
+/**
+ * Rebuild the file(s) for one runtime failure: unit-body failures replay the recorded leaf
+ * alternatives (or a retained search candidate) and regenerate only the failing unit otherwise;
+ * module-slot failures replay the module path with the failing leaf substituted. Returns undefined
+ * when there is no cached tree to repair from. Non-Python runtime repair is out of scope.
+ */
+export async function repairPythonFailure(decisions: Decisions, context: RunContext, attribution: FailureAttribution, options: GenerateOptions): Promise<PythonRepairResult | undefined> {
+  const entry = context.units.get(attribution.target) as UnitCacheEntry | undefined;
+  const recorded = context.generationTaskFor(attribution.target);
+  const task = entry?.task ?? recorded?.task;
+  if (task === undefined) return undefined;
+  const project = entry?.layout !== undefined || (recorded?.project ?? false);
+  if (entry === undefined && project) return undefined;
+  const state: State = {
+    task: { prompt: task, updates: [], turn: 1 },
+    ...(attribution.target === attribution.field ? {} : { argumentsSoFar: { path: attribution.target } }),
+  };
+  const outcome: RepairOutcome = { kind: 'none', notes: [] };
+  const text = await generate(decisions, state, attribution.field, options.context === undefined ? { ...options, context } : options, project, { attribution, outcome });
+  const files = project ? JSON.parse(text) as Record<string, string> : { [attribution.path]: text };
+  return { files, outcome };
 }
 
 export const generatePythonAst = (decisions: Decisions, state: State, field: string, options: GenerateOptions): Promise<string> => generate(decisions, state, field, options, false);

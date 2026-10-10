@@ -19,6 +19,10 @@ export interface DecisionPathEntry {
   /** Canonical near-tie flag: top-two gap <= 0.1 or the chosen label is not the probability argmax. */
   nearTie: boolean;
   kind: DecisionKind;
+  /** Criterion text of the chosen label, when the builder supplied it (used to match failure text). */
+  answer?: string;
+  /** The full label-to-criterion map for the question, when supplied (used to decode alternatives). */
+  answers?: Record<string, string>;
 }
 
 export interface PathDecisionRequest {
@@ -28,6 +32,10 @@ export interface PathDecisionRequest {
   kind: DecisionKind;
   /** Context to record into; defaults to the facade's shared context. */
   context?: RunContext;
+  /** Criterion text of the chosen label, for runtime-failure attribution. */
+  answer?: string;
+  /** The full label-to-criterion map for the question, so alternatives can be decoded. */
+  answers?: Record<string, string>;
 }
 
 export interface PathChoice {
@@ -42,6 +50,12 @@ export interface LineSlot {
   unit?: string;
   candidate?: number;
   decisionId?: number;
+  /** Attempt scope whose recorded decisions produced this line, for failure attribution. */
+  scope?: string;
+  /** Unit-cache target the written file belongs to. */
+  target?: string;
+  /** Generation field that produced the written file. */
+  field?: string;
 }
 
 /** A per-run resource (the Python serializer worker) owned and disposed by the context. */
@@ -77,6 +91,9 @@ export class RunContext {
 
   private readonly paths = new Map<string, DecisionPathEntry[]>();
   private readonly byId = new Map<number, DecisionPathEntry>();
+  private readonly sources = new Map<string, string>();
+  private readonly candidates = new Map<string, unknown[]>();
+  private readonly generationTasks = new Map<string, { task: string; project: boolean }>();
   private nextDecisionId = 1;
   private worker: RunContextWorker | undefined;
   private disposed = false;
@@ -138,9 +155,84 @@ export class RunContext {
     map.set(line, slot);
   }
 
+  /** Replace the whole line map for a written file; used by assembly after each generation. */
+  recordLineMap(path: string, slots: ReadonlyMap<number, LineSlot>): void {
+    this.assertActive();
+    this.lines.set(path, new Map(slots));
+  }
+
   slotAtLine(path: string, line: number): LineSlot | undefined {
     this.assertActive();
     return this.lines.get(path)?.get(line);
+  }
+
+  /** Record the exact source generated for a file, so runtime repair can refuse to touch an edited file. */
+  recordSource(path: string, source: string): void {
+    this.assertActive();
+    this.sources.set(path, source);
+  }
+
+  sourceFor(path: string): string | undefined {
+    this.assertActive();
+    return this.sources.get(path);
+  }
+
+  /**
+   * Move the line map and source recorded under a generation field to the concrete written path
+   * (single-file writes know the path only after the tool runs). A no-op when they are the same.
+   */
+  adoptWrittenFile(from: string, to: string): void {
+    this.assertActive();
+    if (from === to) return;
+    const lines = this.lines.get(from);
+    if (lines !== undefined) {
+      this.lines.delete(from);
+      this.lines.set(to, lines);
+    }
+    const source = this.sources.get(from);
+    if (source !== undefined) {
+      this.sources.delete(from);
+      this.sources.set(to, source);
+    }
+  }
+
+  /** Retain validated-but-dropped search candidates for one (target, unit) as repair candidates. */
+  retainCandidates(target: string, unit: string, bodies: readonly unknown[]): void {
+    this.assertActive();
+    if (!bodies.length) return;
+    const key = `${target}${SEPARATOR}${unit}`;
+    this.candidates.set(key, [...(this.candidates.get(key) ?? []), ...bodies]);
+  }
+
+  candidatesFor(target: string, unit: string): readonly unknown[] {
+    this.assertActive();
+    return this.candidates.get(`${target}${SEPARATOR}${unit}`) ?? [];
+  }
+
+  /** Record the normalized task text a write target was generated for; runtime repair replays with it. */
+  recordGenerationTask(target: string, task: string, project: boolean): void {
+    this.assertActive();
+    this.generationTasks.set(target, { task, project });
+  }
+
+  generationTaskFor(target: string): { task: string; project: boolean } | undefined {
+    this.assertActive();
+    return this.generationTasks.get(target);
+  }
+
+  /**
+   * Consume a used repair alternative: the recorded choice moves to the forced label and the label
+   * leaves the retained alternatives, so the same runner-up is not replayed twice.
+   */
+  consumeAlternative(decisionId: number, label: string): boolean {
+    this.assertActive();
+    const entry = this.byId.get(decisionId);
+    if (entry === undefined || entry.chosen === label) return false;
+    entry.chosen = label;
+    const answer = entry.answers?.[label];
+    if (answer !== undefined) entry.answer = answer;
+    entry.alternatives = entry.alternatives.filter(alternative => alternative.label !== label);
+    return true;
   }
 
   setWorker(worker: RunContextWorker | undefined): void {
@@ -160,6 +252,9 @@ export class RunContext {
     this.byId.clear();
     this.units.clear();
     this.lines.clear();
+    this.sources.clear();
+    this.candidates.clear();
+    this.generationTasks.clear();
     await worker?.dispose();
   }
 

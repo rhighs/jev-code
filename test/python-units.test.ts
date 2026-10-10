@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import { Decisions } from '../src/decisions.js';
-import { createBuilder, generatePythonAst, vocabulary, type Shared } from '../src/python-ast.js';
+import { createBuilder, generatePythonAst, repairPythonFailure, vocabulary, type Shared } from '../src/python-ast.js';
 import { functionDef, node, type Builder, type PythonNode, type Scope } from '../src/python-nodes.js';
-import { commitRepairedUnit, dependentNames, fillUnits, loadUnitCache, saveUnitCache, unitFromCached, unitToCached, type Unit, type UnitCacheEntry, type UnitCheck, type UnitRepair } from '../src/python-units.js';
+import { attributeFailure, commitRepairedUnit, dependentNames, decodedAnswer, fillUnits, forcedLabels, loadUnitCache, saveUnitCache, unitFromCached, unitToCached, type Unit, type UnitCacheEntry, type UnitCheck, type UnitRepair } from '../src/python-units.js';
 import { attemptScope, createRunContext, type RunContext } from '../src/run-context.js';
 import { LimitError, type DecisionProvider } from '../src/types.js';
 import { SlotProvider, type SlotEntry } from './helpers.js';
@@ -433,5 +433,230 @@ test('a committed repair makes the next rewrite regenerate the caller and reuse 
   assert.ok(second.seen.some(entry => entry.generation.unit === 'greet'), 'the caller is regenerated');
   assert.ok(!second.seen.some(entry => entry.generation.unit === 'shout'), 'the repaired unit is reused');
   assert.ok(!second.seen.some(entry => entry.generation.slot === 'unit_count'), 'decomposition is skipped');
+  await context.dispose();
+});
+
+test('assembly records a per-file line-to-slot map and the generated source', async () => {
+  const context = createRunContext();
+  const provider = new GateProvider([...decomposition, ...bodies, ...main]);
+  const source = await generatePythonAst(inContext(provider, context), state, 'content', options);
+  assert.equal(context.sourceFor('content'), source);
+  const lines = source.split('\n');
+  const lineOf = (prefix: string): number => lines.findIndex(line => line.startsWith(prefix)) + 1;
+  assert.deepEqual(context.slotAtLine('content', lineOf('def greet(')), { slot: 'function_body', unit: 'greet', scope: attemptScope('content', 'greet'), target: 'content', field: 'content' });
+  assert.deepEqual(context.slotAtLine('content', lineOf('def greet(') + 1), { slot: 'function_body', unit: 'greet', scope: attemptScope('content', 'greet'), target: 'content', field: 'content' });
+  assert.deepEqual(context.slotAtLine('content', lineOf('def shout(')), { slot: 'function_body', unit: 'shout', scope: attemptScope('content', 'shout'), target: 'content', field: 'content' });
+  const moduleSlot = context.slotAtLine('content', lineOf('print('))!;
+  assert.equal(moduleSlot.slot, 'module_body');
+  assert.equal(moduleSlot.unit, undefined);
+  assert.equal(moduleSlot.scope, attemptScope('content'));
+  await context.dispose();
+});
+
+const traceback = (frames: Array<{ path: string; line: number; source: string }>, error: string): string =>
+  ['Traceback (most recent call last):', ...frames.flatMap(frame => [`  File "${frame.path}", line ${frame.line}, in module`, `    ${frame.source}`]), error].join('\n');
+
+test('a unit-body traceback maps to the failing leaf and replay rebuilds the source with no requests', async () => {
+  const context = createRunContext();
+  const provider = new GateProvider([...decomposition, ...bodies, ...main]);
+  const d = inContext(provider, context);
+  const source = await generatePythonAst(d, state, 'content', options);
+  context.adoptWrittenFile('content', 'main.py');
+  const leaf = context.pathFor(attemptScope('content', 'greet')).find(candidate => candidate.kind === 'leaf')!;
+  assert.ok(leaf.answer !== undefined && leaf.alternatives.length >= 2);
+
+  const text = traceback([{ path: '/ws/main.py', line: 3, source: "print(greet('greet'))" }, { path: '/ws/main.py', line: 2, source: "return 'greet'" }], 'TypeError: broken');
+  const attribution = attributeFailure(context, text, '/ws');
+  assert.ok(attribution, 'the traceback is attributable');
+  assert.equal(attribution.unit, 'greet');
+  assert.equal(attribution.target, 'content');
+  assert.equal(attribution.field, 'content');
+  assert.equal(attribution.path, 'main.py');
+  assert.equal(attribution.line, 2);
+  assert.equal(attribution.decisionId, leaf.decisionId, 'the failing leaf is matched by its answer on the frame line');
+  assert.deepEqual(attribution.forced, forcedLabels(leaf));
+
+  const before = provider.inner.calls;
+  const repaired = await repairPythonFailure(d, context, attribution, { ...options, context });
+  assert.ok(repaired, 'the repair rebuilds the file');
+  assert.equal(repaired.outcome.kind, 'unit-replay');
+  assert.equal(repaired.outcome.decisionId, leaf.decisionId);
+  assert.equal(repaired.outcome.forced, attribution.forced[0]);
+  assert.equal(provider.inner.calls, before, 'leaf replay asks no provider questions');
+  const expected = JSON.parse(leaf.answers![attribution.forced[0]!]!) as string;
+  assert.ok(repaired.files['main.py']!.includes(`return '${expected}'`), `the runner-up literal is replayed: ${expected}`);
+  assert.match(repaired.files['main.py']!, /print\(greet\('greet'\)\)/, 'the module path is replayed unchanged');
+  assert.equal(context.decisionEntry(leaf.decisionId)?.chosen, attribution.forced[0], 'the used alternative is consumed on commit');
+  await context.dispose();
+});
+
+test('a module-slot traceback substitutes the failing leaf in the assembled program', async () => {
+  const context = createRunContext();
+  const provider = new SlotProvider([
+    { slot: 'unit_count', answer: '0' },
+    { slot: 'module_body', answer: 'expr', once: true },
+    { slot: 'expression', answer: 'call' },
+    { slot: 'callee', answer: { value: 'print' } },
+    { slot: 'argument_count', answer: '1' },
+    { slot: 'argument_0', answer: 'binary' },
+    { slot: 'operator', answer: 'Div' },
+    { slot: 'left', answer: 'number' }, { slot: 'number', answer: { value: 1 }, once: true },
+    { slot: 'right', answer: 'number' }, { slot: 'number', answer: { value: 0 }, once: true },
+    { slot: 'module_body', answer: 'finish' },
+  ]);
+  const d = inContext(provider, context);
+  const source = await generatePythonAst(d, { task: { prompt: 'Print a division result.', turn: 1, updates: [] } }, 'content', options);
+  assert.equal(source, 'print(1 / 0)\n');
+  context.adoptWrittenFile('content', 'main.py');
+  const leaf = context.pathFor(attemptScope('content')).filter(candidate => candidate.kind === 'leaf').at(-1)!;
+  const attribution = attributeFailure(context, traceback([{ path: '/ws/main.py', line: 1, source: 'print(1 / 0)' }], 'ZeroDivisionError: division by zero'), '/ws');
+  assert.ok(attribution);
+  assert.equal(attribution.unit, undefined, 'the failing frame is a module line');
+  assert.equal(attribution.decisionId, leaf.decisionId);
+
+  const before = provider.calls;
+  const repaired = await repairPythonFailure(d, context, attribution, { ...options, context });
+  assert.ok(repaired);
+  assert.equal(repaired.outcome.kind, 'module-substitution');
+  assert.equal(repaired.files['main.py'], 'print(1 / 1)\n');
+  assert.equal(provider.calls, before, 'module substitution asks no provider questions');
+  await context.dispose();
+});
+
+test('a checker reason without a traceback maps to the recorded leaf by its answer text', async () => {
+  const context = createRunContext();
+  const provider = new GateProvider([...decomposition, ...bodies, ...main]);
+  await generatePythonAst(inContext(provider, context), state, 'content', options);
+  const attribution = attributeFailure(context, "main.py printed 'greet' but expected 'hello'", '/ws');
+  assert.ok(attribution);
+  assert.equal(attribution.unit, 'greet');
+  assert.equal(attribution.line, undefined);
+  const leaf = context.pathFor(attemptScope('content', 'greet')).find(candidate => candidate.kind === 'leaf')!;
+  assert.equal(attribution.decisionId, leaf.decisionId);
+  assert.deepEqual(attribution.forced, forcedLabels(leaf));
+  await context.dispose();
+});
+
+test('unattributable failure text returns undefined', async () => {
+  const context = createRunContext();
+  const provider = new GateProvider([...decomposition, ...bodies, ...main]);
+  await generatePythonAst(inContext(provider, context), state, 'content', options);
+  assert.equal(attributeFailure(context, 'command not found: frobnicate', '/ws'), undefined);
+  assert.equal(attributeFailure(context, 'Traceback (most recent call last):\n  File "other.py", line 2, in <module>\n    boom\n', '/ws'), undefined);
+  await context.dispose();
+});
+
+test('a unit path without leaf decisions skips replay and regenerates the narrowest unit', async () => {
+  const context = createRunContext();
+  const prompt = 'Write a Python helper echo(name) that returns its argument, then print it.';
+  const script: SlotEntry[] = [
+    { slot: 'unit_count', answer: '1' },
+    { slot: 'unit_0_name', answer: { value: 'echo' } }, { slot: 'unit_0_arity', answer: '1' }, { slot: 'unit_0_purpose', answer: { value: 'echo' } }, { slot: 'unit_0_parameter_0', answer: { value: 'name' } },
+    { unit: 'echo', slot: 'function_body', answer: 'return' }, { unit: 'echo', slot: 'expression', answer: 'name' },
+    { slot: 'module_body', answer: 'expr', once: true }, { slot: 'expression', answer: 'call' }, { slot: 'callee', answer: { value: 'print' }, once: true },
+    { slot: 'argument_count', answer: '1' }, { slot: 'argument_0', answer: 'call', once: true }, { slot: 'callee', answer: { value: 'echo' } },
+    { slot: 'argument_0', answer: 'string' }, { slot: 'string', answer: { value: 'name' } },
+    { slot: 'module_body', answer: 'finish' },
+  ];
+  const provider = new GateProvider(script);
+  const d = inContext(provider, context);
+  await generatePythonAst(d, { task: { prompt, turn: 1, updates: [] } }, 'content', options);
+  context.adoptWrittenFile('content', 'main.py');
+  const unitPath = context.pathFor(attemptScope('content', 'echo'));
+  assert.ok(unitPath.length >= 2 && unitPath.every(entry => entry.kind === 'structural'), 'the unit path has no leaf entries');
+  const attribution = attributeFailure(context, traceback([{ path: '/ws/main.py', line: 2, source: 'return name' }], 'NameError: name is not defined'), '/ws');
+  assert.ok(attribution);
+  assert.equal(attribution.unit, 'echo');
+  assert.equal(attribution.decisionId, undefined);
+  assert.deepEqual(attribution.forced, []);
+
+  const before = provider.inner.calls;
+  const repaired = await repairPythonFailure(d, context, attribution, { ...options, context });
+  assert.ok(repaired);
+  assert.equal(repaired.outcome.kind, 'unit-regeneration');
+  assert.ok(provider.inner.calls > before, 'the structural fallback regenerates the failing unit');
+  assert.match(repaired.files['main.py']!, /def echo\(name\):\n    return name\n/);
+  await context.dispose();
+});
+
+test('consuming a repair alternative moves the recorded choice and drops the used label', async () => {
+  const context = createRunContext();
+  const provider = new GateProvider([...decomposition, ...bodies, ...main]);
+  await generatePythonAst(inContext(provider, context), state, 'content', options);
+  const entry = context.pathFor(attemptScope('content', 'greet')).find(candidate => candidate.kind === 'leaf')!;
+  const forced = forcedLabels(entry)[0]!;
+  assert.equal(context.consumeAlternative(entry.decisionId, forced), true);
+  const after = context.decisionEntry(entry.decisionId)!;
+  assert.equal(after.chosen, forced);
+  assert.equal(after.answer, after.answers?.[forced]);
+  assert.ok(!after.alternatives.some(alternative => alternative.label === forced), 'the used alternative is dropped');
+  assert.equal(context.consumeAlternative(entry.decisionId, forced), false, 'consuming the same label twice is a no-op');
+  assert.equal(context.consumeAlternative(999_999, 'value_0'), false, 'unknown decisions are a no-op');
+  await context.dispose();
+});
+
+test('a validated dropped search candidate is reused when leaf replay is unavailable', async () => {
+  const context = createRunContext();
+  const prompt = 'Write a Python helper get_greeting(name) that returns the greeting text, then print it.';
+  const unit = 'get_greeting';
+  const provider = new SlotProvider([
+    { slot: 'unit_count', answer: '1' },
+    { slot: 'unit_0_name', answer: { value: unit } }, { slot: 'unit_0_arity', answer: '1' }, { slot: 'unit_0_purpose', answer: { value: 'returns the greeting' } }, { slot: 'unit_0_parameter_0', answer: { value: 'name' } },
+    { unit, candidate: 0, slot: 'function_body', answer: 'return' }, { unit, candidate: 0, slot: 'expression', answer: 'string' }, { unit, candidate: 0, slot: 'string', answer: { value: 'greeting' } },
+    { unit, candidate: 1, slot: 'function_body', answer: 'pass', once: true }, { unit, candidate: 1, slot: 'function_body', answer: 'finish', once: true },
+    { unit, candidate: 2, slot: 'function_body', answer: 'return' }, { unit, candidate: 2, slot: 'expression', answer: 'name' }, { unit, candidate: 2, slot: 'reference', answer: 'name_0' },
+    { slot: 'candidate_score', candidate: 0, answer: { score: 3 } }, { slot: 'candidate_score', candidate: 2, answer: { score: 2 } },
+    { slot: 'module_body', answer: 'expr', once: true }, { slot: 'expression', answer: 'call' }, { slot: 'callee', answer: { value: 'print' }, once: true },
+    { slot: 'argument_count', answer: '1' }, { slot: 'argument_0', answer: 'call', once: true }, { slot: 'callee', answer: { value: unit } },
+    { slot: 'argument_0', answer: 'string' }, { slot: 'string', answer: { value: 'name' } },
+    { slot: 'module_body', answer: 'finish' },
+  ]);
+  const d = inContext(provider, context);
+  await generatePythonAst(d, { task: { prompt, turn: 1, updates: [] } }, 'content', { ...options, searchWidth: 3 });
+  assert.equal(context.candidatesFor('content', unit).length, 1);
+
+  const attribution = { target: 'content', path: 'content', field: 'content', scope: attemptScope('content', unit), unit, forced: [] as string[], reason: 'runtime failure with no replayable leaf' };
+  const repaired = await repairPythonFailure(d, context, attribution, { ...options, context });
+  assert.ok(repaired);
+  assert.equal(repaired.outcome.kind, 'candidate-reuse');
+  assert.match(repaired.files['content']!, /def get_greeting\(name\):\n    return name\n/);
+  await context.dispose();
+});
+
+test('an alternative that cannot be replayed is discarded and the next one is used', async () => {
+  const context = createRunContext();
+  const provider = new GateProvider([...decomposition, ...bodies, ...main]);
+  const d = inContext(provider, context);
+  await generatePythonAst(d, state, 'content', options);
+  const leaf = context.pathFor(attemptScope('content', 'greet')).find(candidate => candidate.kind === 'leaf')!;
+  const good = forcedLabels(leaf)[0]!;
+  const attribution = { target: 'content', path: 'content', field: 'content', scope: attemptScope('content', 'greet'), unit: 'greet', decisionId: leaf.decisionId, chosen: leaf.chosen, forced: ['not_a_label', good], reason: 'x' };
+  const repaired = await repairPythonFailure(d, context, attribution, { ...options, context });
+  assert.ok(repaired);
+  assert.equal(repaired.outcome.kind, 'unit-replay');
+  assert.equal(repaired.outcome.forced, good, 'the invalid alternative is skipped and the next one is used');
+  await context.dispose();
+});
+
+test('a structural callee failure skips replay and regenerates deterministically', async () => {
+  const context = createRunContext();
+  const provider = new GateProvider([...decomposition,
+    { unit: 'greet', slot: 'function_body', answer: 'return' }, { unit: 'greet', slot: 'expression', answer: 'string' }, { unit: 'greet', slot: 'string', answer: { value: 'greet' } },
+    { unit: 'shout', slot: 'function_body', answer: 'return' }, { unit: 'shout', slot: 'expression', answer: 'call' }, { unit: 'shout', slot: 'callee', answer: { value: 'greet' } },
+    { unit: 'shout', slot: 'argument_0', answer: 'name' },
+    ...main]);
+  const d = inContext(provider, context);
+  await generatePythonAst(d, state, 'content', options);
+  const callee = context.pathFor(attemptScope('content', 'shout')).find(entry => entry.questionKey === 'callee')!;
+  assert.equal(callee.kind, 'structural');
+  assert.ok(forcedLabels(callee).length > 0, 'the structural decision has runner-ups that must not be replayed');
+
+  const attribution = { target: 'content', path: 'content', field: 'content', scope: attemptScope('content', 'shout'), unit: 'shout', decisionId: callee.decisionId, chosen: callee.chosen, forced: forcedLabels(callee), reason: 'x' };
+  const before = provider.inner.calls;
+  const repaired = await repairPythonFailure(d, context, attribution, { ...options, context });
+  assert.ok(repaired);
+  assert.equal(repaired.outcome.kind, 'unit-regeneration', 'a structural override never replays');
+  assert.ok(provider.inner.calls > before, 'the structural failure regenerates the unit');
+  assert.match(repaired.files['content']!, /def shout\(name\):\n    return greet\(name\)/);
   await context.dispose();
 });

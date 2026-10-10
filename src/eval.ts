@@ -102,7 +102,7 @@ export async function runEval(opts: RunEvalOptions): Promise<EvalRecord[]> {
         workspace: ws, provider: opts.provider, tools: builtInTools(), journalDirectory: join(resolve(opts.out), '.jev', 'eval', 'journals', task.name),
         maxTurns: task.limits.maxTurns ?? DEFAULT_LIMITS.maxTurns, maxRequests: task.limits.maxRequests ?? DEFAULT_LIMITS.maxRequests,
         maxGenerationSteps: task.limits.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, maxRunMs: task.limits.maxRunMs ?? DEFAULT_LIMITS.maxRunMs,
-        authorize: () => true, searchWidth: opts.searchWidth ?? 1, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}),
+        authorize: () => true, searchWidth: opts.searchWidth ?? 1, verify: task.check, ...(opts.onEvent ? { onEvent: opts.onEvent } : {}),
       });
       const result = await harness.run(task.prompt);
       const check = result.status === 'completed'
