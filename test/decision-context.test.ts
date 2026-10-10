@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
-import { buildDecisionContext, windowSource, PENDING, COMPLETION_COMPACTION, DECISION_COMPACTION, decisionChoiceBytes, decisionProbabilityBytes, fitDecisionState, MAX_DECISION_REQUEST_BYTES } from '../src/decision-context.js';
+import { buildDecisionContext, windowSource, PENDING, ACTION_COMPACTION, ACTION_COMPACTION_LEVELS, COMPLETION_COMPACTION, DECISION_COMPACTION, decisionChoiceBytes, decisionProbabilityBytes, fitDecisionState, fitDecisionStateDegrading, MAX_DECISION_REQUEST_BYTES } from '../src/decision-context.js';
 import { Decisions } from '../src/decisions.js';
 import { generatePythonAst } from '../src/python-ast.js';
 import { MAX_GRID_REQUEST_BYTES } from '../src/scored-grid.js';
@@ -159,4 +159,55 @@ test('choice and probability byte helpers measure the same question envelope the
   assert.equal(decisionChoiceBytes(state, 'Choose.', criteria), bytes({ state, questions: { selection: { type: 'choice', instructions: 'Choose.', criteria } } }));
   assert.equal(decisionProbabilityBytes(state, 'Are you sure?'), bytes({ state, questions: { verdict: { type: 'noul', instructions: 'Are you sure?' } } }));
   assert.ok(decisionChoiceBytes(state, 'Choose.', criteria) > decisionProbabilityBytes(state, 'Are you sure?'));
+});
+
+/** The action instruction embeds the task text, so the task is counted twice; mirror the harness measure. */
+const actionInstruction = (state: Record<string, unknown>): string => {
+  const task = state.task as { prompt?: unknown; updates?: unknown } | undefined;
+  const prompt = typeof task?.prompt === 'string' ? task.prompt : '';
+  const updates = Array.isArray(task?.updates) ? task.updates.filter((update): update is string => typeof update === 'string') : [];
+  return `Choose the next action for this coding task:\n${[prompt, ...updates].join('\nUpdate: ')}\nUse the actual workspace and tool outcomes to decide.`;
+};
+const actionMeasure = (state: Record<string, unknown>): number => decisionChoiceBytes(state, actionInstruction(state), {});
+const actionFit = (state: Record<string, unknown>, cap = MAX_DECISION_REQUEST_BYTES) =>
+  fitDecisionStateDegrading(state, actionMeasure, cap, ACTION_COMPACTION_LEVELS);
+
+test('several long updates fit the action profile after the carried task is clipped', () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ['8 updates of 4k', { task: { prompt: 'P'.repeat(4000), updates: Array.from({ length: 8 }, () => 'U'.repeat(4000)), turn: 6 } }],
+    ['8 updates of 10k', { task: { prompt: 'P'.repeat(4000), updates: Array.from({ length: 8 }, () => 'U'.repeat(10_000)), turn: 6 } }],
+    ['20 updates of 1k', { task: { prompt: 'P'.repeat(4000), updates: Array.from({ length: 20 }, () => 'U'.repeat(1000)), turn: 12 } }],
+  ];
+  for (const [name, state] of cases) {
+    assert.ok(actionMeasure(state) > MAX_DECISION_REQUEST_BYTES, `${name}: the raw action request is over the cap`);
+    const fit = actionFit(state);
+    assert.equal(fit.overBudget, false, `${name}: the action fit succeeds (${fit.bytes} bytes, trimmed ${fit.trimmed.join(', ') || 'none'})`);
+    assert.ok(fit.bytes <= MAX_DECISION_REQUEST_BYTES, `${name}: ${fit.bytes} bytes`);
+    const task = fit.state.task as { prompt: string; updates: string[] };
+    const updates = (state.task as { updates: string[] }).updates;
+    assert.ok(task.prompt.length < (state.task as { prompt: string }).prompt.length || task.updates.length < updates.length, `${name}: the task text was clipped`);
+    assert.ok(task.updates.length <= (ACTION_COMPACTION.task?.keep ?? 0), `${name}: the kept-update count matches the profile`);
+  }
+});
+
+test('degrading profiles clip the task further until the request fits', () => {
+  const state = { task: { prompt: 'P'.repeat(4000), updates: ['U'.repeat(2000)], turn: 3 } };
+  // A cap between the standard profile's task size and the second level's: only the harder clip fits.
+  const fit = actionFit(state, 3000);
+  assert.equal(fit.overBudget, false);
+  const task = fit.state.task as { prompt: string; updates: string[] };
+  assert.equal(task.prompt, `${'P'.repeat(800)}\n[context clipped]`, 'the second level clipped the prompt');
+  assert.equal(task.updates.length, 1);
+  assert.ok(fit.trimmed.includes('task'));
+  const single = fitDecisionState(state, actionMeasure, 3000, ACTION_COMPACTION);
+  assert.equal(single.overBudget, true, 'the standard profile alone misses this cap');
+});
+
+test('an unshrinkable action state reports over budget at the hardest level', () => {
+  const state = { task: { prompt: 'small task', updates: [] }, tools: [{ description: 'D'.repeat(30_000) }] };
+  const fit = actionFit(state);
+  assert.equal(fit.overBudget, true);
+  assert.ok(fit.bytes > MAX_DECISION_REQUEST_BYTES);
+  const task = fit.state.task as { prompt: string };
+  assert.equal(task.prompt, 'small task', 'a fitting task text is untouched while the bulk keeps the state over budget');
 });

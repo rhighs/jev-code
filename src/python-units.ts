@@ -393,10 +393,12 @@ const fieldOf = (slot: LineSlot): string => slot.field ?? (slot.scope === undefi
 /**
  * The recorded path for one unit attempt: the recorded scope while it still has entries, else the
  * kept search candidate's scope, else the first non-empty candidate scope (search width > 1 records
- * each candidate under its own scope). Scanning from zero is only a fallback for unknown targets;
- * resolving through the kept candidate keeps repair on the body that was actually written.
+ * each candidate under its own scope). `target` is the unit-cache target (the written path); it
+ * defaults to `field` for callers that only know the generation field. Scanning from zero is only a
+ * fallback for unknown targets; resolving through the kept candidate keeps repair on the body that
+ * was actually written.
  */
-export function unitAttemptPath(context: RunContext, field: string, unit: string, scope?: string): { scope?: string; entries: readonly DecisionPathEntry[] } {
+export function unitAttemptPath(context: RunContext, field: string, unit: string, scope?: string, target?: string): { scope?: string; entries: readonly DecisionPathEntry[] } {
   const attemptAt = (candidateScope: string | undefined): { scope: string; entries: readonly DecisionPathEntry[] } | undefined => {
     if (candidateScope === undefined) return undefined;
     const entries = context.pathFor(candidateScope);
@@ -404,11 +406,12 @@ export function unitAttemptPath(context: RunContext, field: string, unit: string
   };
   const recorded = attemptAt(scope);
   if (recorded !== undefined) return recorded;
-  const kept = context.keptCandidate(field, unit);
-  const keptAttempt = attemptAt(kept === undefined ? undefined : attemptScope(field, unit, kept));
+  const unitTarget = target ?? field;
+  const kept = context.keptCandidate(unitTarget, unit);
+  const keptAttempt = attemptAt(kept === undefined ? undefined : attemptScope(field, unit, kept, unitTarget));
   if (keptAttempt !== undefined) return keptAttempt;
   for (let candidate = 0; candidate < 8; candidate++) {
-    const candidateAttempt = attemptAt(attemptScope(field, unit, candidate));
+    const candidateAttempt = attemptAt(attemptScope(field, unit, candidate, unitTarget));
     if (candidateAttempt !== undefined) return candidateAttempt;
   }
   return { entries: [] };
@@ -484,7 +487,7 @@ export function attributeFailure(context: RunContext, text: string, workspace: s
   const field = fieldOf(chosen.slot);
   const attempt = chosen.slot.unit === undefined
     ? { scope: chosen.slot.scope, entries: chosen.slot.scope === undefined ? [] : context.pathFor(chosen.slot.scope) }
-    : unitAttemptPath(context, field, chosen.slot.unit, chosen.slot.scope);
+    : unitAttemptPath(context, field, chosen.slot.unit, chosen.slot.scope, chosen.slot.target);
   const leaf = failingLeaf(attempt.entries, chosen.frame.source ?? text);
   return {
     target: chosen.slot.target ?? chosen.key,

@@ -4,7 +4,7 @@ import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import { Decisions } from '../src/decisions.js';
 import { createBuilder, generatePythonAst, repairPythonFailure, vocabulary, type Shared } from '../src/python-ast.js';
 import { functionDef, node, type Builder, type PythonNode, type Scope } from '../src/python-nodes.js';
-import { attributeFailure, commitRepairedUnit, dependentNames, decodedAnswer, fillUnits, forcedLabels, loadUnitCache, saveUnitCache, unitAttemptPath, unitFromCached, unitToCached, type Unit, type UnitCheck, type UnitRepair } from '../src/python-units.js';
+import { attributeFailure, commitRepairedUnit, dependentNames, decodedAnswer, fillUnits, forcedLabels, invalidateCachedBodies, loadUnitCache, saveUnitCache, unitAttemptPath, unitFromCached, unitToCached, type Unit, type UnitCheck, type UnitRepair } from '../src/python-units.js';
 import { attemptScope, createRunContext, type RunContext } from '../src/run-context.js';
 import { LimitError, type DecisionEventData, type DecisionProvider } from '../src/types.js';
 import { SlotProvider, type SlotEntry } from './helpers.js';
@@ -256,7 +256,7 @@ test('a width-1 unit that fails its static check retries once with the reason an
 test('retry narrowing applies the reason table: arity forbids the peer, undefined drops the name, compile keeps criteria', async () => {
   const objective = 'shout the greet message';
   const context = createRunContext();
-  const shared: Shared = { field: 'content', options: { ...options, context }, objective, context: {}, budget: { step: 0 }, vocab: vocabulary(objective), maxDepth: 8 };
+  const shared: Shared = { field: 'content', target: 'content', options: { ...options, context }, objective, context: {}, budget: { step: 0 }, vocab: vocabulary(objective), maxDepth: 8 };
   const peers = [{ name: 'greet', arity: 1, purpose: 'greet' }];
   const scope: Scope = { names: new Map([['message', { kind: 'variable' }]]), parent: { names: new Map([['greet', { kind: 'function', arity: 1 }]]), function: false, loop: false }, function: true, loop: false };
   const record = (script: SlotEntry[]) => {
@@ -546,7 +546,7 @@ test('a unit-body traceback maps to the failing leaf and replay rebuilds the sou
   const d = inContext(provider, context);
   const source = await generatePythonAst(d, state, 'content', options);
   context.adoptWrittenFile('content', 'main.py');
-  const leaf = context.pathFor(attemptScope('content', 'greet')).find(candidate => candidate.kind === 'leaf')!;
+  const leaf = context.pathFor(attemptScope('main.py', 'greet')).find(candidate => candidate.kind === 'leaf')!;
   assert.ok(leaf.answer !== undefined && leaf.alternatives.length >= 2);
   assert.equal(leaf.nearTie, true, 'the fixture distribution is a near-tie, so its alternatives are consumable');
 
@@ -593,7 +593,7 @@ test('a module-slot traceback substitutes the failing leaf in the assembled prog
   const source = await generatePythonAst(d, { task: { prompt: 'Print a division result.', turn: 1, updates: [] } }, 'content', options);
   assert.equal(source, 'print(1 / 0)\n');
   context.adoptWrittenFile('content', 'main.py');
-  const leaf = context.pathFor(attemptScope('content')).filter(candidate => candidate.kind === 'leaf').at(-1)!;
+  const leaf = context.pathFor(attemptScope('main.py')).filter(candidate => candidate.kind === 'leaf').at(-1)!;
   assert.equal(leaf.nearTie, true, 'the fixture distribution is a near-tie');
   const attribution = attributeFailure(context, traceback([{ path: '/ws/main.py', line: 1, source: 'print(1 / 0)' }], 'ZeroDivisionError: division by zero'), '/ws');
   assert.ok(attribution);
@@ -615,7 +615,7 @@ test('a non-near-tie failure skips the alternatives and regenerates the unit', a
   const d = inContext(provider, context);
   await generatePythonAst(d, state, 'content', options);
   context.adoptWrittenFile('content', 'main.py');
-  const leaf = context.pathFor(attemptScope('content', 'greet')).find(candidate => candidate.kind === 'leaf')!;
+  const leaf = context.pathFor(attemptScope('main.py', 'greet')).find(candidate => candidate.kind === 'leaf')!;
   assert.equal(leaf.nearTie, false, 'the confident fixture is not a near-tie');
   const attribution = attributeFailure(context, traceback([{ path: '/ws/main.py', line: 3, source: "print(greet('greet'))" }, { path: '/ws/main.py', line: 2, source: "return 'greet'" }], 'TypeError: broken'), '/ws');
   assert.ok(attribution);
@@ -660,7 +660,7 @@ test('a non-near-tie module failure regenerates the module block', async () => {
   const source = await generatePythonAst(d, { task: { prompt: 'Print a division result.', turn: 1, updates: [] } }, 'content', options);
   assert.equal(source, 'print(1 / 0)\n');
   context.adoptWrittenFile('content', 'main.py');
-  const leaf = context.pathFor(attemptScope('content')).filter(candidate => candidate.kind === 'leaf').at(-1)!;
+  const leaf = context.pathFor(attemptScope('main.py')).filter(candidate => candidate.kind === 'leaf').at(-1)!;
   assert.equal(leaf.nearTie, false, 'the confident fixture is not a near-tie');
   const attribution = attributeFailure(context, traceback([{ path: '/ws/main.py', line: 1, source: 'print(1 / 0)' }], 'ZeroDivisionError: division by zero'), '/ws');
   assert.ok(attribution);
@@ -682,10 +682,10 @@ test('an exhausted alternative list regenerates the unit once', async () => {
   const d = inContext(provider, context);
   await generatePythonAst(d, state, 'content', options);
   context.adoptWrittenFile('content', 'main.py');
-  const leaf = context.pathFor(attemptScope('content', 'greet')).find(candidate => candidate.kind === 'leaf')!;
+  const leaf = context.pathFor(attemptScope('main.py', 'greet')).find(candidate => candidate.kind === 'leaf')!;
   assert.equal(leaf.nearTie, true, 'the near-tie gate opens the replay loop');
 
-  const attribution = { target: 'main.py', path: 'main.py', field: 'content', scope: attemptScope('content', 'greet'), unit: 'greet', decisionId: leaf.decisionId, chosen: leaf.chosen, forced: ['missing_alternative'], reason: 'x' };
+  const attribution = { target: 'main.py', path: 'main.py', field: 'content', scope: attemptScope('main.py', 'greet'), unit: 'greet', decisionId: leaf.decisionId, chosen: leaf.chosen, forced: ['missing_alternative'], reason: 'x' };
   const before = provider.criteria.filter(entry => entry.unit === 'greet' && entry.slot === 'function_body').length;
   const repaired = await repairPythonFailure(d, context, attribution, { ...options, context });
   assert.ok(repaired);
@@ -735,7 +735,7 @@ test('a unit path without leaf decisions skips replay and regenerates the narrow
   const d = inContext(provider, context);
   await generatePythonAst(d, { task: { prompt, turn: 1, updates: [] } }, 'content', options);
   context.adoptWrittenFile('content', 'main.py');
-  const unitPath = context.pathFor(attemptScope('content', 'echo'));
+  const unitPath = context.pathFor(attemptScope('main.py', 'echo'));
   assert.ok(unitPath.length >= 2 && unitPath.every(entry => entry.kind === 'structural'), 'the unit path has no leaf entries');
   const attribution = attributeFailure(context, traceback([{ path: '/ws/main.py', line: 2, source: 'return name' }], 'NameError: name is not defined'), '/ws');
   assert.ok(attribution);
@@ -820,14 +820,14 @@ test('a width>1 attribution resolves through the kept candidate, not candidate 0
   assert.match(source, /return 'greeting text'/);
   context.adoptWrittenFile('content', 'main.py');
 
-  const keptPath = context.pathFor(attemptScope('content', unit, 2));
+  const keptPath = context.pathFor(attemptScope('main.py', unit, 2));
   assert.ok(keptPath.length > 0, 'the kept candidate path is recorded');
   const keptLeaf = keptPath.find(entry => entry.kind === 'leaf')!;
   const defLine = source.split('\n').findIndex(line => line.startsWith(`def ${unit}(`)) + 1;
-  assert.equal(context.slotAtLine('main.py', defLine)?.scope, attemptScope('content', unit, 2), 'the line map records the kept candidate scope');
+  assert.equal(context.slotAtLine('main.py', defLine)?.scope, attemptScope('main.py', unit, 2), 'the line map records the kept candidate scope');
 
-  const attempt = unitAttemptPath(context, 'content', unit, attemptScope('content', unit));
-  assert.equal(attempt.scope, attemptScope('content', unit, 2), 'attribution resolves through the kept candidate');
+  const attempt = unitAttemptPath(context, 'content', unit, attemptScope('main.py', unit), 'main.py');
+  assert.equal(attempt.scope, attemptScope('main.py', unit, 2), 'attribution resolves through the kept candidate');
   assert.equal(attempt.entries[0]?.decisionId, keptPath[0]?.decisionId);
 
   const attribution = attributeFailure(context, traceback([
@@ -880,5 +880,129 @@ test('a structural callee failure skips replay and regenerates deterministically
   assert.equal(repaired.outcome.kind, 'unit-regeneration', 'a structural override never replays');
   assert.ok(provider.inner.calls > before, 'the structural failure regenerates the unit');
   assert.match(repaired.files['content']!, /def shout\(name\):\n    return greet\(name\)/);
+  await context.dispose();
+});
+
+/** One helper unit named `compute` returning `literal`, then a main block that prints it. */
+const computeFile = (literal: string, runnerUp?: string): SlotEntry[] => [
+  { slot: 'unit_count', answer: '1', once: true },
+  { slot: 'unit_0_name', answer: { value: 'compute' }, once: true }, { slot: 'unit_0_arity', answer: '0', once: true }, { slot: 'unit_0_purpose', answer: { value: 'compute' }, once: true },
+  { unit: 'compute', slot: 'function_body', answer: 'return', once: true }, { unit: 'compute', slot: 'expression', answer: 'string', once: true },
+  { unit: 'compute', slot: 'string', answer: { value: literal }, once: true, ...(runnerUp === undefined ? {} : { runnerUp }) },
+  { slot: 'module_body', answer: 'expr', once: true }, { slot: 'expression', answer: 'call', once: true }, { slot: 'callee', answer: { value: 'print' }, once: true },
+  { slot: 'argument_count', answer: '1', once: true }, { slot: 'argument_0', answer: 'call', once: true }, { slot: 'callee', answer: { value: 'compute' }, once: true },
+  { slot: 'module_body', answer: 'finish', once: true },
+];
+
+test('a second single-file write does not clobber the first file\'s decisions or repair target', async () => {
+  const context = createRunContext();
+  const prompt = 'Write Python programs a.py and b.py, each with a helper compute that returns the file name. A c.py file exists too. Print the result.';
+  const provider = new SlotProvider([...computeFile('a.py', 'b.py'), ...computeFile('b.py', 'c.py')]);
+  const d = inContext(provider, context);
+
+  await generatePythonAst(d, { task: { prompt, turn: 1, updates: [] } }, 'content', options);
+  context.adoptWrittenFile('content', 'a.py');
+  const slotA = context.slotAtLine('a.py', 2)!;
+  assert.equal(slotA.target, 'a.py');
+  assert.equal(slotA.scope, attemptScope('a.py', 'compute'), 'adoption re-keys the line slot scope to the written target');
+  assert.equal(context.slotAtLine('a.py', 3)?.scope, attemptScope('a.py'), 'the module line slot scope is target-qualified too');
+  const pathA = context.pathFor(slotA.scope!).map(entry => entry.decisionId);
+  assert.ok(pathA.length > 0);
+  const modulePathA = context.pathFor(attemptScope('a.py')).map(entry => entry.decisionId);
+  assert.ok(modulePathA.length > 0);
+
+  await generatePythonAst(d, { task: { prompt, turn: 2, updates: [] } }, 'content', options);
+  context.adoptWrittenFile('content', 'b.py');
+  assert.deepEqual(context.pathFor(slotA.scope!).map(entry => entry.decisionId), pathA, 'the second write leaves the first file\'s decision path intact');
+  assert.deepEqual(context.pathFor(attemptScope('a.py')).map(entry => entry.decisionId), modulePathA, 'the second write leaves the first file\'s module path intact');
+
+  const attribution = attributeFailure(context, traceback([
+    { path: '/ws/a.py', line: 3, source: 'print(compute())' },
+    { path: '/ws/a.py', line: 2, source: "return 'a.py'" },
+  ], 'RuntimeError: boom'), '/ws');
+  assert.ok(attribution, 'the a.py failure is attributable');
+  assert.equal(attribution.target, 'a.py');
+  assert.ok(pathA.includes(attribution.decisionId!), 'the failing decision belongs to a.py\'s own path');
+  assert.equal(attribution.scope, attemptScope('a.py', 'compute'));
+
+  const repaired = await repairPythonFailure(d, context, attribution, { ...options, context });
+  assert.ok(repaired);
+  assert.equal(repaired.outcome.kind, 'unit-replay');
+  assert.match(repaired.files['a.py']!, /return 'b\.py'/, 'a.py is repaired from its own runner-up');
+  assert.ok(!repaired.files['a.py']!.includes('c.py'), 'the later file\'s runner-up is not used');
+  await context.dispose();
+});
+
+test('a width>1 kept-candidate scope stays with its own file across a second single-file write', async () => {
+  const context = createRunContext();
+  const prompt = 'Write Python programs a.py and b.py, each with a helper compute that returns the file name. A c.py file exists too. Print the result.';
+  const unit = 'compute';
+  const wide = (literal: string): SlotEntry[] => [
+    { slot: 'unit_count', answer: '1', once: true },
+    { slot: 'unit_0_name', answer: { value: unit }, once: true }, { slot: 'unit_0_arity', answer: '0', once: true }, { slot: 'unit_0_purpose', answer: { value: unit }, once: true },
+    { unit, candidate: 0, slot: 'function_body', answer: 'return', once: true }, { unit, candidate: 0, slot: 'expression', answer: 'string', once: true }, { unit, candidate: 0, slot: 'string', answer: { value: literal }, once: true },
+    { unit, candidate: 1, slot: 'function_body', answer: 'pass', once: true }, { unit, candidate: 1, slot: 'function_body', answer: 'finish', once: true },
+    { unit, candidate: 2, slot: 'function_body', answer: 'return', once: true }, { unit, candidate: 2, slot: 'expression', answer: 'string', once: true }, { unit, candidate: 2, slot: 'string', answer: { value: literal }, once: true },
+    { slot: 'candidate_score', candidate: 0, answer: { score: 2 }, once: true }, { slot: 'candidate_score', candidate: 2, answer: { score: 3 }, once: true },
+    { slot: 'module_body', answer: 'expr', once: true }, { slot: 'expression', answer: 'call', once: true }, { slot: 'callee', answer: { value: 'print' }, once: true },
+    { slot: 'argument_count', answer: '1', once: true }, { slot: 'argument_0', answer: 'call', once: true }, { slot: 'callee', answer: { value: unit }, once: true },
+    { slot: 'module_body', answer: 'finish', once: true },
+  ];
+  const provider = new SlotProvider([...wide('a.py'), ...wide('b.py')]);
+  const d = inContext(provider, context);
+
+  await generatePythonAst(d, { task: { prompt, turn: 1, updates: [] } }, 'content', { ...options, searchWidth: 3 });
+  context.adoptWrittenFile('content', 'a.py');
+  const slotA = context.slotAtLine('a.py', 2)!;
+  assert.equal(slotA.scope, attemptScope('a.py', unit, 2), 'the line map records the kept candidate scope for a.py');
+  assert.equal(context.keptCandidate('a.py', unit), 2);
+  const pathA = context.pathFor(slotA.scope!).map(entry => entry.decisionId);
+  assert.ok(pathA.length > 0);
+
+  await generatePythonAst(d, { task: { prompt, turn: 2, updates: [] } }, 'content', { ...options, searchWidth: 3 });
+  context.adoptWrittenFile('content', 'b.py');
+  assert.deepEqual(context.pathFor(slotA.scope!).map(entry => entry.decisionId), pathA, 'the kept-candidate path is not overwritten by the second write');
+  assert.equal(context.keptCandidate('a.py', unit), 2, 'a.py keeps its own kept candidate');
+  assert.equal(context.keptCandidate('b.py', unit), 2, 'each file records its own kept candidate');
+  await context.dispose();
+});
+
+test('a run-state snapshot restores the unit cache, kept candidates, and paths after a failed rebuild', async () => {
+  const context = createRunContext();
+  const unit = 'greet';
+  const scope = attemptScope('main.py', unit, 2);
+  const originalBody = [node('Return', { value: node('Constant', { value: 'orig', kind: null }) })];
+  const original: Unit = { name: unit, arity: 0, purpose: unit, params: [], def: functionDef(unit, [], originalBody), body: originalBody };
+  saveUnitCache(context, 'main.py', { task: 'task text', units: [unitToCached(original, true)] });
+  context.recordKeptCandidate('main.py', unit, 2);
+  context.recordGenerationTask('main.py', 'task text', false);
+  context.retainCandidates('main.py', unit, [[node('Pass')]]);
+  const decisionId = context.allocateDecisionId();
+  context.recordDecision(scope, { decisionId, questionKey: 'string', identity: {}, chosen: 'value_0',
+    alternatives: [{ label: 'value_0', probability: 1 }], nearTie: false, kind: 'leaf' });
+
+  const snapshot = context.snapshotRunState();
+
+  // A rebuild that never reaches disk: the cache body is invalidated and replaced, the kept
+  // candidate and task are rewritten, and new decisions are recorded under the same scope.
+  invalidateCachedBodies(context, 'main.py', [unit]);
+  saveUnitCache(context, 'main.py', { task: 'failed rebuild', units: [unitToCached({ ...original, body: [node('Pass')] }, true)] });
+  context.recordKeptCandidate('main.py', unit, 0);
+  context.recordGenerationTask('main.py', 'failed rebuild', false);
+  context.retainCandidates('main.py', unit, [[node('Break')]]);
+  const rebuiltId = context.allocateDecisionId();
+  context.recordDecision(scope, { decisionId: rebuiltId, questionKey: 'string', identity: {}, chosen: 'value_1',
+    alternatives: [], nearTie: false, kind: 'leaf' });
+
+  context.restoreRunState(snapshot);
+
+  const entry = loadUnitCache(context, 'main.py', 'task text')!;
+  assert.deepEqual(entry.units.find(candidate => candidate.name === unit)?.body, originalBody, 'the validated cache body is back');
+  assert.equal(context.keptCandidate('main.py', unit), 2);
+  assert.equal(context.generationTaskFor('main.py')?.task, 'task text');
+  assert.equal(context.candidatesFor('main.py', unit).length, 1, 'only the pre-rebuild retained candidate remains');
+  assert.deepEqual(context.pathFor(scope).map(entry => entry.decisionId), [decisionId], 'the failed rebuild decisions are dropped');
+  assert.equal(context.decisionEntry(rebuiltId), undefined, 'the failed rebuild decision id is no longer resolvable');
+  assert.equal(context.decisionEntry(decisionId)?.chosen, 'value_0');
   await context.dispose();
 });

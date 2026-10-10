@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, realpath, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Decisions, jsonState, type State } from './decisions.js';
-import { ACTION_COMPACTION, COMPLETION_COMPACTION, compactRetryState, decisionChoiceBytes, decisionProbabilityBytes, fitDecisionState, MAX_DECISION_REQUEST_BYTES } from './decision-context.js';
+import { ACTION_COMPACTION_LEVELS, COMPLETION_COMPACTION, compactRetryState, decisionChoiceBytes, decisionProbabilityBytes, fitDecisionState, fitDecisionStateDegrading, MAX_DECISION_REQUEST_BYTES } from './decision-context.js';
 import { createRunContext, type DecisionSeed, type RunContext } from './run-context.js';
 import { fragmentsFrom, generateArguments, generateText, type GenerateOptions } from './generation.js';
 import { repairPythonFailure, type PythonRepairResult } from './python-ast.js';
@@ -319,8 +319,10 @@ export class Harness {
     }
     const fileSnapshots = [...files].map(key => ({ key, source: runContext.sourceFor(key), lines: runContext.lines.get(key) }));
     const decisionSnapshot = runContext.snapshotDecisions();
+    const runStateSnapshot = runContext.snapshotRunState();
     const restore = (): void => {
       for (const snapshot of fileSnapshots) runContext.restoreFile(snapshot.key, snapshot.source, snapshot.lines);
+      runContext.restoreRunState(runStateSnapshot);
       runContext.restoreDecisions(decisionSnapshot);
     };
     try {
@@ -526,9 +528,9 @@ export class Harness {
           return `Choose the next action for this coding task:\n${[prompt, ...updates].join('\nUpdate: ')}\nUse the actual workspace and tool outcomes to decide.`;
         };
         // Size safety: compact history/recent and the carried task text, then re-measure. A long
-        // but legal prompt degrades to a clipped task instead of ending the run; three consecutive
-        // failures on an unshrinkable state still end the run as limited.
-        const actionFit = fitDecisionState(state, candidate => decisionChoiceBytes(jsonState(candidate), actionInstructionFor(candidate), criteria), MAX_DECISION_REQUEST_BYTES, ACTION_COMPACTION);
+        // but legal prompt degrades to a progressively clipped task instead of ending the run;
+        // three consecutive failures on a genuinely unshrinkable state still end the run as limited.
+        const actionFit = fitDecisionStateDegrading(state, candidate => decisionChoiceBytes(jsonState(candidate), actionInstructionFor(candidate), criteria), MAX_DECISION_REQUEST_BYTES, ACTION_COMPACTION_LEVELS);
         if (actionFit.overBudget) {
           actionSizeFailures++;
           const sizeFailure = `path=action, bytes=${actionFit.bytes}, cap=${actionFit.cap}, trimmed keys=${actionFit.trimmed.join(', ') || 'none'}`;

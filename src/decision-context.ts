@@ -106,11 +106,25 @@ export const COMPLETION_COMPACTION: DecisionCompaction = {
  * from it, so a long but legal prompt can exceed the cap on its own. The action decision degrades
  * by clipping the carried task text instead of ending the run; the completion check and the
  * field/plan selects keep their stricter profiles (an over-budget completion stays a size failure).
+ * The task clamps are sized so the profile's own worst case (a clipped prompt plus the kept
+ * updates, counted twice through the instruction) stays under the 24k cap.
  */
 export const ACTION_COMPACTION: DecisionCompaction = {
   ...DECISION_COMPACTION,
-  task: { prompt: 4000, updates: 2000, keep: 8 },
+  task: { prompt: 2000, updates: 750, keep: 4 },
 };
+
+/**
+ * Progressively harder action profiles, tried in order until the request fits. A state that is
+ * still over budget after the standard profile is clipped further instead of failing three times
+ * with identical measurements; only a state that stays over budget at the hardest level is
+ * genuinely unshrinkable and keeps the three-strike terminal path.
+ */
+export const ACTION_COMPACTION_LEVELS: readonly DecisionCompaction[] = [
+  ACTION_COMPACTION,
+  { ...DECISION_COMPACTION, task: { prompt: 800, updates: 300, keep: 2 } },
+  { ...DECISION_COMPACTION, task: { prompt: 200, updates: 120, keep: 1 } },
+];
 
 /**
  * Harder compaction applied once when a single decision request is rejected by the platform's
@@ -235,6 +249,27 @@ export function fitDecisionState(
   const compacted = compactDecisionState(state, profile);
   const bytes = measure(compacted.state);
   return { state: compacted.state, bytes, cap, trimmed: compacted.trimmed, overBudget: bytes > cap };
+}
+
+/**
+ * Fit a state with degrading profiles: each profile is applied to the original state and the first
+ * result that fits is returned. When none fits, the hardest profile's result is returned with
+ * `overBudget` set, so the caller can apply its terminal policy. Used by the action path, where a
+ * shrinkable state must degrade instead of failing repeated measurements of the same state.
+ */
+export function fitDecisionStateDegrading(
+  state: Record<string, unknown>,
+  measure: (state: Record<string, unknown>) => number,
+  cap: number,
+  profiles: readonly DecisionCompaction[],
+): DecisionFit {
+  let last: DecisionFit | undefined;
+  for (const profile of profiles) {
+    last = fitDecisionState(state, measure, cap, profile);
+    if (!last.overBudget) return last;
+  }
+  if (last === undefined) throw new Error('fitDecisionStateDegrading requires at least one profile.');
+  return last;
 }
 
 export interface AstStateInput { objective: string; context: Record<string, unknown>; preview: string; core: Record<string, unknown>; questions: unknown; cap: number }

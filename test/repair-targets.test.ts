@@ -75,6 +75,44 @@ test('two single-file targets in one run do not share a unit cache entry', async
   assert.ok(records.every(record => record.result.ok), JSON.stringify(records.map(record => record.result.output)));
 });
 
+/** One helper unit named `compute` returning `int('<literal>')`, then a main block that prints it. */
+const intFile = (literal: string, runnerUp: string): SlotEntry[] => [
+  { slot: 'unit_count', answer: '1', once: true },
+  { slot: 'unit_0_name', answer: { value: 'compute' }, once: true }, { slot: 'unit_0_arity', answer: '0', once: true }, { slot: 'unit_0_purpose', answer: { value: 'compute' }, once: true },
+  { unit: 'compute', slot: 'function_body', answer: 'return', once: true }, { unit: 'compute', slot: 'expression', answer: 'call', once: true },
+  { unit: 'compute', slot: 'callee', answer: { value: 'int' }, once: true }, { unit: 'compute', slot: 'argument_count', answer: '1', once: true },
+  { unit: 'compute', slot: 'argument_0', answer: 'string', once: true }, { unit: 'compute', slot: 'string', answer: { value: literal }, once: true, runnerUp },
+  { slot: 'module_body', answer: 'expr', once: true }, { slot: 'expression', answer: 'call', once: true }, { slot: 'callee', answer: { value: 'print' }, once: true },
+  { slot: 'argument_count', answer: '1', once: true }, { slot: 'argument_0', answer: 'call', once: true }, { slot: 'callee', answer: { value: 'compute' }, once: true },
+  { slot: 'module_body', answer: 'finish', once: true },
+];
+
+test('a failure in the first of two written files repairs from that file\'s own decisions', async t => {
+  const root = await workspace(t);
+  const prompt = "Write Python programs a.py and b.py, each with a helper compute that prints int('x'); the corrected literal is int('5') for a.py and int('9') for b.py. Then run python3 a.py and report the result.";
+  const script: SlotEntry[] = [
+    ...intFile('x', '5'),   // a.py: the near-tie runner-up is '5'
+    ...intFile('x', '9'),   // b.py: the runner-up is '9'; it must never be used for a.py
+    // plan-text phases: path a.py, path b.py, the bash command, its cwd, then slack
+    { phase: 'plan', answer: 'plan_0', once: true }, { phase: 'plan', answer: 'plan_1', once: true },
+    ...Array.from({ length: 6 }, () => ({ phase: 'plan', answer: 'plan_0', once: true } as SlotEntry)),
+  ];
+  const provider = new MixedProvider(new SlotProvider(script), ['write_file', 'write_file', 'bash', 'finish'], ['a.py', 'b.py']);
+  const result = await new Harness({ workspace: root, provider, experimentalGrid: true }).run(prompt);
+
+  assert.equal(result.status, 'completed', result.summary);
+  assert.match(await readFile(join(root, 'a.py'), 'utf8'), /return int\('5'\)/, 'a.py is repaired from its own runner-up');
+  assert.ok(!(await readFile(join(root, 'a.py'), 'utf8')).includes("int('9')"), 'the later file\'s runner-up is not used');
+  assert.match(await readFile(join(root, 'b.py'), 'utf8'), /return int\('x'\)/, 'b.py keeps its own decisions');
+  const bash = result.records.filter(record => record.tool === 'bash');
+  assert.equal(bash.length, 1, 'the repaired run replaces the failed one');
+  assert.equal(bash[0]!.result.ok, true, bash[0]!.result.output);
+  assert.match(bash[0]!.result.output, /^5$/m, 'the repaired a.py prints a.py\'s runner-up');
+  const journal = (await readFile(join(root, '.jev', 'runs', `${result.id}.jsonl`), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { type: string; data: Record<string, unknown> & { repair?: ToolRepairRecord } });
+  const repairs = journal.flatMap(event => event.type === 'tool_end' && event.data.repair !== undefined ? [event.data.repair] : []);
+  assert.ok(repairs.some(repair => repair.kind === 'unit-replay' && repair.target === 'a.py'), `journaled repairs: ${JSON.stringify(repairs)}`);
+});
+
 test('a declined repair write is retried on the next failure instead of blocking repair', async t => {
   const root = await workspace(t);
   const prompt = "Write a Python program in main.py with a helper compute that prints int('5'); do not print int('x').";

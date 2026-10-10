@@ -89,6 +89,20 @@ export interface DecisionSnapshot {
   alternatives: DecisionAlternative[];
 }
 
+/**
+ * Mutable run state a repair rebuild can rewrite, captured so a failed repair write can undo the
+ * rebuild. Maps are private to RunContext; the snapshot type is exported for callers that thread it
+ * through a repair cycle.
+ */
+export interface RunStateSnapshot {
+  units: Map<string, UnitCacheEntry>;
+  keptCandidates: Map<string, number>;
+  candidates: Map<string, PythonNode[][]>;
+  generationTasks: Map<string, { task: string; project: boolean }>;
+  paths: Map<string, DecisionPathEntry[]>;
+  byId: Map<number, DecisionPathEntry>;
+}
+
 export interface LineSlot {
   slot: string;
   unit?: string;
@@ -116,9 +130,14 @@ export class RunContextDisposedError extends Error {
 
 const SEPARATOR = '\0';
 
-/** Attempt scope key: one ordered decision path per (field, unit, candidate) generation. */
-export const attemptScope = (field: string, unit?: string, candidate?: number): string =>
-  `${field}${SEPARATOR}${unit ?? ''}${SEPARATOR}${candidate === undefined ? '' : String(candidate)}`;
+/**
+ * Attempt scope key: one ordered decision path per (target, unit, candidate) generation. The target
+ * is the unit-cache target — the concrete written path once known, else the generation field — so
+ * two single-file writes through one body field never share a scope. `field` stays the first
+ * argument for call-site readability; when `target` is omitted it defaults to `field`.
+ */
+export const attemptScope = (field: string, unit?: string, candidate?: number, target?: string): string =>
+  `${target ?? field}${SEPARATOR}${unit ?? ''}${SEPARATOR}${candidate === undefined ? '' : String(candidate)}`;
 
 /**
  * Run-scoped generation state: decision paths and retained alternatives, the within-run unit
@@ -195,26 +214,26 @@ export class RunContext {
   }
 
   /** Regenerating a unit invalidates every recorded attempt for it, all search candidates included. */
-  invalidateUnitAttempts(field: string, unit: string): void {
+  invalidateUnitAttempts(target: string, unit: string): void {
     this.assertActive();
-    const prefix = `${field}${SEPARATOR}${unit}${SEPARATOR}`;
+    const prefix = `${target}${SEPARATOR}${unit}${SEPARATOR}`;
     for (const scope of [...this.paths.keys()]) if (scope.startsWith(prefix)) this.invalidateScope(scope);
-    this.keptCandidates.delete(`${field}${SEPARATOR}${unit}`);
+    this.keptCandidates.delete(`${target}${SEPARATOR}${unit}`);
   }
 
   /**
-   * The search candidate whose body was kept for one (field, unit) at width > 1. Recorded when a
+   * The search candidate whose body was kept for one (target, unit) at width > 1. Recorded when a
    * unit validates so the line map can resolve repair through the body that was actually written
    * instead of scanning candidate scopes from zero.
    */
-  recordKeptCandidate(field: string, unit: string, candidate: number): void {
+  recordKeptCandidate(target: string, unit: string, candidate: number): void {
     this.assertActive();
-    this.keptCandidates.set(`${field}${SEPARATOR}${unit}`, candidate);
+    this.keptCandidates.set(`${target}${SEPARATOR}${unit}`, candidate);
   }
 
-  keptCandidate(field: string, unit: string): number | undefined {
+  keptCandidate(target: string, unit: string): number | undefined {
     this.assertActive();
-    return this.keptCandidates.get(`${field}${SEPARATOR}${unit}`);
+    return this.keptCandidates.get(`${target}${SEPARATOR}${unit}`);
   }
 
   recordDecision(scope: string, entry: DecisionPathEntry): void {
@@ -289,17 +308,23 @@ export class RunContext {
   /**
    * Move everything recorded under a generation field to the concrete written path (single-file
    * writes know the path only after the tool runs). The line map, source, unit cache, generation
-   * task, and retained candidates are all re-keyed and each line slot's `target` follows, so two
-   * files written through the same body field can never share a cache entry or a repair target.
-   * A no-op when they are the same.
+   * task, retained candidates, recorded decision paths, and kept-candidate scopes are all re-keyed;
+   * each line slot's `target` and scope follow, so two files written through the same body field
+   * can never share a cache entry, a decision path, or a repair target. A no-op when they are the
+   * same.
    */
   adoptWrittenFile(from: string, to: string): void {
     this.assertActive();
     if (from === to) return;
+    const fromPrefix = `${from}${SEPARATOR}`;
+    const toPrefix = `${to}${SEPARATOR}`;
     const lines = this.lines.get(from);
     if (lines !== undefined) {
       this.lines.delete(from);
-      for (const slot of lines.values()) if (slot.target === from) slot.target = to;
+      for (const slot of lines.values()) {
+        if (slot.target === from) slot.target = to;
+        if (slot.scope?.startsWith(fromPrefix)) slot.scope = `${toPrefix}${slot.scope.slice(fromPrefix.length)}`;
+      }
       this.lines.set(to, lines);
     }
     const source = this.sources.get(from);
@@ -317,12 +342,29 @@ export class RunContext {
       this.generationTasks.delete(from);
       this.generationTasks.set(to, task);
     }
-    const prefix = `${from}${SEPARATOR}`;
     for (const key of [...this.candidates.keys()]) {
-      if (!key.startsWith(prefix)) continue;
+      if (!key.startsWith(fromPrefix)) continue;
       const bodies = this.candidates.get(key)!;
       this.candidates.delete(key);
-      this.candidates.set(`${to}${key.slice(from.length)}`, bodies);
+      this.candidates.set(`${toPrefix}${key.slice(fromPrefix.length)}`, bodies);
+    }
+    for (const key of [...this.keptCandidates.keys()]) {
+      if (!key.startsWith(fromPrefix)) continue;
+      const candidate = this.keptCandidates.get(key)!;
+      this.keptCandidates.delete(key);
+      this.keptCandidates.set(`${toPrefix}${key.slice(fromPrefix.length)}`, candidate);
+    }
+    // Recorded decision paths move to the written target so a later generation under the same
+    // field starts a fresh scope instead of overwriting this file's entries. Entries already
+    // recorded for the target are superseded by the write being adopted.
+    for (const key of [...this.paths.keys()]) {
+      if (!key.startsWith(fromPrefix)) continue;
+      const entries = this.paths.get(key)!;
+      this.paths.delete(key);
+      const next = `${toPrefix}${key.slice(fromPrefix.length)}`;
+      const replaced = this.paths.get(next);
+      if (replaced !== undefined) for (const entry of replaced) this.byId.delete(entry.decisionId);
+      this.paths.set(next, entries);
     }
   }
 
@@ -374,6 +416,41 @@ export class RunContext {
   candidatesFor(target: string, unit: string): readonly PythonNode[][] {
     this.assertActive();
     return this.candidates.get(`${target}${SEPARATOR}${unit}`) ?? [];
+  }
+
+  /**
+   * Snapshot the mutable generation state a repair rebuild can consume or rewrite: unit-cache
+   * entries (deep-cloned, because body invalidation mutates them in place), kept-candidate indexes,
+   * retained candidates, generation tasks, and the recorded decision paths. The caller restores it
+   * when the rebuild's write never reaches disk, so the next repair rebuilds from the pre-rebuild
+   * state instead of the failed rebuild's cache, scopes, or decisions. A snapshot is consumed by
+   * one restore.
+   */
+  snapshotRunState(): RunStateSnapshot {
+    this.assertActive();
+    return {
+      units: new Map([...this.units].map(([key, entry]) => [key, structuredClone(entry)])),
+      keptCandidates: new Map(this.keptCandidates),
+      candidates: new Map([...this.candidates].map(([key, bodies]) => [key, [...bodies]])),
+      generationTasks: new Map([...this.generationTasks].map(([key, value]) => [key, { ...value }])),
+      paths: new Map([...this.paths].map(([key, entries]) => [key, [...entries]])),
+      byId: new Map(this.byId),
+    };
+  }
+
+  /** Restore entries captured by snapshotRunState(); entries recorded since the snapshot are dropped. */
+  restoreRunState(snapshot: RunStateSnapshot): void {
+    this.assertActive();
+    const replace = <K, V>(target: Map<K, V>, source: ReadonlyMap<K, V>): void => {
+      target.clear();
+      for (const [key, value] of source) target.set(key, value);
+    };
+    replace(this.units, snapshot.units);
+    replace(this.keptCandidates, snapshot.keptCandidates);
+    replace(this.candidates, snapshot.candidates);
+    replace(this.generationTasks, snapshot.generationTasks);
+    replace(this.paths, snapshot.paths);
+    replace(this.byId, snapshot.byId);
   }
 
   /** Record the normalized task text a write target was generated for; runtime repair replays with it. */

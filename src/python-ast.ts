@@ -116,7 +116,7 @@ export async function checkCandidate(source: string, spec: CandidateSpec, signal
   return (await diagnoseCandidate(source, spec, signal, context))?.reason;
 }
 
-export interface Shared { field: string; options: GenerateOptions; objective: string; context: State; budget: { step: number }; vocab: Vocab; maxDepth: number }
+export interface Shared { field: string; target: string; options: GenerateOptions; objective: string; context: State; budget: { step: number }; vocab: Vocab; maxDepth: number }
 export interface StepInfo { slot: string; production: string; symbols: string[]; decisionId?: number }
 /** Deterministic replay of a recorded decision path with one forced leaf answer. */
 export interface BuilderReplay {
@@ -144,10 +144,10 @@ export function vocabulary(objective: string): Vocab {
 
 export function createBuilder(shared: Shared, input: BuilderInput): WaveBuilder {
   const { decisions, render, report, unit, peers, candidate, repair, replay } = input;
-  const { field, options, objective, context, budget, vocab, maxDepth } = shared;
+  const { field, target, options, objective, context, budget, vocab, maxDepth } = shared;
   const { words, identifiers, strings, numbers, pieces } = vocab;
   const runContext = options.context ?? decisions.runContext;
-  const pathScope = attemptScope(field, unit, candidate);
+  const pathScope = attemptScope(field, unit, candidate, target);
   // Retry narrowing: `arity` forbids the offending peer call; `undefined` keeps the offending
   // name out of every reference-shaped pick; `return` forces a return; `compile` changes no
   // criteria and only carries the failed snippet in state.
@@ -534,7 +534,8 @@ const moduleNameOf = (layout: Layout, path: string): string | undefined => {
 /**
  * Rebuild one file's line-to-slot map after assembly: a unit definition span (its `def` line plus
  * every indented or blank line that follows) maps to that unit; every other line maps to the module
- * block. The map is keyed by the written path so tracebacks resolve back to decisions.
+ * block. The map is keyed by the written path so tracebacks resolve back to decisions, and each
+ * slot's scope is target-qualified so two files written through one field keep separate paths.
  */
 function recordFileLines(context: RunContext, key: string, target: string, field: string, source: string, fileUnits: readonly Unit[]): void {
   const lines = source.split('\n');
@@ -551,10 +552,10 @@ function recordFileLines(context: RunContext, key: string, target: string, field
     const span = spans.find(candidate => line >= candidate.start && line <= candidate.end);
     // Search width > 1 records each candidate under its own scope; the line map points at the
     // kept candidate so attribution and repair follow the body that was written.
-    const kept = span === undefined ? undefined : context.keptCandidate(field, span.unit);
+    const kept = span === undefined ? undefined : context.keptCandidate(target, span.unit);
     map.set(line, span === undefined
-      ? { slot: 'module_body', scope: attemptScope(field), target, field }
-      : { slot: 'function_body', unit: span.unit, scope: kept === undefined ? attemptScope(field, span.unit) : attemptScope(field, span.unit, kept), target, field });
+      ? { slot: 'module_body', scope: attemptScope(field, undefined, undefined, target), target, field }
+      : { slot: 'function_body', unit: span.unit, scope: kept === undefined ? attemptScope(field, span.unit, undefined, target) : attemptScope(field, span.unit, kept, target), target, field });
   }
   context.recordLineMap(key, map);
   context.recordSource(key, source);
@@ -564,7 +565,8 @@ function recordFileLines(context: RunContext, key: string, target: string, field
 async function generate(decisions: Decisions, state: State, field: string, options: GenerateOptions, project: boolean, repair?: RepairExecution): Promise<string> {
   const task = state.task as { prompt?: string; updates?: string[] } | undefined;
   const objective = [task?.prompt ?? '', ...(task?.updates ?? [])].join('\n');
-  const shared: Shared = { field, options, objective, context: compactContext(state), budget: { step: 0 }, vocab: vocabulary(objective), maxDepth: 8 };
+  const target = unitCacheTarget(state, field);
+  const shared: Shared = { field, target, options, objective, context: compactContext(state), budget: { step: 0 }, vocab: vocabulary(objective), maxDepth: 8 };
   const runContext = options.context ?? decisions.runContext;
   const tree = node('Module', { body: [], type_ignores: [] });
   const previewOf = (root: PythonNode): Promise<string> => unparsePython(previewTree(root) as PythonNode, decisions.signal, options.maxBytes, runContext);
@@ -573,7 +575,6 @@ async function generate(decisions: Decisions, state: State, field: string, optio
   });
   const rootScope: Scope = { names: new Map(), function: false, loop: false };
   const peers: Peer[] = [];
-  const target = unitCacheTarget(state, field);
   const taskText = normalizeUnitTask(objective);
   runContext.recordGenerationTask(target, taskText, project);
   const attribution = repair?.attribution;
@@ -646,7 +647,7 @@ async function generate(decisions: Decisions, state: State, field: string, optio
     // Repair for a unit-body failure: replay the recorded leaf alternatives (or reuse a retained
     // search candidate) before falling back to regenerating this one unit.
     const replayUnitRepair = async (unit: Unit): Promise<{ kind: 'replay'; body: PythonNode[]; decisionId: number; forced: string } | { kind: 'candidate'; body: PythonNode[] } | undefined> => {
-      const attempt = unitAttemptPath(runContext, field, unit.name, attribution?.scope);
+      const attempt = unitAttemptPath(runContext, field, unit.name, attribution?.scope, target);
       const path = attempt.entries;
       const failingEntry = attribution?.decisionId === undefined ? undefined : path.find(entry => entry.decisionId === attribution.decisionId);
       // Near-tie consumption (U10): only a failing leaf marked near-tie has runner-ups worth
@@ -723,8 +724,8 @@ async function generate(decisions: Decisions, state: State, field: string, optio
             ast: { slot: 'candidate', production: c.kept ? 'kept' : 'dropped', symbols: [], unit: unit.name, candidate: c.index, kept: c.kept, ...(c.reason === undefined ? {} : { reason: c.reason }) },
           });
         },
-      } : undefined, unit => runContext.invalidateUnitAttempts(field, unit.name), (unit, candidate) => {
-        if (candidate !== undefined) runContext.recordKeptCandidate(field, unit.name, candidate);
+      } : undefined, unit => runContext.invalidateUnitAttempts(target, unit.name), (unit, candidate) => {
+        if (candidate !== undefined) runContext.recordKeptCandidate(target, unit.name, candidate);
         validated.add(unit.name);
       });
     } finally {
@@ -735,7 +736,8 @@ async function generate(decisions: Decisions, state: State, field: string, optio
   // Module block: normal generation, or for a repair the recorded module path replayed with the
   // failing leaf substituted (a unit-scope failure replays the module path unchanged, no requests).
   const replayModuleBlock = async (): Promise<void> => {
-    const modulePath = runContext.pathFor(attemptScope(field)).filter(entry => !decompositionSlot(entry.questionKey));
+    const moduleScope = attemptScope(field, undefined, undefined, target);
+    const modulePath = runContext.pathFor(moduleScope).filter(entry => !decompositionSlot(entry.questionKey));
     const failingEntry = attribution?.decisionId === undefined ? undefined : modulePath.find(entry => entry.decisionId === attribution.decisionId);
     // Leaf-only contract: only a leaf decision can be substituted, and a module-scope failure
     // without a usable forced alternative cannot be fixed by replaying the module path unchanged.
@@ -765,7 +767,7 @@ async function generate(decisions: Decisions, state: State, field: string, optio
       }
     }
     // No usable recorded path, or every forced alternative mismatched: regenerate the module block.
-    runContext.invalidateScope(attemptScope(field));
+    runContext.invalidateScope(moduleScope);
     await makeRoot().block(tree.body as PythonNode[], rootScope, 0, 'module_body');
     if (repair !== undefined && moduleRepair && repair.outcome.kind === 'none') {
       repair.outcome.kind = 'module-regeneration';
