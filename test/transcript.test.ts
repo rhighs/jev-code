@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { PassThrough } from 'node:stream';
 import test from 'node:test';
+import { createPrinter } from '../src/print.js';
 import { decisionStrip, initialState, reduce, type Item, type ToolItem, type TranscriptState } from '../src/transcript.js';
 import type { HarnessEvent, HarnessEventData, ToolRecord } from '../src/types.js';
 
@@ -8,7 +10,7 @@ const ev = <K extends keyof HarnessEventData>(type: K, data: HarnessEventData[K]
   ({ type, data, runId: 'r', timestamp: 't', elapsedMs: (clock += 10), turn }) as HarnessEvent;
 const run = (events: Array<HarnessEvent | Parameters<typeof reduce>[1]>, state = initialState()): TranscriptState => events.reduce(reduce, state);
 const start = (): HarnessEvent => ev('start', { schema: 1, prompt: 'Write hello.py', workspace: '/ws', decoder: 'dynamic', limits: { turns: 50, requests: 512 }, journal: null }, 0);
-const text = (field: string, value: string, ast?: { slot: string; production: string; unit?: string; candidate?: number }, done = false): HarnessEvent =>
+const text = (field: string, value: string, ast?: { slot: string; production: string; unit?: string; candidate?: number; decisionId?: number }, done = false): HarnessEvent =>
   ev('text', { field, bytes: value.length, done, change: { replace: value }, decoder: ast ? 'ast' : 'choice', step: 1, cursor: { row: 0, column: 0, offset: 0 }, ...(ast ? { ast: { symbols: [], ...ast } } : {}) });
 const record = (tool: string, args: ToolRecord['args'], ok: boolean, output: string, data?: Record<string, unknown>, turn = 1): ToolRecord =>
   ({ turn, tool, args, result: { ok, output, ...(data ? { data } : {}) } });
@@ -207,6 +209,54 @@ test('interleaved unit decisions pair with their own slots and batched decisions
   assert.equal(single.live?.decision?.confidence, undefined);
   assert.match(decisionStrip(single), /^name → x · /);
   assert.equal(single.live?.decision?.lowConfidence, false);
+});
+
+test('wave decision events count one request per wave and pair their steps by decisionId', () => {
+  const base = run([start(), ev('turn', { files: 0, plan: '' }), ev('action', { tool: 'write_file' })]);
+  const wave = (slot: string, choice: string, decisionId: number): HarnessEvent =>
+    ev('decision', { model: 'm', choice, confidence: 1, field: 'content', phase: 'ast', slot, decisionId, wave: 7,
+      options: [{ label: choice, probability: 0.8 }, { label: 'other', probability: 0.2 }] });
+  const a = reduce(base, wave('argument_0', 'number', 11));
+  assert.equal(a.requests, base.requests + 1, 'the first question of a wave counts the request');
+  assert.equal(a.live?.card.requests, 1);
+  assert.equal(a.live?.decision?.slot, 'argument_0');
+  assert.equal(a.live?.decision?.decisionId, 11);
+  assert.equal(a.live?.decision?.wave, 7);
+  const b = reduce(a, wave('argument_1', 'string', 12));
+  assert.equal(b.requests, a.requests, 'the sibling question of the same wave does not count again');
+  assert.equal(b.live?.card.requests, 1);
+  assert.equal(b.live?.decision?.slot, 'argument_0', 'a sibling question does not replace the strip');
+  assert.equal(b.decisions.length, 2, 'both questions stay in the ring');
+  const step0 = reduce(b, text('content', 'add(__jev_pending__, __jev_pending__)', { slot: 'argument_0', production: 'number', decisionId: 11 }));
+  assert.equal(step0.live?.decision?.decisionId, 11, 'the step pairs with its own question');
+  assert.equal(step0.live?.decision?.choice, 'number');
+  const step1 = reduce(step0, text('content', 'add(1, __jev_pending__)', { slot: 'argument_1', production: 'string', decisionId: 12 }));
+  assert.equal(step1.live?.decision?.decisionId, 12);
+  assert.equal(step1.live?.decision?.choice, 'string');
+  const next = reduce(step1, ev('decision', { model: 'm', choice: 'Add', confidence: 1, field: 'content', slot: 'operator', decisionId: 13, wave: 8, options: [{ label: 'Add', probability: 1 }] }));
+  assert.equal(next.requests, b.requests + 1, 'a new wave counts again');
+  assert.equal(next.waves.size, 2);
+  const legacy = reduce(base, ev('decision', { model: 'm', choice: 'Return', confidence: 1, field: 'content', slot: 'stmt', unit: 'area', decisionId: 21, options: [{ label: 'Return', probability: 1 }] }));
+  const legacyStep = reduce(legacy, text('content', 'def area(): __jev_pending__', { slot: 'stmt', production: 'Return', unit: 'area', decisionId: 21 }));
+  assert.equal(legacyStep.live?.decision?.decisionId, 21, 'a single alternatives-aware decision pairs by decisionId too');
+});
+
+test('the printer renders one step line per wave question and one request in the strip', () => {
+  const stderr = new PassThrough();
+  let out = '';
+  stderr.on('data', chunk => { out += String(chunk); });
+  const printer = createPrinter(stderr as unknown as NodeJS.WritableStream & { isTTY?: boolean });
+  const events: HarnessEvent[] = [
+    start(), ev('turn', { files: 0, plan: '' }), ev('action', { tool: 'write_file' }),
+    ev('decision', { model: 'm', choice: 'number', confidence: 1, field: 'content', phase: 'ast', slot: 'argument_0', decisionId: 11, wave: 7, options: [{ label: 'number', probability: 1 }] }),
+    ev('decision', { model: 'm', choice: 'string', confidence: 1, field: 'content', phase: 'ast', slot: 'argument_1', decisionId: 12, wave: 7, options: [{ label: 'string', probability: 1 }] }),
+    text('content', 'add(__jev_pending__, __jev_pending__)', { slot: 'argument_0', production: 'number', decisionId: 11 }),
+    text('content', 'add(1, __jev_pending__)', { slot: 'argument_1', production: 'string', decisionId: 12 }),
+  ];
+  for (const event of events) printer.onEvent(event);
+  const lines = out.trim().split('\n');
+  assert.deepEqual(lines.slice(-2), ['  argument_0 → number', '  argument_1 → string']);
+  assert.match(decisionStrip(run(events)), /1 req$/, 'both wave questions render as one request');
 });
 
 test('text events update the live path, source, and slot, and tool_end clears the live area', () => {

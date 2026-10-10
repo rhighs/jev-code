@@ -1,7 +1,8 @@
 import type { Decisions, State } from './decisions.js';
+import { waveRequestBytes } from './decisions.js';
 import type { Field } from './types.js';
 import type { TextProgress, TextChange } from './grid.js';
-import type { RunContext } from './run-context.js';
+import { attemptScope, type RunContext } from './run-context.js';
 import { compactRetryState, decisionChoiceBytes, fitDecisionState, MAX_DECISION_REQUEST_BYTES } from './decision-context.js';
 import { compactContext, generateScoredGrid } from './scored-grid.js';
 import ts from 'typescript';
@@ -42,6 +43,10 @@ const tsDiagnostics = (fileName: string, text: string): Array<{ message: string;
     target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext,
   } }).diagnostics ?? []).filter(diagnostic => diagnostic.category === ts.DiagnosticCategory.Error)
     .slice(0, 5).map(diagnostic => ({ message: ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'), offset: diagnostic.start ?? text.length }));
+
+/** Choice-shaped tool fields: their criteria are fixed per field, so they can share one wave. */
+type ChoiceField = Extract<Field, { type: 'boolean' } | { type: 'enum' }>;
+const isChoiceField = (field: Field): field is ChoiceField => field.type === 'boolean' || field.type === 'enum';
 
 export function syntaxFeedback(state: State, field: string, text: string): Array<{ message: string; offset: number }> {
   const args = state.argumentsSoFar as Record<string, unknown> | undefined;
@@ -129,7 +134,7 @@ export async function generateArguments(decisions: Decisions, state: State, fiel
     }
     return fit.state;
   };
-  const outcomes = await Promise.allSettled(Object.entries(fields).map(async ([name, field]) => {
+  const singleField = async (name: string, field: Field): Promise<Array<readonly [string, string | number | boolean]>> => {
     try {
       let value: string | number | boolean;
       if (field.type === 'boolean') {
@@ -155,12 +160,36 @@ export async function generateArguments(decisions: Decisions, state: State, fiel
         }
         if (!Number.isFinite(value) || (field.min !== undefined && value < field.min) || (field.max !== undefined && value > field.max)) throw new Error(`${name} is outside its permitted range.`);
       } else value = await generateText(scoped, { ...state, argumentFields: fields, field: name }, name, field.description, { ...options, maxBytes: field.maxBytes ?? 256_000, allowEmpty: field.allowEmpty ?? false });
-      return [name, value] as const;
+      return [[name, value]];
     } catch (error) { controller.abort(error); throw error; }
-  }));
+  };
+  // The field wave is restricted to choice-shaped fields (boolean/enum): their criteria do not
+  // depend on a sibling answer, so one request answers them together. String and number fields are
+  // generative and stay their own decisions.
+  const waveFields = Object.entries(fields).filter((entry): entry is [string, ChoiceField] => isChoiceField(entry[1]));
+  const waveNames = new Set((waveFields.length >= 2 ? waveFields : []).map(([name]) => name));
+  const fieldWave = async (entries: Array<[string, ChoiceField]>): Promise<Array<readonly [string, string | number | boolean]>> => {
+    try {
+      const questions = Object.fromEntries(entries.map(([name, field]) => [name, {
+        instruction: field.description,
+        criteria: field.type === 'boolean' ? { true: 'Yes.', false: 'No.' } : field.choices,
+        identity: { field: name },
+      }]));
+      const fit = fitDecisionState({ ...state, argumentFields: fields }, candidate => waveRequestBytes(candidate, questions), MAX_DECISION_REQUEST_BYTES);
+      if (fit.overBudget) {
+        throw new LimitError(`Field decision size failure: path=field, fields=${entries.map(([name]) => name).join(', ')}, bytes=${fit.bytes}, cap=${fit.cap}, trimmed keys=${fit.trimmed.join(', ') || 'none'}; the request was not sent.`);
+      }
+      const answers = await scoped.chooseWave(fit.state, questions, { scope: attemptScope('field'), retryState: compactRetryState });
+      return entries.map(([name, field]) => [name, field.type === 'boolean' ? answers[name]!.choice === 'true' : answers[name]!.choice] as const);
+    } catch (error) { controller.abort(error); throw error; }
+  };
+  const tasks: Array<Promise<Array<readonly [string, string | number | boolean]>>> = [];
+  if (waveNames.size) tasks.push(fieldWave(waveFields.filter(([name]) => waveNames.has(name))));
+  for (const [name, field] of Object.entries(fields)) if (!waveNames.has(name)) tasks.push(singleField(name, field));
+  const outcomes = await Promise.allSettled(tasks);
   const failure = outcomes.find(outcome => outcome.status === 'rejected');
   if (failure?.status === 'rejected') throw controller.signal.reason ?? failure.reason;
-  const args: Record<string, string | number | boolean> = Object.fromEntries(outcomes.flatMap(outcome => outcome.status === 'fulfilled' ? [outcome.value] : []));
+  const args: Record<string, string | number | boolean> = Object.fromEntries(outcomes.flatMap(outcome => outcome.status === 'fulfilled' ? outcome.value : []));
   const registry = options.astRegistry ?? defaultAsts;
   const routedAdapter = registry.resolve({ argumentsSoFar: args });
   const initialAdapter = registry.resolve(state);

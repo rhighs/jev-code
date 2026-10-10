@@ -110,7 +110,32 @@ export interface ManyChoiceDecisionResult {
   metadata: DecisionMetadata & { questions: number };
 }
 
-export type DecisionResult = ChoiceDecisionResult | ProbabilityDecisionResult | ScoreDecisionResult | ManyChoiceDecisionResult;
+/**
+ * One independent question inside a wave. Each question carries its own instruction and criteria;
+ * a wave must never contain a question whose criteria depend on a sibling answer.
+ */
+export interface WaveQuestion {
+  instruction: string;
+  criteria: Record<string, string>;
+}
+
+/** One answered wave question: the chosen label, its confidence, and the ranked alternatives. */
+export interface WaveChoice {
+  choice: string;
+  confidence: number;
+  score: number;
+  probabilities: Record<string, number>;
+  alternatives: DecisionAlternative[];
+}
+
+/** Per-question answers for one wave request. */
+export interface WaveDecisionResult {
+  type: 'wave';
+  value: Record<string, WaveChoice>;
+  metadata: DecisionMetadata & { questions: number };
+}
+
+export type DecisionResult = ChoiceDecisionResult | ProbabilityDecisionResult | ScoreDecisionResult | ManyChoiceDecisionResult | WaveDecisionResult;
 
 export type JsonObject = { [key: string]: JsonValue };
 

@@ -6,7 +6,7 @@ import { createBuilder, generatePythonAst, repairPythonFailure, vocabulary, type
 import { functionDef, node, type Builder, type PythonNode, type Scope } from '../src/python-nodes.js';
 import { attributeFailure, commitRepairedUnit, dependentNames, decodedAnswer, fillUnits, forcedLabels, loadUnitCache, saveUnitCache, unitFromCached, unitToCached, type Unit, type UnitCacheEntry, type UnitCheck, type UnitRepair } from '../src/python-units.js';
 import { attemptScope, createRunContext, type RunContext } from '../src/run-context.js';
-import { LimitError, type DecisionProvider } from '../src/types.js';
+import { LimitError, type DecisionEventData, type DecisionProvider } from '../src/types.js';
 import { SlotProvider, type SlotEntry } from './helpers.js';
 
 interface UnitState { generation: { slot: string; unit?: string; peers?: Array<{ name: string; arity: number; purpose: string }>; partialSource: string; repair?: { reason: string; symbol?: string; snippet?: string } } }
@@ -16,14 +16,18 @@ class GateProvider implements DecisionProvider {
   readonly inner: SlotProvider;
   readonly seen: UnitState[] = [];
   readonly criteria: Array<{ slot: string; unit?: string; keys: string[] }> = [];
+  /** Question keys per request, so wave batching is observable. */
+  readonly asked: string[][] = [];
   pending = 0;
   maxPending = 0;
   constructor(script: SlotEntry[], private readonly hold?: Hold) { this.inner = new SlotProvider(script); }
   async decide<Q extends Questions>(input: EntryType, questions: Q, signal?: AbortSignal): Promise<SystemOneResult<Q>> {
     const state = input as unknown as UnitState;
     this.seen.push(structuredClone(state));
-    const question = questions.selection;
-    if (question?.type === 'choice') this.criteria.push({ slot: state.generation.slot, ...(state.generation.unit === undefined ? {} : { unit: state.generation.unit }), keys: Object.keys(question.criteria) });
+    this.asked.push(Object.keys(questions).map(key => key === 'selection' && state.generation.slot !== undefined ? state.generation.slot : key));
+    for (const [key, question] of Object.entries(questions)) {
+      if (question.type === 'choice') this.criteria.push({ slot: state.generation.slot ?? key, ...(state.generation.unit === undefined ? {} : { unit: state.generation.unit }), keys: Object.keys(question.criteria) });
+    }
     this.pending++;
     this.maxPending = Math.max(this.maxPending, this.pending);
     try { await this.hold?.(state, signal); return await this.inner.decide(input, questions, signal); }
@@ -137,6 +141,33 @@ test('the main block of a unit tree narrows module member arguments and derives 
   assert.ok(!provider.criteria.some(entry => entry.slot === 'method_name'));
 });
 
+test('the unit spec batches name, arity, and purpose into one wave per unit, then params', async () => {
+  const context = createRunContext();
+  const events: DecisionEventData[] = [];
+  const provider = new GateProvider([...decomposition, ...bodies, ...main]);
+  const d = new Decisions(provider, 200, new AbortController().signal, async data => { events.push(data); }, 4, undefined, context);
+  await generatePythonAst(d, state, 'content', options);
+
+  assert.deepEqual(provider.asked.filter(keys => keys.length > 1), [
+    ['unit_0_name', 'unit_0_arity', 'unit_0_purpose'],
+    ['unit_1_name', 'unit_1_arity', 'unit_1_purpose'],
+  ], 'one wave per unit spec; params stay sequential');
+  const spec = events.filter(event => event.wave !== undefined && String(event.slot).startsWith('unit_0_'));
+  assert.deepEqual(spec.map(event => event.slot), ['unit_0_name', 'unit_0_arity', 'unit_0_purpose']);
+  assert.equal(new Set(spec.map(event => event.wave)).size, 1, 'the unit spec is one request');
+  assert.equal(new Set(spec.map(event => event.decisionId)).size, 3, 'each wave question gets its own decision id');
+  assert.ok(spec.every(event => event.unit === undefined && event.field === 'content' && event.phase === 'ast'));
+
+  const root = context.pathFor(attemptScope('content'));
+  assert.deepEqual(root.slice(0, 8).map(entry => [entry.questionKey, entry.kind]), [
+    ['unit_count', 'structural'],
+    ['unit_0_name', 'leaf'], ['unit_0_arity', 'structural'], ['unit_0_purpose', 'leaf'],
+    ['unit_0_parameter_0', 'leaf'],
+    ['unit_1_name', 'leaf'], ['unit_1_arity', 'structural'], ['unit_1_purpose', 'leaf'],
+  ]);
+  await context.dispose();
+});
+
 test('a unit whose static check fails twice aborts the other in-flight unit and nothing is produced', async () => {
   const units = [stubUnit('greet'), stubUnit('shout')];
   const aborted: string[] = [];
@@ -210,9 +241,10 @@ test('a width-1 unit that fails its static check retries once with the reason an
   const retry = provider.seen.find(s => s.generation.unit === 'get_greeting' && s.generation.slot === 'expression');
   assert.equal(retry?.generation.repair?.reason, 'return');
   assert.equal(retry?.generation.repair?.symbol, undefined);
-  assert.deepEqual(provider.seen.map(s => s.generation.slot), ['unit_count', 'unit_0_name', 'unit_0_arity', 'unit_0_purpose', 'unit_0_parameter_0',
-    'function_body', 'function_body', 'expression', 'string',
-    'module_body', 'expression', 'callee', 'argument_count', 'argument_0', 'string', 'module_body']);
+  assert.deepEqual(provider.asked, [['unit_count'], ['unit_0_name', 'unit_0_arity', 'unit_0_purpose'], ['unit_0_parameter_0'],
+    ['function_body'], ['function_body'], ['expression'], ['string'],
+    ['module_body'], ['expression'], ['callee'], ['argument_count'], ['argument_0'], ['string'], ['module_body']],
+  'the unit spec batches into one wave and the retry costs only its own productions');
 });
 
 test('retry narrowing applies the reason table: arity forbids the peer, undefined drops the name, compile keeps criteria', async () => {
@@ -264,8 +296,15 @@ test('at most four unit requests are in flight with six units', async () => {
   const units: SlotEntry[] = [{ slot: 'unit_count', answer: '6' }];
   const names = ['a', 'b', 'c', 'd', 'e', 'f'];
   names.forEach((n, i) => units.push({ slot: `unit_${i}_name`, answer: { value: n } }, { slot: `unit_${i}_arity`, answer: '0' }, { slot: `unit_${i}_purpose`, answer: { value: 'helper' } }));
+  // A two-arrival barrier guarantees overlap without a timing-dependent sleep.
+  let arrived = 0, release!: () => void;
+  const both = new Promise<void>(resolve => { release = resolve; });
   const provider = new GateProvider([...units, ...names.map(() => ({ slot: 'function_body', answer: 'pass', once: true })), { slot: 'function_body', answer: 'finish' },
-    { slot: 'module_body', answer: 'finish' }], async s => { if (s.generation.unit) await new Promise(resolve => setTimeout(resolve, 15)); });
+    { slot: 'module_body', answer: 'finish' }], async s => {
+    if (!s.generation.unit) return;
+    if (++arrived === 2) release();
+    await both;
+  });
   const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Python helper functions a b c d e f.' } }, 'content', options);
   assert.equal((source.match(/^def /gm) ?? []).length, 6);
   assert.ok(provider.maxPending <= 4, `max in flight ${provider.maxPending}`);

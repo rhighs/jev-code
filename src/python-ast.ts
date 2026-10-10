@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Decisions, State } from './decisions.js';
 import type { GenerateOptions } from './generation.js';
-import { assemble, assembleProject, cachedPeer, commitRepairedUnit, decompose, decomposeLayout, dropUnitCache, ENTRY, fillUnits, invalidateCachedBodies, isEntry, loadUnitCache, normalizeUnitTask, peersOf, saveUnitCache, unitAttemptPath, unitFromCached, unitToCached, type FailureAttribution, type Layout, type Peer, type Unit, type UnitCacheEntry, type UnitCheck, type UnitRepair } from './python-units.js';
+import { assemble, assembleProject, cachedPeer, commitRepairedUnit, decompose, decomposeLayout, dropUnitCache, ENTRY, fillUnits, invalidateCachedBodies, isEntry, loadUnitCache, normalizeUnitTask, peersOf, saveUnitCache, unitAttemptPath, unitFromCached, unitToCached, type FailureAttribution, type Layout, type Peer, type Unit, type UnitCacheEntry, type UnitCheck, type UnitRepair, type WaveBuilder, type WaveQuestion } from './python-units.js';
 import { RUBRIC, wantsReturn } from './python-search.js';
 import { gridCursor } from './grid.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
@@ -15,7 +15,7 @@ import { LimitError } from './types.js';
 import { identifierCandidates, numberCandidates, objectiveWords, phraseLiterals, quotedLiterals, stringCandidates } from './vocab.js';
 import { anyMemberFits, BUILTINS, builtinCallable, fits, memberCriteria, moduleMembers, type PythonType } from './python-symbols.js';
 import { choice } from '@typesafe-ai/sdk';
-import { functionDef, name, node, type Builder, type PythonNode, type Scope, type Symbol, type Vocab } from './python-nodes.js';
+import { functionDef, name, node, type PythonNode, type Scope, type Symbol, type Vocab } from './python-nodes.js';
 export type { PythonNode } from './python-nodes.js';
 
 const keywords = new Set('False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case'.split(' '));
@@ -237,7 +237,7 @@ export async function checkCandidate(source: string, spec: CandidateSpec, signal
 }
 
 export interface Shared { field: string; options: GenerateOptions; objective: string; context: State; budget: { step: number }; vocab: Vocab; maxDepth: number }
-export interface StepInfo { slot: string; production: string; symbols: string[] }
+export interface StepInfo { slot: string; production: string; symbols: string[]; decisionId?: number }
 /** Deterministic replay of a recorded decision path with one forced leaf answer. */
 export interface BuilderReplay {
   path: readonly DecisionPathEntry[];
@@ -259,7 +259,7 @@ export function vocabulary(objective: string): Vocab {
   return { words, identifiers, strings, numbers: numberCandidates(objective), purposes: [...new Set(purposes)].slice(0, 160) };
 }
 
-export function createBuilder(shared: Shared, input: BuilderInput): Builder {
+export function createBuilder(shared: Shared, input: BuilderInput): WaveBuilder {
   const { decisions, render, report, unit, peers, candidate, repair, replay } = input;
   const { field, options, objective, context, budget, vocab, maxDepth } = shared;
   const { words, identifiers, strings, numbers } = vocab;
@@ -299,10 +299,93 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
       ...(repair === undefined ? {} : { repair: { reason: repair.reason, ...(repair.symbol === undefined ? {} : { symbol: repair.symbol }), ...(repair.snippet === undefined ? {} : { snippet: repair.snippet }) } }),
       constraints: { depth, maxDepth, inFunction: scope.function, inLoop: scope.loop, remainingSteps: options.maxSteps - budget.step } };
     const state = astDecisionState({ objective, context, preview, core, questions, cap: MAX_GRID_REQUEST_BYTES });
-    const selected = keys.length === 1 ? keys[0]!
-      : (await decisions.chooseWithAlternatives(state, instruction, criteria, { scope: pathScope, questionKey: slot, kind, context: runContext, answers: criteria })).choice;
-    await report(preview, { slot, production: selected, symbols });
+    let selected: string;
+    let decisionId: number | undefined;
+    if (keys.length === 1) selected = keys[0]!;
+    else {
+      const answer = await decisions.chooseWithAlternatives(state, instruction, criteria, { scope: pathScope, questionKey: slot, kind, context: runContext, answers: criteria });
+      selected = answer.choice;
+      decisionId = answer.decisionId;
+    }
+    await report(preview, { slot, production: selected, symbols, ...(decisionId === undefined ? {} : { decisionId }) });
     return selected;
+  }
+
+  interface PreparedWave {
+    slot: string;
+    criteria: Record<string, string>;
+    /** Terminal values; undefined for a direct production pick. */
+    values: Array<string | number> | undefined;
+    kind: DecisionKind;
+  }
+
+  /**
+   * Batch independent questions into one request (one wave). The dependency rule is enforced by the
+   * call sites: sibling arguments, binary/compare children, and the unit spec never depend on a
+   * sibling answer. Host-derived (single-label) questions and replay never send a request; a wave
+   * rejected by the platform falls back to a single-question request per isolated question inside
+   * the facade, and a failed fallback fails the unit loudly with the question journaled.
+   */
+  async function wave(requests: Record<string, WaveQuestion>, scope: Scope, depth = 0): Promise<Record<string, string | number>> {
+    decisions.signal.throwIfAborted();
+    const prepared: PreparedWave[] = Object.entries(requests).map(([slot, question]) => {
+      if (question.kind === 'production') return { slot, criteria: question.criteria, values: undefined, kind: 'structural' };
+      const values = question.kind === 'identifier'
+        ? question.values.filter(value => !(question.exclude ?? []).includes(value) && !referenceForbidden.has(value) && /^[A-Za-z_][A-Za-z_0-9]*$/.test(value) && !keywords.has(value))
+        : [...question.values];
+      return { slot, criteria: Object.fromEntries(values.map((value, index) => [`value_${index}`, JSON.stringify(value)])), values, kind: 'leaf' };
+    });
+    budget.step += prepared.length;
+    if (budget.step > options.maxSteps) throw new LimitError(`Python AST production budget exhausted (${options.maxSteps}).`);
+    const decode = (item: PreparedWave, label: string): string | number => {
+      if (item.values === undefined) return label;
+      const value = item.values[Number(label.slice(6))];
+      if (value === undefined) throw new Error(`Invalid Python AST terminal: ${label}`);
+      return value;
+    };
+    const answers: Record<string, string | number> = {};
+    const reportable: Array<{ item: PreparedWave; label: string; decisionId?: number }> = [];
+    const pending: PreparedWave[] = [];
+    for (const item of prepared) {
+      const labels = Object.keys(item.criteria);
+      if (!labels.length) throw new Error(`No valid Python AST production for ${item.slot}.`);
+      if (labels.length === 1) { answers[item.slot] = decode(item, labels[0]!); reportable.push({ item, label: labels[0]! }); continue; }
+      if (replay !== undefined) {
+        const entry = replay.path[replayIndex];
+        if (entry === undefined || entry.questionKey !== item.slot) throw new Error(`Replay path does not match the ${item.slot} decision.`);
+        replayIndex++;
+        const selected = entry.decisionId === replay.forceId && replay.forced !== undefined ? replay.forced : entry.chosen;
+        if (!Object.hasOwn(item.criteria, selected)) throw new Error(`Replay answer ${selected} is not a valid production for ${item.slot}.`);
+        answers[item.slot] = decode(item, selected);
+        continue;
+      }
+      pending.push(item);
+    }
+    if (pending.length) {
+      const preview = await render();
+      const symbols = visible(scope);
+      const instructionOf = (slot: string): string => `Choose the next valid Python AST production for ${slot}. The rendered source marks the slot being filled with ${PENDING}. Satisfy the objective with the smallest sufficient program. Complete the current slot only; do not add unrequested behavior.`;
+      const questions = Object.fromEntries(pending.map(item => [item.slot, choice(instructionOf(item.slot), item.criteria)]));
+      const core = { field, phase: 'ast', ...(unit === undefined ? {} : { unit }), ...(candidate === undefined ? {} : { candidate }), ...(peers === undefined || !peers.length ? {} : { peers: peers.map(peer => ({ ...peer })) }), symbols, symbolTable: symbolTable(scope),
+        ...(repair === undefined ? {} : { repair: { reason: repair.reason, ...(repair.symbol === undefined ? {} : { symbol: repair.symbol }), ...(repair.snippet === undefined ? {} : { snippet: repair.snippet }) } }),
+        constraints: { depth, maxDepth, inFunction: scope.function, inLoop: scope.loop, remainingSteps: options.maxSteps - budget.step } };
+      const state = astDecisionState({ objective, context, preview, core, questions, cap: MAX_GRID_REQUEST_BYTES });
+      const result = await decisions.chooseWave(state, Object.fromEntries(pending.map(item => [item.slot, {
+        instruction: instructionOf(item.slot), criteria: item.criteria, kind: item.kind, answers: item.criteria,
+      }])), { scope: pathScope, context: runContext, kind: 'structural',
+        onSkip: async (question, detail) => { await options.note?.(`Wave question ${question} was skipped after a provider rejection and asked singly (${detail}).`); } });
+      for (const item of pending) {
+        const answer = result[item.slot]!;
+        answers[item.slot] = decode(item, answer.choice);
+        reportable.push({ item, label: answer.choice, ...(answer.decisionId === undefined ? {} : { decisionId: answer.decisionId }) });
+      }
+      for (const entry of reportable) await report(preview, { slot: entry.item.slot, production: entry.label, symbols, ...(entry.decisionId === undefined ? {} : { decisionId: entry.decisionId }) });
+    } else if (reportable.length && replay === undefined) {
+      const preview = await render();
+      const symbols = visible(scope);
+      for (const entry of reportable) await report(preview, { slot: entry.item.slot, production: entry.label, symbols });
+    }
+    return answers;
   }
 
   async function terminal(slot: string, scope: Scope, values: Array<string | number>): Promise<string | number> {
@@ -336,19 +419,39 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
   /**
    * Python-local mirror of `fillCall` in src/lang/core.ts: a known callee arity is host-derived (a
    * single count is never a question), and each argument narrows by its curated parameter type.
+   * Sibling arguments are independent questions, so their production picks batch into one wave.
    */
   async function fillCall(func: PythonNode, args: PythonNode[], counts: number[] | undefined, paramTypes: PythonType[] | undefined, scope: Scope, depth: number, calls: number): Promise<void> {
     const count = Number(await pick('argument_count', scope, Object.fromEntries((counts ?? [0, 1, 2, 3]).map(value => [String(value), `${value} positional arguments.`]))));
-    for (let i = 0; i < count; i++) {
-      const arg = node('Hole'); args.push(arg);
-      const range = func._type === 'Name' && func.id === 'range';
-      const explicitRange = /range\s*\(|\b(?:empty|zero iterations|zero times)\b/i.test(objective);
-      const constraint = range && i === 2 ? 'nonzero' : range && !explicitRange && count === 1 ? 'positive' : undefined;
-      await expression(arg, scope, depth + 1, `argument_${i}`, constraint, calls + 1, paramTypes?.[i]);
+    if (!count) return;
+    const range = func._type === 'Name' && func.id === 'range';
+    const explicitRange = /range\s*\(|\b(?:empty|zero iterations|zero times)\b/i.test(objective);
+    const plans = Array.from({ length: count }, (_, i) => {
+      const target = node('Hole'); args.push(target);
+      const constraint = range && i === 2 ? 'nonzero' as const : range && !explicitRange && count === 1 ? 'positive' as const : undefined;
+      const expect = paramTypes?.[i];
+      return { slot: `argument_${i}`, target, constraint, expect, plan: planExpression(scope, depth + 1, `argument_${i}`, constraint, calls + 1, expect) };
+    });
+    if (plans.length > 1) {
+      // Sibling arguments are independent questions: one wave (also the deterministic replay order).
+      const selected = await wave(Object.fromEntries(plans.map(({ slot, plan }) => [slot, { kind: 'production' as const, criteria: plan.criteria }])), scope, depth + 1);
+      for (const { slot, target, constraint, expect, plan } of plans) {
+        await fillExpression(target, plan, scope, depth + 1, slot, String(selected[slot]), constraint, calls + 1, expect);
+      }
+      return;
     }
+    for (const { slot, target, constraint, expect } of plans) await expression(target, scope, depth + 1, slot, constraint, calls + 1, expect);
   }
 
-  async function expression(target: PythonNode, scope: Scope, depth: number, slot = 'expression', numberConstraint?: 'positive' | 'nonzero', calls = 0, expect?: PythonType): Promise<void> {
+  interface ExpressionPlan {
+    criteria: Record<string, string>;
+    namesForValue: string[];
+    calleeNames: string[];
+    receiverNames: string[];
+  }
+
+  /** The production criteria and candidate lists for one expression slot, computed from the scope. */
+  function planExpression(scope: Scope, depth: number, slot: string, numberConstraint: 'positive' | 'nonzero' | undefined, calls: number, expect?: PythonType): ExpressionPlan {
     const table = symbolTable(scope);
     const namesForValue = visible(scope).filter(id => !['builtin', 'function'].includes(table[id]!.kind) && !referenceForbidden.has(id));
     // Direct callees come from the symbol table; a typed argument keeps only calls whose common
@@ -368,7 +471,18 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
     if (depth < maxDepth) Object.assign(criteria, { attribute: 'Read an attribute from a defined object.', subscript: 'Index a defined object.' });
     if (depth < maxDepth && calls < 2 && Object.keys(callees).length) criteria.call = 'Call a function, such as print, with arguments.';
     if (depth < maxDepth && fits(expect, 'list') && (expect === 'list' || (!slot.startsWith('element_') && !slot.startsWith('argument_')))) criteria.list = 'A list of expressions.';
-    const production = await pick(slot, scope, criteria, depth);
+    return { criteria, namesForValue, calleeNames, receiverNames };
+  }
+
+  async function expression(target: PythonNode, scope: Scope, depth: number, slot = 'expression', numberConstraint?: 'positive' | 'nonzero', calls = 0, expect?: PythonType): Promise<void> {
+    const plan = planExpression(scope, depth, slot, numberConstraint, calls, expect);
+    const production = await pick(slot, scope, plan.criteria, depth);
+    await fillExpression(target, plan, scope, depth, slot, production, numberConstraint, calls, expect);
+  }
+
+  /** Fill one chosen production; the plan's candidate lists are recomputed scope-stable inputs. */
+  async function fillExpression(target: PythonNode, plan: ExpressionPlan, scope: Scope, depth: number, slot: string, production: string, numberConstraint: 'positive' | 'nonzero' | undefined, calls: number, expect?: PythonType): Promise<void> {
+    const { namesForValue, calleeNames, receiverNames } = plan;
     if (production === 'string') { Object.assign(target, node('Constant', { value: String(await terminal('string', scope, strings)), kind: null })); }
     else if (production === 'number') {
       const value = Number(await terminal('number', scope, numbers.filter(value => numberConstraint === 'positive' ? value > 0 : numberConstraint === 'nonzero' ? value !== 0 : true)));
@@ -386,7 +500,9 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
       const func = node('Hole');
       const args: PythonNode[] = [];
       Object.assign(target, node('Call', { func, args, keywords: [] }));
-      const selected = await pick('callee', scope, callees);
+      const calleeCriteria: Record<string, string> = Object.fromEntries(calleeNames.map((value, index) => [`name_${index}`, value]));
+      if (receiverNames.length && anyMemberFits(expect)) calleeCriteria.member = 'Call an attribute or method of an already defined object or module.';
+      const selected = await pick('callee', scope, calleeCriteria);
       let counts: number[] | undefined;
       let paramTypes: PythonType[] | undefined;
       if (selected === 'member') {
@@ -406,7 +522,7 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
       } else {
         const id = calleeNames[Number(selected.slice(5))]!;
         Object.assign(func, name(id));
-        const symbol = table[id];
+        const symbol = symbolTable(scope)[id];
         if (symbol?.arity !== undefined) counts = [symbol.arity];
         else if (symbol?.kind === 'builtin') counts = builtinCallable(id)?.arity;
         if (symbol?.kind === 'builtin') paramTypes = symbol.params;
@@ -417,7 +533,12 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
       const operators = production === 'binary' ? { Add: 'addition +', Sub: 'subtraction -', Mult: 'multiplication *', Div: 'division /', FloorDiv: 'integer division //', Mod: 'remainder %', Pow: 'power **' } : { Eq: 'equal ==', NotEq: 'not equal !=', Lt: 'less than <', LtE: 'less or equal <=', Gt: 'greater than >', GtE: 'greater or equal >=', In: 'membership in' };
       const operator = await pick('operator', scope, operators);
       Object.assign(target, production === 'binary' ? node('BinOp', { left, op: node(operator), right }) : node('Compare', { left, ops: [node(operator)], comparators: [right] }));
-      await expression(left, scope, depth + 1, 'left', undefined, calls); await expression(right, scope, depth + 1, 'right', undefined, calls);
+      const leftPlan = planExpression(scope, depth + 1, 'left', undefined, calls, undefined);
+      const rightPlan = planExpression(scope, depth + 1, 'right', undefined, calls, undefined);
+      // Both children are independent questions: one wave (also the deterministic replay order).
+      const selected = await wave({ left: { kind: 'production', criteria: leftPlan.criteria }, right: { kind: 'production', criteria: rightPlan.criteria } }, scope, depth + 1);
+      await fillExpression(left, leftPlan, scope, depth + 1, 'left', String(selected.left), undefined, calls, undefined);
+      await fillExpression(right, rightPlan, scope, depth + 1, 'right', String(selected.right), undefined, calls, undefined);
     } else if (production === 'list') {
       const elts: PythonNode[] = [];
       Object.assign(target, node('List', { elts, ctx: node('Load') }));
@@ -492,7 +613,7 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
       }
     }
   }
-  return { pick, terminal, identifier, expression, block };
+  return { pick, wave, terminal, identifier, expression, block };
 }
 
 /** Unit-cache write target: the concrete path when known, else the generation field. */
@@ -570,14 +691,14 @@ async function generate(decisions: Decisions, state: State, field: string, optio
   // A cache-less repair is only possible for a single file whose whole program is module statements.
   if (attribution !== undefined && cached === undefined && project) throw new Error(`No validated unit tree for ${target}; runtime repair is unavailable.`);
   const repairWithoutTree = attribution !== undefined && cached === undefined;
-  const makeRoot = (replay?: BuilderReplay): Builder => createBuilder(shared, {
+  const makeRoot = (replay?: BuilderReplay): WaveBuilder => createBuilder(shared, {
     decisions, peers, ...(replay === undefined ? {} : { replay }), render: () => previewOf(tree), report: (preview, info) => emit(preview, info),
   });
   let layout: Layout | undefined;
   let units: Unit[];
   let pending: Unit[];
   let reused = false;
-  let root: Builder | undefined;
+  let root: WaveBuilder | undefined;
   if (cached !== undefined && (project ? cached.layout !== undefined : cached.layout === undefined)) {
     // Within-run reuse: restore the validated unit tree, then revalidate each unit before trusting it.
     reused = true;

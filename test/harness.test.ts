@@ -319,16 +319,18 @@ test('custom tools are selectable and enum/boolean fields are constructed', asyn
   const root = await workspace(t);
   let observed: Record<string, string | number | boolean> | undefined;
   const base = new ScriptedProvider([{ action: 'custom', args: {} }, { action: 'finish', args: { summary: 'Custom tool ran.' } }]);
+  const asked: string[][] = [];
   const provider: DecisionProvider = { decide: async (state, questions, signal) => {
-    const input = state as unknown as { field?: string };
-    if (input.field === 'mode' || input.field === 'flag') {
-      const key = input.field === 'mode' ? 'fast' : 'true';
-      return { model: 'test', usage: { input_tokens: 0, output_tokens: 0 }, answers: {
-        selection: { type: 'choice', choice: key, confidence: 1, probabilities: input.field === 'mode'
-          ? { fast: 1, slow: 0 }
-          : { true: 1, false: 0 },
-        },
-      } } as never;
+    const entries = Object.entries(questions) as Array<[string, { type: string; criteria?: Record<string, string> }]>;
+    const choiceFields = entries.filter(([key, question]) => (key === 'mode' || key === 'flag') && question.type === 'choice');
+    if (choiceFields.length) {
+      asked.push(Object.keys(questions));
+      const answers = Object.fromEntries(choiceFields.map(([key, question]) => {
+        const selected = key === 'mode' ? 'fast' : 'true';
+        return [key, { type: 'choice', choice: selected, confidence: 1,
+          probabilities: Object.fromEntries(Object.keys(question.criteria ?? {}).map(label => [label, label === selected ? 1 : 0])) }];
+      }));
+      return { model: 'test', usage: { input_tokens: 0, output_tokens: 0 }, answers } as never;
     }
     return base.decide(state, questions, signal);
   } };
@@ -338,6 +340,7 @@ test('custom tools are selectable and enum/boolean fields are constructed', asyn
   }], journalDirectory: false });
   assert.equal((await harness.run('Run the custom tool.')).status, 'completed');
   assert.deepEqual(observed, { mode: 'fast', flag: true });
+  assert.deepEqual(asked, [['mode', 'flag']], 'both choice-shaped fields are answered by one wave request');
 });
 
 test('run duration spans prompt processing and is persisted on every outcome', async t => {

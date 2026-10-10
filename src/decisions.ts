@@ -1,7 +1,7 @@
-import { DecisionSession, createDecisionSession, isNearTie } from './sdk/decisions.js';
+import { DecisionSession, createDecisionSession, isNearTie, waveFailureKind } from './sdk/decisions.js';
 import { RunResources, type RunLimits } from './sdk/resources.js';
-import { DecisionError, LimitError, type DecisionProvider, type DecisionResult, type JsonObject } from './sdk/types.js';
-import { defaultRunContext, type PathChoice, type PathDecisionRequest, type RunContext } from './run-context.js';
+import { DecisionError, LimitError, type DecisionAlternative, type DecisionProvider, type DecisionResult, type JsonObject, type WaveChoice, type WaveDecisionResult, type WaveQuestion } from './sdk/types.js';
+import { defaultRunContext, mergeIdentity, type DecisionIdentity, type DecisionKind, type PathChoice, type PathDecisionRequest, type RunContext } from './run-context.js';
 import type { DecisionEventData } from './types.js';
 
 export type State = Record<string, unknown>;
@@ -13,6 +13,58 @@ export type State = Record<string, unknown>;
  * Harness/generation call sites pass a decision-context builder.
  */
 export type RetryStateBuilder = (state: State) => State;
+
+/**
+ * Byte cap for one wave request. Mirrors MAX_GRID_REQUEST_BYTES: bytes are the token proxy, and a
+ * wave is pre-split into one request per part before sending, so no part exceeds the cap.
+ */
+export const MAX_WAVE_REQUEST_BYTES = 24_000;
+
+/**
+ * One question inside a wave. `criteria` must not depend on any sibling answer (the dependency
+ * rule); questions with fewer than two labels are resolved host-side and never enter a request.
+ */
+export interface WaveQuestionSpec {
+  instruction: string;
+  criteria: Record<string, string>;
+  /** Slot recorded on the event and path entry; defaults to the wave key. */
+  slot?: string;
+  kind?: DecisionKind;
+  /** Per-question identity override merged over the state-derived identity. */
+  identity?: Partial<DecisionIdentity>;
+  /** Criterion text of the chosen label and the full map, for runtime-failure attribution. */
+  answer?: string;
+  answers?: Record<string, string>;
+}
+
+export interface WaveRequest {
+  /** Attempt scope for the recorded path entries. */
+  scope: string;
+  context?: RunContext;
+  kind?: DecisionKind;
+  /** Harder state for one `max_tokens_exceeded` retry of a wave part. */
+  retryState?: RetryStateBuilder;
+  /** Journal hook: a question isolated by bisection is asked singly instead. */
+  onSkip?: (question: string, detail: string) => void | Promise<void>;
+}
+
+/** One answered wave question; `decisionId` is absent when the question was host-derived. */
+export interface WaveAnswer {
+  choice: string;
+  decisionId?: number;
+  alternatives: DecisionAlternative[];
+  nearTie: boolean;
+}
+
+/** Request bytes for a wave, matching the payload DecisionSession.chooseWave sends. */
+export const waveRequestBytes = (state: unknown, questions: Record<string, WaveQuestionSpec>): number =>
+  Buffer.byteLength(JSON.stringify({ state, questions: Object.fromEntries(Object.entries(questions).map(([key, spec]) => [key,
+    { type: 'choice', instructions: spec.instruction, criteria: spec.criteria }])) }));
+
+/** Worst-case request count for a wave: every question asked singly plus the bisection overhead. */
+const waveWorstCase = (count: number): number => count + Math.ceil(Math.log2(Math.max(1, count)));
+
+const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
 const projectJson = (value: unknown, ancestors: Set<object>): unknown => {
   if (value === undefined) return undefined;
@@ -128,7 +180,7 @@ export class Decisions {
       const nearTie = isNearTie(alternatives, result.value);
       const decisionId = context.allocateDecisionId();
       captured = { choice: result.value, decisionId, alternatives, nearTie };
-      const currentIdentity = identity(state);
+      const currentIdentity = mergeIdentity(identity(state), request.identity);
       const answer = request.answer ?? request.answers?.[result.value];
       context.recordDecision(request.scope, {
         decisionId, questionKey: request.questionKey, identity: currentIdentity,
@@ -195,4 +247,139 @@ export class Decisions {
       return Object.assign({}, ...parts.flatMap(part => part.status === 'fulfilled' ? [part.value] : []));
     }
   }
+
+  /**
+   * One request per wave answers independent questions, each with its own instruction and criteria.
+   * The dependency rule is the caller's contract: no question's criteria may depend on a sibling
+   * answer. Questions with fewer than two labels are resolved host-side; a wave over the byte cap is
+   * pre-split; a rejected request is bisected until the bad question is isolated, and that question
+   * falls back to a single-question request. Every answered question emits one decision event
+   * carrying `decisionId` and the shared `wave` request id, and records a path entry.
+   */
+  async chooseWave(state: State, questions: Record<string, WaveQuestionSpec>, request: WaveRequest): Promise<Record<string, WaveAnswer>> {
+    const context = request.context ?? this.runContext;
+    const answers: Record<string, WaveAnswer> = {};
+    const queued: Array<{ key: string; spec: WaveQuestionSpec }> = [];
+    for (const [key, spec] of Object.entries(questions)) {
+      const labels = Object.keys(spec.criteria);
+      if (!labels.length) throw new Error(`No valid labels for wave question ${key}.`);
+      if (labels.length === 1) {
+        // Fewer than two labels is host-derived: never part of a wave, never a request.
+        answers[key] = { choice: labels[0]!, alternatives: [{ label: labels[0]!, probability: 1 }], nearTie: false };
+        continue;
+      }
+      if (context.isWaveShapeBlacklisted(key)) {
+        await this.askWaveQuestion(state, key, spec, request, context, answers);
+        continue;
+      }
+      queued.push({ key, spec });
+    }
+    await this.sendWave(state, queued, request, context, answers);
+    return answers;
+  }
+
+  /** Send one wave part: pre-split, budget pre-check, one request id, one event per question. */
+  private async sendWave(state: State, part: Array<{ key: string; spec: WaveQuestionSpec }>, request: WaveRequest, context: RunContext, answers: Record<string, WaveAnswer>): Promise<void> {
+    if (!part.length) return;
+    const chunks = splitWave(state, part);
+    if (chunks.length > 1) {
+      // A wave over the byte budget pre-splits: every part is its own wave request.
+      for (const chunk of chunks) await this.sendWave(state, chunk, request, context, answers);
+      return;
+    }
+    // Budget pre-check: the worst case (every question asked singly plus bisection overhead) must fit.
+    this.assertRequestBudget(waveWorstCase(part.length));
+    const waveId = context.allocateWaveId();
+    const waveQuestions = Object.fromEntries(part.map(({ key, spec }) => [key, { instruction: spec.instruction, criteria: spec.criteria }]));
+    let result: WaveDecisionResult;
+    try {
+      result = await this.attemptWave(state, waveQuestions, request);
+    } catch (error) {
+      if (waveFailureKind(error) !== 'bisect') throw error;
+      if (part.length > 1) {
+        // A rejected wave: bisect until the bad question is isolated.
+        const middle = Math.ceil(part.length / 2);
+        await this.sendWave(state, part.slice(0, middle), request, context, answers);
+        await this.sendWave(state, part.slice(middle), request, context, answers);
+        return;
+      }
+      // The bad question is isolated: skip it from the wave, journal it, and ask it singly.
+      const { key, spec } = part[0]!;
+      const detail = errorText(error);
+      context.recordWaveBisection(key);
+      await request.onSkip?.(key, detail);
+      try {
+        await this.askWaveQuestion(state, key, spec, request, context, answers);
+      } catch (fallback) {
+        throw new DecisionError(`Wave question ${key} was skipped after a provider rejection and its single-question fallback failed: ${errorText(fallback)}`, { cause: fallback });
+      }
+      return;
+    }
+    for (const { key, spec } of part) {
+      const cell = result.value[key];
+      if (cell === undefined) throw new DecisionError(`The wave did not answer question ${key}.`);
+      await this.recordWaveAnswer(state, request, context, key, spec, cell, waveId, result.metadata.model, answers);
+    }
+  }
+
+  /** One wave request, with one `max_tokens_exceeded` compaction retry when a builder is supplied. */
+  private async attemptWave(state: State, questions: Record<string, WaveQuestion>, request: WaveRequest): Promise<WaveDecisionResult> {
+    try {
+      return await this.session.chooseWave(jsonState(state), questions);
+    } catch (error) {
+      if (request.retryState === undefined || !(error instanceof DecisionError) || !/max_tokens_exceeded/.test(error.message)) throw error;
+      this.signal.throwIfAborted();
+      return this.session.chooseWave(jsonState(request.retryState(state)), questions);
+    }
+  }
+
+  /** One question asked alone: a blacklisted shape, or a bisected question's single fallback. */
+  private async askWaveQuestion(state: State, key: string, spec: WaveQuestionSpec, request: WaveRequest, context: RunContext, answers: Record<string, WaveAnswer>): Promise<void> {
+    const slot = spec.slot ?? spec.identity?.slot ?? key;
+    const choice = await this.chooseWithAlternatives(state, spec.instruction, spec.criteria, {
+      scope: request.scope, questionKey: slot, kind: spec.kind ?? request.kind ?? 'structural', context,
+      identity: { ...spec.identity, slot },
+      ...(spec.answer === undefined ? {} : { answer: spec.answer }),
+      ...(spec.answers === undefined ? {} : { answers: spec.answers }),
+    });
+    answers[key] = { choice: choice.choice, decisionId: choice.decisionId, alternatives: choice.alternatives, nearTie: choice.nearTie };
+  }
+
+  private async recordWaveAnswer(state: State, request: WaveRequest, context: RunContext, key: string, spec: WaveQuestionSpec, cell: WaveChoice, waveId: number, model: string, answers: Record<string, WaveAnswer>): Promise<void> {
+    const slot = spec.slot ?? spec.identity?.slot ?? key;
+    const questionIdentity = mergeIdentity(identity(state), { ...spec.identity, slot });
+    const alternatives = [...cell.alternatives];
+    const nearTie = isNearTie(alternatives, cell.choice);
+    const decisionId = context.allocateDecisionId();
+    const answer = spec.answer ?? spec.answers?.[cell.choice];
+    context.recordDecision(request.scope, {
+      decisionId, questionKey: slot, identity: questionIdentity, chosen: cell.choice, alternatives, nearTie,
+      kind: spec.kind ?? request.kind ?? 'structural',
+      ...(answer === undefined ? {} : { answer }),
+      ...(spec.answers === undefined ? {} : { answers: { ...spec.answers } }),
+    });
+    answers[key] = { choice: cell.choice, decisionId, alternatives, nearTie };
+    await this.onDecision({ choice: cell.choice, confidence: cell.confidence, model, options: alternatives, decisionId, wave: waveId, nearTie, ...questionIdentity });
+  }
 }
+
+/** Request bytes of one wave entry, mirroring the greedy accounting in scored-grid.ts. */
+const waveEntryBytes = (key: string, spec: WaveQuestionSpec): number =>
+  Buffer.byteLength(JSON.stringify({ [key]: { type: 'choice', instructions: spec.instruction, criteria: spec.criteria } })) - 2;
+
+/** Greedy byte pre-split: one request per part, each within MAX_WAVE_REQUEST_BYTES. */
+const splitWave = (state: State, part: Array<{ key: string; spec: WaveQuestionSpec }>): Array<Array<{ key: string; spec: WaveQuestionSpec }>> => {
+  const framing = Buffer.byteLength(JSON.stringify({ state, questions: {} }));
+  const chunks: Array<Array<{ key: string; spec: WaveQuestionSpec }>> = [];
+  let current: Array<{ key: string; spec: WaveQuestionSpec }> = [];
+  let bytes = framing;
+  for (const item of part) {
+    const entry = waveEntryBytes(item.key, item.spec);
+    if (current.length && bytes + entry + 1 > MAX_WAVE_REQUEST_BYTES) { chunks.push(current); current = []; bytes = framing; }
+    bytes += entry + (current.length ? 1 : 0);
+    current.push(item);
+    if (bytes > MAX_WAVE_REQUEST_BYTES) throw new LimitError(`Wave question ${item.key} exceeds the safe request size (${MAX_WAVE_REQUEST_BYTES} bytes); the request was not sent.`);
+  }
+  if (current.length) chunks.push(current);
+  return chunks;
+};

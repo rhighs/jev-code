@@ -8,6 +8,21 @@ export interface Peer { name: string; arity: number; purpose: string; module?: s
 export interface Unit extends Peer { params: string[]; def: PythonNode; body: PythonNode[] }
 export interface Layout { pkg: string; modules: string[] }
 
+/**
+ * One question inside a wave. Questions must be independent of every sibling answer (the
+ * dependency rule); `identifier` and `terminal` decode from `value_i` labels, `production`
+ * answers with the chosen label itself.
+ */
+export type WaveQuestion =
+  | { kind: 'identifier'; values: readonly string[]; exclude?: readonly string[] }
+  | { kind: 'terminal'; values: Array<string | number> }
+  | { kind: 'production'; criteria: Record<string, string> };
+
+/** Builder with wave support: the unit-spec questions (name, arity, purpose) batch into one request. */
+export interface WaveBuilder extends Builder {
+  wave(requests: Record<string, WaveQuestion>, scope: Scope, depth?: number): Promise<Record<string, string | number>>;
+}
+
 export const ENTRY = 'main';
 const importFrom = (module: string, id: string): PythonNode => node('ImportFrom', { module, names: [node('alias', { name: id, asname: null })], level: 0 });
 const isImport = (stmt: PythonNode): boolean => stmt._type === 'Import' || stmt._type === 'ImportFrom';
@@ -22,14 +37,20 @@ export async function decomposeLayout(root: Builder, scope: Scope): Promise<Layo
   return { pkg, modules };
 }
 
-export async function decompose(root: Builder, scope: Scope, vocab: Vocab, peers: Peer[], layout?: Layout): Promise<Unit[]> {
+export async function decompose(root: WaveBuilder, scope: Scope, vocab: Vocab, peers: Peer[], layout?: Layout): Promise<Unit[]> {
   if (!vocab.purposes.length) return [];
   const count = Number(await root.pick('unit_count', scope, counts(6, i => i === 0 ? 'No helper functions; write the program as one main block.' : `${i} helper function${i > 1 ? 's' : ''}, each generated on its own, then a main block that uses them.`)));
   const units: Unit[] = [];
   for (let i = 0; i < count; i++) {
-    const name = await root.identifier(`unit_${i}_name`, scope, units.map(u => u.name));
-    const arity = Number(await root.pick(`unit_${i}_arity`, scope, counts(3, n => `${n} positional parameter${n === 1 ? '' : 's'}.`)));
-    const purpose = String(await root.terminal(`unit_${i}_purpose`, scope, vocab.purposes));
+    // Name, arity, and purpose are independent questions: one wave per unit spec, then params.
+    const spec = await root.wave({
+      [`unit_${i}_name`]: { kind: 'identifier', values: vocab.identifiers, exclude: units.map(unit => unit.name) },
+      [`unit_${i}_arity`]: { kind: 'production', criteria: counts(3, n => `${n} positional parameter${n === 1 ? '' : 's'}.`) },
+      [`unit_${i}_purpose`]: { kind: 'terminal', values: vocab.purposes },
+    }, scope);
+    const name = String(spec[`unit_${i}_name`]!);
+    const arity = Number(spec[`unit_${i}_arity`]!);
+    const purpose = String(spec[`unit_${i}_purpose`]!);
     const unitScope: Scope = { names: new Map(), parent: scope, function: true, loop: false };
     const params: string[] = [];
     for (let j = 0; j < arity; j++) { const p = await root.identifier(`unit_${i}_parameter_${j}`, unitScope, params); params.push(p); unitScope.names.set(p, { kind: 'parameter' }); }

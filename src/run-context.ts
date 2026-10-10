@@ -36,7 +36,24 @@ export interface PathDecisionRequest {
   answer?: string;
   /** The full label-to-criterion map for the question, so alternatives can be decoded. */
   answers?: Record<string, string>;
+  /**
+   * Per-question identity override merged over the state-derived identity. Wave questions share one
+   * state but record their own slot, and field-wave questions record their own field.
+   */
+  identity?: Partial<DecisionIdentity>;
 }
+
+/** Merge a per-question identity override over the state-derived identity. */
+export const mergeIdentity = (base: DecisionIdentity, override?: Partial<DecisionIdentity>): DecisionIdentity => {
+  if (override === undefined) return base;
+  const merged: DecisionIdentity = { ...base };
+  if (override.field !== undefined) merged.field = override.field;
+  if (override.phase !== undefined) merged.phase = override.phase;
+  if (override.slot !== undefined) merged.slot = override.slot;
+  if (override.unit !== undefined) merged.unit = override.unit;
+  if (override.candidate !== undefined) merged.candidate = override.candidate;
+  return merged;
+};
 
 export interface PathChoice {
   choice: string;
@@ -111,7 +128,10 @@ export class RunContext {
   private readonly sources = new Map<string, string>();
   private readonly candidates = new Map<string, unknown[]>();
   private readonly generationTasks = new Map<string, { task: string; project: boolean }>();
+  private readonly waveBisections = new Map<string, number>();
+  private readonly waveBlacklist = new Set<string>();
   private nextDecisionId = 1;
+  private nextWaveId = 1;
   private worker: RunContextWorker | undefined;
   private disposed = false;
 
@@ -120,6 +140,33 @@ export class RunContext {
   allocateDecisionId(): number {
     this.assertActive();
     return this.nextDecisionId++;
+  }
+
+  /** Allocate the request id for one wave (one batched provider request). */
+  allocateWaveId(): number {
+    this.assertActive();
+    return this.nextWaveId++;
+  }
+
+  /**
+   * Count a wave bisection that isolated one question shape. The second isolation blacklists the
+   * shape, so later waves ask it singly instead of repeating the bisection cost; returns true when
+   * this call blacklisted the shape.
+   */
+  recordWaveBisection(shape: string): boolean {
+    this.assertActive();
+    const count = (this.waveBisections.get(shape) ?? 0) + 1;
+    this.waveBisections.set(shape, count);
+    if (count >= 2) {
+      this.waveBlacklist.add(shape);
+      return true;
+    }
+    return false;
+  }
+
+  isWaveShapeBlacklisted(shape: string): boolean {
+    this.assertActive();
+    return this.waveBlacklist.has(shape);
   }
 
   /** Start a fresh attempt for a scope; any previous entries for it are invalidated. */
@@ -289,6 +336,8 @@ export class RunContext {
     this.sources.clear();
     this.candidates.clear();
     this.generationTasks.clear();
+    this.waveBisections.clear();
+    this.waveBlacklist.clear();
     await worker?.dispose();
   }
 

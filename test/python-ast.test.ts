@@ -11,10 +11,14 @@ import { Harness } from '../src/harness.js';
 import type { DecisionEventData, DecisionProvider, HarnessEvent } from '../src/types.js';
 import { ScriptedProvider } from './helpers.js';
 
-interface AstState { generation: { phase: string; slot: string; partialSource: string; partialAst?: unknown; symbols: string[]; symbolTable?: Record<string, { kind: string; arity?: number; params?: string[] }>; constraints: { inFunction: boolean; inLoop: boolean } } }
+interface AstState { generation: { phase: string; slot?: string; partialSource: string; partialAst?: unknown; symbols: string[]; symbolTable?: Record<string, { kind: string; arity?: number; params?: string[] }>; constraints: { inFunction: boolean; inLoop: boolean } } }
 class AstProvider implements DecisionProvider {
   states: AstState[] = [];
   criteria: Array<Record<string, EntryType>> = [];
+  /** Slot of every asked question, in request order (wave questions use their key). */
+  slots: string[] = [];
+  /** Question keys per request, so wave batching is observable. */
+  asked: string[][] = [];
   constructor(private script: Array<string | { value: string }>, private fallback?: DecisionProvider) {}
   async decide<Q extends Questions>(input: EntryType, questions: Q, signal?: AbortSignal): Promise<SystemOneResult<Q>> {
     const state = input as unknown as AstState;
@@ -23,17 +27,20 @@ class AstProvider implements DecisionProvider {
       return this.fallback.decide(input, questions, signal);
     }
     this.states.push(structuredClone(state));
-    const desired = this.script.shift();
-    assert.notEqual(desired, undefined, `Missing AST decision for ${state.generation.slot}`);
-    const question = questions.selection!;
-    assert.equal(question.type, 'choice');
-    if (question.type !== 'choice') throw new Error('Expected Choice');
-    this.criteria.push({ ...question.criteria });
-    const selection = typeof desired === 'string' ? desired : Object.entries(question.criteria).find(([, label]) => label === desired!.value)?.[0];
-    assert.ok(selection && Object.hasOwn(question.criteria, selection), `Unavailable production ${JSON.stringify(desired)} in ${state.generation.slot}`);
-    return { model: 'ast-fixture', usage: { input_tokens: 10, output_tokens: 2 }, answers: {
-      selection: { type: 'choice', choice: selection, confidence: 1, probabilities: Object.fromEntries(Object.keys(question.criteria).map(key => [key, Number(key === selection)])) },
-    } } as unknown as SystemOneResult<Q>;
+    this.asked.push(Object.keys(questions).map(key => key === 'selection' && state.generation.slot !== undefined ? state.generation.slot : key));
+    const answers: Record<string, unknown> = {};
+    for (const [key, question] of Object.entries(questions)) {
+      const desired = this.script.shift();
+      assert.notEqual(desired, undefined, `Missing AST decision for ${state.generation.slot ?? key}`);
+      assert.equal(question.type, 'choice');
+      if (question.type !== 'choice') throw new Error('Expected Choice');
+      this.criteria.push({ ...question.criteria });
+      this.slots.push(state.generation.slot ?? key);
+      const selection = typeof desired === 'string' ? desired : Object.entries(question.criteria).find(([, label]) => label === desired!.value)?.[0];
+      assert.ok(selection && Object.hasOwn(question.criteria, selection), `Unavailable production ${JSON.stringify(desired)} in ${state.generation.slot ?? key}`);
+      answers[key] = { type: 'choice', choice: selection, confidence: 1, probabilities: Object.fromEntries(Object.keys(question.criteria).map(label => [label, Number(label === selection)])) };
+    }
+    return { model: 'ast-fixture', usage: { input_tokens: 10, output_tokens: 2 }, answers } as unknown as SystemOneResult<Q>;
   }
 }
 const hello = () => ['expr', 'call', { value: 'print' }, '1', 'string', { value: JSON.stringify('Hello, world!') }, 'finish'];
@@ -61,7 +68,7 @@ test('Python AST builds a complete tree, streams productions and unparses execut
 
 test('function parameters enter the symbol table and return is allowed only in function scope', async () => {
   const provider = new AstProvider(['0', 'function', { value: JSON.stringify('add') }, '2', { value: JSON.stringify('a') }, { value: JSON.stringify('b') },
-    'return', 'binary', 'Add', 'name', { value: 'a' }, 'name', { value: 'b' }, 'finish']);
+    'return', 'binary', 'Add', 'name', 'name', { value: 'a' }, { value: 'b' }, 'finish']);
   const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Write Python add(a, b), return a plus b.' } }, 'content', options);
   assert.equal(source, 'def add(a, b):\n    return a + b\n');
   const body = provider.states.find(state => state.generation.slot === 'function_body')!;
@@ -113,8 +120,8 @@ test('assignment RHS cannot reference a name before it is defined', async () => 
 
 test('defined functions constrain call arity from the symbol table', async () => {
   const provider = new AstProvider(['0', 'function', { value: JSON.stringify('add') }, '2', { value: JSON.stringify('a') }, { value: JSON.stringify('b') },
-    'return', 'binary', 'Add', 'name', { value: 'a' }, 'name', { value: 'b' },
-    'expr', 'call', { value: 'print' }, '1', 'call', { value: 'add' }, 'number', { value: '1' }, 'number', { value: '2' }, 'finish']);
+    'return', 'binary', 'Add', 'name', 'name', { value: 'a' }, { value: 'b' },
+    'expr', 'call', { value: 'print' }, '1', 'call', { value: 'add' }, 'number', 'number', { value: '1' }, { value: '2' }, 'finish']);
   const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Python define add(a, b) returning a + b, then print add(1, 2).' } }, 'content', options);
   assert.match(source, /def add\(a, b\):\n    return a \+ b/);
   assert.match(source, /print\(add\(1, 2\)\)/);
@@ -138,13 +145,13 @@ test('calls to imported module members fill the callee from the curated table an
 
 test('member arguments narrow by parameter type: randint offers numbers with no range or None', async () => {
   const provider = new AstProvider(['0', 'import', 'random', 'expr', 'call', { value: 'print' }, '1', 'call', 'member', { value: 'random' },
-    'randint', 'number', { value: '1' }, 'number', { value: '100' }, 'finish']);
+    'randint', 'number', 'number', { value: '1' }, { value: '100' }, 'finish']);
   const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Python import random and print random.randint(1, 100).' } }, 'content', options);
   assert.equal(source, 'import random\nprint(random.randint(1, 100))\n');
-  const member = provider.states.findIndex(state => state.generation.slot === 'member');
-  assert.ok(member >= 0);
-  assert.match(String(provider.criteria[member]!.randint), /random\.randint\(a: number, b: number\) -> number/);
-  const args = provider.states.flatMap((state, index) => index > member && /^argument_[01]$/.test(state.generation.slot) ? [provider.criteria[index]!] : []);
+  const memberAt = provider.slots.findIndex(slot => slot === 'member');
+  assert.ok(memberAt >= 0);
+  assert.match(String(provider.criteria[memberAt]!.randint), /random\.randint\(a: number, b: number\) -> number/);
+  const args = provider.criteria.filter((_, index) => index > memberAt && /^argument_[01]$/.test(provider.slots[index]!));
   assert.equal(args.length, 2, 'both randint number arguments are asked');
   for (const criteria of args) {
     assert.ok(Object.hasOwn(criteria, 'number'));
@@ -157,7 +164,7 @@ test('member arguments narrow by parameter type: randint offers numbers with no 
 
 test('a typed argument narrows its callee candidates and the member list by result type', async () => {
   const provider = new AstProvider(['0', 'import', 'random', 'import', 'math', 'assign', { value: JSON.stringify('target') },
-    'call', 'member', { value: 'math' }, 'sqrt', 'call', 'member', { value: 'random' }, 'randint', 'number', { value: '1' }, 'number', { value: '100' }, 'finish']);
+    'call', 'member', { value: 'math' }, 'sqrt', 'call', 'member', { value: 'random' }, 'randint', 'number', 'number', { value: '1' }, { value: '100' }, 'finish']);
   const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Python import random and math, then target = math.sqrt(random.randint(1, 100)).' } }, 'content', options);
   assert.equal(source, 'import random\nimport math\ntarget = math.sqrt(random.randint(1, 100))\n');
 
@@ -207,14 +214,14 @@ test('a call on an unknown receiver keeps the spelling path', async () => {
 
 test('builtin parameters narrow their arguments: an input prompt accepts only a string', async () => {
   const provider = new AstProvider(['0', 'import', 'random',
-    'assign', { value: JSON.stringify('target') }, 'call', 'member', { value: 'random' }, 'randint', 'number', { value: '1' }, 'number', { value: '100' },
+    'assign', { value: JSON.stringify('target') }, 'call', 'member', { value: 'random' }, 'randint', 'number', 'number', { value: '1' }, { value: '100' },
     'assign', { value: JSON.stringify('guess') }, 'call', { value: 'int' }, '1', 'call', { value: 'input' }, '1', 'string', { value: JSON.stringify('Guess: ') },
     'finish']);
   const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Write a Python guessing game: import random, set target = random.randint(1, 100), then guess = int(input("Guess: ")).' } }, 'content', options);
   assert.equal(source, "import random\ntarget = random.randint(1, 100)\nguess = int(input('Guess: '))\n");
-  const inputAt = provider.states.findLastIndex((state, index) => state.generation.slot === 'callee' && Object.values(provider.criteria[index]!).includes('input'));
+  const inputAt = provider.slots.findLastIndex((slot, index) => slot === 'callee' && Object.values(provider.criteria[index]!).includes('input'));
   assert.ok(inputAt >= 0);
-  const promptAt = provider.states.findIndex((state, index) => index > inputAt && state.generation.slot === 'argument_0');
+  const promptAt = provider.slots.findIndex((slot, index) => index > inputAt && slot === 'argument_0');
   const prompt = provider.criteria[promptAt]!;
   assert.ok(Object.hasOwn(prompt, 'string'));
   assert.ok(!Object.hasOwn(prompt, 'number') && !Object.hasOwn(prompt, 'boolean') && !Object.hasOwn(prompt, 'list'), 'only string candidates fit an input prompt');
@@ -384,4 +391,216 @@ test('a direct generation without an explicit context uses the process default a
   await closeDefaultRunContext();
   assert.equal(context.isDisposed, true);
   assert.throws(() => context.allocateDecisionId(), /disposed/);
+});
+
+test('sibling call arguments batch into one wave with per-question identity and one request', async () => {
+  const context = createRunContext();
+  const events: DecisionEventData[] = [];
+  const provider = new AstProvider(['0', 'import', 'math', 'expr', 'call', { value: 'print' }, '1', 'call', 'member', { value: 'math' },
+    'gcd', 'number', 'number', { value: '12' }, { value: '8' }, 'finish']);
+  const d = new Decisions(provider, 100, new AbortController().signal, async data => { events.push(data); }, 4, undefined, context);
+  const source = await generatePythonAst(d, { task: { prompt: 'Python import math and print math.gcd(12, 8).' } }, 'content', options);
+  assert.equal(source, 'import math\nprint(math.gcd(12, 8))\n');
+
+  assert.deepEqual(provider.asked, [
+    ['unit_count'], ['module_body'], ['module'], ['module_body'], ['expression'], ['callee'], ['argument_count'], ['argument_0'],
+    ['callee'], ['receiver'], ['member'], ['argument_0', 'argument_1'], ['number'], ['number'], ['module_body'],
+  ], 'the callee is asked alone, the count is a post-callee single, and the sibling arguments batch');
+  assert.equal(provider.asked.filter(keys => keys.includes('argument_count')).length, 1, 'only print asks for a count; the known gcd arity is host-derived');
+  const waveState = provider.states[provider.asked.findIndex(keys => keys.length > 1)]!;
+  assert.equal(waveState.generation.slot, undefined, 'a wave state carries no single slot; questions carry their own');
+
+  const path = context.pathFor(attemptScope('content'));
+  const memberAt = path.findIndex(entry => entry.questionKey === 'member');
+  const siblings = path.slice(memberAt).filter(entry => /^argument_[01]$/.test(entry.questionKey));
+  assert.deepEqual(siblings.map(entry => [entry.questionKey, entry.chosen, entry.kind]),
+    [['argument_0', 'number', 'structural'], ['argument_1', 'number', 'structural']]);
+  assert.deepEqual(siblings.map(entry => entry.identity.slot), ['argument_0', 'argument_1'], 'each wave question records its own slot');
+  assert.ok(siblings.every(entry => entry.identity.field === 'content' && entry.identity.phase === 'ast'));
+  assert.equal(new Set(siblings.map(entry => entry.decisionId)).size, 2, 'wave questions get distinct decision ids');
+
+  const waveEvents = events.filter(event => event.wave !== undefined);
+  assert.equal(waveEvents.length, 2);
+  assert.equal(new Set(waveEvents.map(event => event.wave)).size, 1, 'one wave id for the whole request');
+  assert.deepEqual(waveEvents.map(event => event.slot), ['argument_0', 'argument_1']);
+  assert.deepEqual(waveEvents.map(event => event.decisionId), siblings.map(entry => entry.decisionId));
+  assert.ok(events.some(event => event.wave === undefined && event.choice !== undefined), 'single questions carry no wave id');
+  await context.dispose();
+});
+
+test('binary and compare children batch into one wave before either child is filled', async () => {
+  const provider = new AstProvider(['0', 'expr', 'call', { value: 'print' }, '1', 'binary', 'Add', 'number', 'number', { value: '1' }, { value: '2' }, 'finish']);
+  const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Python print 1 plus 2.' } }, 'content', options);
+  assert.equal(source, 'print(1 + 2)\n');
+  assert.deepEqual(provider.asked, [
+    ['unit_count'], ['module_body'], ['expression'], ['callee'], ['argument_count'], ['argument_0'], ['operator'],
+    ['left', 'right'], ['number'], ['number'], ['module_body'],
+  ], 'one wave answers both children after the operator');
+  const operatorAt = provider.slots.findIndex(slot => slot === 'operator');
+  assert.deepEqual(provider.slots.slice(operatorAt + 1, operatorAt + 3), ['left', 'right'], 'both children are asked before either is filled');
+});
+
+test('a wave question isolated by bisection is journaled through the note hook', async () => {
+  const notes: string[] = [];
+  const inner = new AstProvider(['0', 'import', 'math', 'expr', 'call', { value: 'print' }, '1', 'call', 'member', { value: 'math' },
+    'gcd', 'number', 'number', { value: '12' }, { value: '8' }, 'finish']);
+  // The wave-shaped request for argument_1 is rejected (422); the plain single-question shape succeeds.
+  const provider: DecisionProvider = { decide: async (input, questions, signal) => {
+    if (Object.keys(questions).includes('argument_1')) throw Object.assign(new Error('Jev rejected the request (422).'), { status: 422 });
+    return inner.decide(input, questions, signal);
+  } };
+  const source = await generatePythonAst(decisions(provider), { task: { prompt: 'Python import math and print math.gcd(12, 8).' } }, 'content',
+    { ...options, note: async message => { notes.push(message); } });
+  assert.equal(source, 'import math\nprint(math.gcd(12, 8))\n');
+  assert.equal(notes.length, 1);
+  assert.match(notes[0]!, /^Wave question argument_1 was skipped after a provider rejection and asked singly \(Jev rejected the request \(422\)\.\)\.$/);
+});
+
+const waveAnswer = (criteria: Record<string, string>, selected: string): unknown => ({
+  type: 'choice', choice: selected, confidence: 1,
+  probabilities: Object.fromEntries(Object.keys(criteria).map(label => [label, label === selected ? 1 : 0])),
+});
+
+const firstLabelAnswer = (questions: Questions): Record<string, unknown> =>
+  Object.fromEntries(Object.entries(questions).map(([key, question]) => [key,
+    waveAnswer(question.type === 'choice' ? question.criteria as Record<string, string> : {}, Object.keys((question.criteria ?? {}) as Record<string, string>)[0]!)]));
+
+test('a wave over the byte budget pre-splits into one request per part', async () => {
+  const calls: string[][] = [];
+  const provider: DecisionProvider = { decide: async (_state, questions) => {
+    calls.push(Object.keys(questions));
+    return { model: 'wave-fixture', usage: { input_tokens: 1, output_tokens: 1 }, answers: firstLabelAnswer(questions) } as never;
+  } };
+  const d = new Decisions(provider, 100, new AbortController().signal, undefined, 4, undefined, createRunContext());
+  const huge = 'x'.repeat(15_000);
+  const answers = await d.chooseWave({ task: { prompt: 'x' } }, {
+    a: { instruction: 'A', criteria: { x: huge, y: 'Y' } },
+    b: { instruction: 'B', criteria: { x: huge, y: 'Y' } },
+  }, { scope: attemptScope('content') });
+  assert.deepEqual(calls, [['a'], ['b']], 'each part is its own wave request');
+  assert.equal(answers.a!.choice, 'x');
+  assert.equal(answers.b!.choice, 'x');
+  assert.notEqual(answers.a!.decisionId, answers.b!.decisionId);
+  assert.equal(d.requests, 2);
+  await d.runContext.dispose();
+});
+
+test('a single-label wave question is host-derived and never sent', async () => {
+  const calls: string[][] = [];
+  const provider: DecisionProvider = { decide: async (_state, questions) => {
+    calls.push(Object.keys(questions));
+    return { model: 'wave-fixture', usage: { input_tokens: 1, output_tokens: 1 }, answers: firstLabelAnswer(questions) } as never;
+  } };
+  const d = new Decisions(provider, 100, new AbortController().signal, undefined, 4, undefined, createRunContext());
+  const answers = await d.chooseWave({}, {
+    solo: { instruction: 'S', criteria: { only: 'Only.' } },
+    pair: { instruction: 'P', criteria: { x: 'X.', y: 'Y.' } },
+  }, { scope: attemptScope('content') });
+  assert.equal(answers.solo!.choice, 'only');
+  assert.equal(answers.solo!.decisionId, undefined, 'a host-derived question records no decision');
+  assert.deepEqual(calls, [['pair']], 'only the two-label question is sent');
+  await d.runContext.dispose();
+});
+
+test('a rejected wave bisects until the bad question is isolated and falls back to a single question', async () => {
+  const calls: string[][] = [];
+  const skipped: string[] = [];
+  // The wave-shaped request for `bad` is rejected (422); the plain single-question shape succeeds.
+  const provider: DecisionProvider = { decide: async (_state, questions) => {
+    const keys = Object.keys(questions);
+    calls.push(keys);
+    const bad = Object.entries(questions).some(([, question]) => question.type === 'choice' && Object.hasOwn(question.criteria ?? {}, 'b1'));
+    if (bad && keys[0] !== 'selection') throw Object.assign(new Error('Jev rejected the request (422).'), { status: 422 });
+    return { model: 'wave-fixture', usage: { input_tokens: 1, output_tokens: 1 }, answers: firstLabelAnswer(questions) } as never;
+  } };
+  const d = new Decisions(provider, 100, new AbortController().signal, undefined, 4, undefined, createRunContext());
+  const answers = await d.chooseWave({}, {
+    good: { instruction: 'G', criteria: { g1: 'G1.', g2: 'G2.' } },
+    bad: { instruction: 'B', criteria: { b1: 'B1.', b2: 'B2.' } },
+  }, { scope: attemptScope('content'), onSkip: async (question, detail) => { skipped.push(`${question}: ${detail}`); } });
+  assert.deepEqual(calls, [['good', 'bad'], ['good'], ['bad'], ['selection']], 'the wave bisects to the bad question, then asks it singly');
+  assert.equal(answers.good!.choice, 'g1');
+  assert.equal(answers.bad!.choice, 'b1');
+  assert.equal(skipped.length, 1);
+  assert.match(skipped[0]!, /^bad: Jev rejected the request \(422\)\.$/);
+  assert.equal(d.runContext.isWaveShapeBlacklisted('bad'), false, 'one isolation does not blacklist the shape');
+  await d.runContext.dispose();
+});
+
+test('a skipped question whose single fallback also fails fails the unit loudly', async () => {
+  const calls: string[][] = [];
+  const provider: DecisionProvider = { decide: async (_state, questions) => {
+    calls.push(Object.keys(questions));
+    if (Object.entries(questions).some(([, question]) => question.type === 'choice' && Object.hasOwn(question.criteria ?? {}, 'b1'))) {
+      throw Object.assign(new Error('Jev rejected the request (422).'), { status: 422 });
+    }
+    return { model: 'wave-fixture', usage: { input_tokens: 1, output_tokens: 1 }, answers: firstLabelAnswer(questions) } as never;
+  } };
+  const d = new Decisions(provider, 100, new AbortController().signal, undefined, 4, undefined, createRunContext());
+  await assert.rejects(d.chooseWave({}, {
+    good: { instruction: 'G', criteria: { g1: 'G1.', g2: 'G2.' } },
+    bad: { instruction: 'B', criteria: { b1: 'B1.', b2: 'B2.' } },
+  }, { scope: attemptScope('content') }), /Wave question bad was skipped after a provider rejection and its single-question fallback failed: Jev rejected the request \(422\)\./);
+  assert.deepEqual(calls, [['good', 'bad'], ['good'], ['bad'], ['selection']]);
+  await d.runContext.dispose();
+});
+
+test('a 5xx wave failure surfaces without bisection and a repeat bisection blacklists the shape', async () => {
+  let calls = 0;
+  const fatal: DecisionProvider = { decide: async () => { calls++; throw Object.assign(new Error('internal server error'), { status: 500 }); } };
+  const fatalDecisions = new Decisions(fatal, 100, new AbortController().signal, undefined, 4, undefined, createRunContext());
+  await assert.rejects(fatalDecisions.chooseWave({}, {
+    a: { instruction: 'A', criteria: { a1: 'A1.', a2: 'A2.' } },
+    b: { instruction: 'B', criteria: { b1: 'B1.', b2: 'B2.' } },
+  }, { scope: attemptScope('content') }), /internal server error/);
+  assert.equal(calls, 1, 'a fatal failure is not bisected');
+  await fatalDecisions.runContext.dispose();
+
+  const calls2: string[][] = [];
+  const provider: DecisionProvider = { decide: async (_state, questions) => {
+    const keys = Object.keys(questions);
+    calls2.push(keys);
+    const bad = Object.entries(questions).some(([, question]) => question.type === 'choice' && Object.hasOwn(question.criteria ?? {}, 'b1'));
+    if (bad && keys[0] !== 'selection') throw Object.assign(new Error('Jev rejected the request (422).'), { status: 422 });
+    return { model: 'wave-fixture', usage: { input_tokens: 1, output_tokens: 1 }, answers: firstLabelAnswer(questions) } as never;
+  } };
+  const d = new Decisions(provider, 100, new AbortController().signal, undefined, 4, undefined, createRunContext());
+  const wave = (): Promise<Record<string, { choice: string }>> => d.chooseWave({}, {
+    good: { instruction: 'G', criteria: { g1: 'G1.', g2: 'G2.' } },
+    bad: { instruction: 'B', criteria: { b1: 'B1.', b2: 'B2.' } },
+  }, { scope: attemptScope('content') });
+  await wave();
+  assert.equal(d.runContext.isWaveShapeBlacklisted('bad'), false);
+  await wave();
+  assert.equal(d.runContext.isWaveShapeBlacklisted('bad'), true, 'the second isolation blacklists the shape');
+  const before = calls2.length;
+  await wave();
+  const later = calls2.slice(before);
+  assert.ok(later.every(keys => !(keys.includes('bad') && keys.includes('good'))), `a blacklisted shape never joins a wave: ${JSON.stringify(later)}`);
+  assert.deepEqual(later, [['selection'], ['good']], 'the blacklisted question is asked singly and the rest still batch');
+  await d.runContext.dispose();
+});
+
+test('the wave budget pre-check covers the singles worst case plus bisection overhead', async () => {
+  let calls = 0;
+  const provider: DecisionProvider = { decide: async (_state, questions) => {
+    calls++;
+    return { model: 'wave-fixture', usage: { input_tokens: 1, output_tokens: 1 }, answers: firstLabelAnswer(questions) } as never;
+  } };
+  const questions = {
+    a: { instruction: 'A', criteria: { a1: 'A1.', a2: 'A2.' } },
+    b: { instruction: 'B', criteria: { b1: 'B1.', b2: 'B2.' } },
+    c: { instruction: 'C', criteria: { c1: 'C1.', c2: 'C2.' } },
+  };
+  const tight = new Decisions(provider, 4, new AbortController().signal, undefined, 4, undefined, createRunContext());
+  await assert.rejects(tight.chooseWave({}, questions, { scope: attemptScope('content') }), /Request budget exhausted \(4\)\./);
+  assert.equal(calls, 0, 'the wave was not sent');
+  await tight.runContext.dispose();
+
+  const fits = new Decisions(provider, 5, new AbortController().signal, undefined, 4, undefined, createRunContext());
+  const answers = await fits.chooseWave({}, questions, { scope: attemptScope('content') });
+  assert.equal(Object.keys(answers).length, 3);
+  assert.equal(calls, 1, 'the wave itself is one request');
+  assert.equal(fits.requests, 1);
+  await fits.runContext.dispose();
 });

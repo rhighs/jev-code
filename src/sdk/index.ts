@@ -1,4 +1,4 @@
-export { DecisionSession, NEAR_TIE_GAP, isNearTie, type DecisionSessionOptions } from './decisions.js';
+export { DecisionSession, NEAR_TIE_GAP, isNearTie, waveFailureKind, type DecisionSessionOptions } from './decisions.js';
 export {
   RunContext,
   RunContextDisposedError,
@@ -82,4 +82,7 @@ export {
   type ResourceKind,
   type ScoreDecisionResult,
   type TokenUsage,
+  type WaveChoice,
+  type WaveDecisionResult,
+  type WaveQuestion,
 } from './types.js';

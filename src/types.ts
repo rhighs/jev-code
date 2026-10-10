@@ -78,6 +78,8 @@ export interface DecisionEventData {
   decisionId?: number;
   /** Canonical near-tie flag: top-two gap <= 0.1 or the chosen label is not the probability argmax. */
   nearTie?: boolean;
+  /** Wave (batched request) id; every question answered by one request carries the same id. */
+  wave?: number;
 }
 export interface TextEventData extends TextProgress {
   field: string;

@@ -10,7 +10,7 @@ import type { HarnessEvent } from '../src/types.js';
 import { ScriptedProvider } from './helpers.js';
 
 const FIXTURE = new URL('./fixtures/events-baseline.jsonl', import.meta.url);
-const ADDED: Record<string, string[]> = { start: ['schema'], decision: ['options', 'field', 'phase', 'slot', 'unit', 'candidate', 'line'] };
+const ADDED: Record<string, string[]> = { start: ['schema'], decision: ['options', 'field', 'phase', 'slot', 'unit', 'candidate', 'line', 'decisionId', 'nearTie', 'wave'] };
 
 const mask = (event: HarnessEvent, ws: string): Record<string, unknown> => {
   const val = JSON.parse(JSON.stringify(event).replaceAll(ws, '<ws>')) as Record<string, unknown>;

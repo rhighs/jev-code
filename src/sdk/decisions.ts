@@ -12,6 +12,8 @@ import {
   type ProbabilityDecisionResult,
   type ScoreDecisionResult,
   type TokenUsage,
+  type WaveDecisionResult,
+  type WaveQuestion,
 } from './types.js';
 
 const ROUNDING_STEP = 0.01;
@@ -101,6 +103,20 @@ export const isNearTie = (alternatives: readonly DecisionAlternative[], chosen: 
   if (argmax === undefined) return false;
   if (chosen !== argmax) return true;
   return second === Number.NEGATIVE_INFINITY || top - second <= NEAR_TIE_GAP + NEAR_TIE_EPSILON;
+};
+
+/**
+ * Classify a wave failure for the bisection policy: `bisect` when the platform rejected the
+ * request shape (HTTP 422, surfaced after the SDK's own retries) or answered with an invalid
+ * response, so the offending question can be isolated; `fatal` for everything else (retried 5xx
+ * surfaced, cancellation, limits), which fails the wave as a unit.
+ */
+export const waveFailureKind = (error: unknown): 'bisect' | 'fatal' => {
+  if (!(error instanceof DecisionError)) return 'fatal';
+  if (error.evidence.kind === 'invalid-response') return 'bisect';
+  const cause = error.cause;
+  if (isRecord(cause) && cause.status === 422) return 'bisect';
+  return /\b422\b|unprocessable entity/i.test(error.message) ? 'bisect' : 'fatal';
 };
 
 const assertJsonValue = (value: unknown, ancestors: Set<object>): void => {
@@ -275,6 +291,44 @@ export class DecisionSession {
     const result: ManyChoiceDecisionResult = {
       type: 'many-choice',
       value: values,
+      metadata: { model: response.model, usage: this.usage(response), questions: questionKeys.length },
+    };
+    await this.notify(result);
+    return result;
+  }
+
+  /**
+   * One request answers every question in the wave, each with its own instruction and criteria.
+   * Callers must guarantee the dependency rule: no question's criteria may depend on a sibling
+   * answer. One wave is one provider request; per-question identity and event emission happen at
+   * the facade (src/decisions.ts), which owns decision ids and wave ids.
+   */
+  async chooseWave(state: JsonObject, questions: Record<string, WaveQuestion>): Promise<WaveDecisionResult> {
+    const questionKeys = Object.keys(questions);
+    if (questionKeys.length === 0) throw new Error('chooseWave requires at least one question.');
+    for (const key of questionKeys) {
+      const labels = Object.keys(questions[key]!.criteria);
+      if (labels.length < 2 || labels.length > 255) throw new Error('Choice requires 2-255 candidates.');
+    }
+    const asked = Object.fromEntries(questionKeys.map(key => [key, choice(questions[key]!.instruction, questions[key]!.criteria)]));
+    const response = await this.ask(state, asked);
+    this.assertAnswerKeys(response.answers, questionKeys);
+    const value: WaveDecisionResult['value'] = {};
+    for (const key of questionKeys) {
+      const criteria = questions[key]!.criteria;
+      const answer: unknown = response.answers[key];
+      if (!isRecord(answer) || answer.type !== 'choice' || typeof answer.choice !== 'string' || !Object.hasOwn(criteria, answer.choice)) {
+        invalid(`Jev returned an invalid or missing wave choice: ${key}`);
+      }
+      assertExactKeys(answer, ['type', 'choice', 'confidence', 'probabilities'], `Jev returned an invalid or missing wave choice: ${key}`);
+      const probabilities = assertDistribution(answer.probabilities, Object.keys(criteria), `Jev returned an invalid wave distribution: ${key}`,
+        label => `Jev returned an invalid or missing wave probability: ${key}.${label}`);
+      const confidence = assertUnit(answer.confidence, `Jev returned invalid confidence for: ${key}`);
+      value[key] = { choice: answer.choice, confidence, score: probabilities[answer.choice]!, probabilities, alternatives: topAlternatives(probabilities) };
+    }
+    const result: WaveDecisionResult = {
+      type: 'wave',
+      value,
       metadata: { model: response.model, usage: this.usage(response), questions: questionKeys.length },
     };
     await this.notify(result);

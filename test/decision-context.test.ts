@@ -57,29 +57,34 @@ class LongProvider implements DecisionProvider {
   constructor(private script: Array<string | { value: string }>) {}
   async decide<Q extends Questions>(input: EntryType, questions: Q): Promise<SystemOneResult<Q>> {
     this.requests.push(bytes({ state: input, questions }));
-    const desired = this.script.shift();
-    assert.notEqual(desired, undefined);
-    const question = questions.selection!;
-    if (question.type !== 'choice') throw new Error('Expected Choice');
-    const selection = typeof desired === 'string' ? desired : Object.entries(question.criteria).find(([, label]) => label === desired!.value)?.[0];
-    assert.ok(selection, `Unavailable ${JSON.stringify(desired)}`);
-    return { model: 'fixture', usage: { input_tokens: 1, output_tokens: 1 }, answers: {
-      selection: { type: 'choice', choice: selection, confidence: 1, probabilities: Object.fromEntries(Object.keys(question.criteria).map(key => [key, Number(key === selection)])) },
-    } } as unknown as SystemOneResult<Q>;
+    const answers: Record<string, unknown> = {};
+    for (const [key, question] of Object.entries(questions)) {
+      const desired = this.script.shift();
+      assert.notEqual(desired, undefined);
+      assert.equal(question.type, 'choice');
+      if (question.type !== 'choice') throw new Error('Expected Choice');
+      const selection = typeof desired === 'string' ? desired : Object.entries(question.criteria).find(([, label]) => label === desired!.value)?.[0];
+      assert.ok(selection, `Unavailable ${JSON.stringify(desired)}`);
+      answers[key] = { type: 'choice', choice: selection, confidence: 1, probabilities: Object.fromEntries(Object.keys(question.criteria).map(key => [key, Number(key === selection)])) };
+    }
+    return { model: 'fixture', usage: { input_tokens: 1, output_tokens: 1 }, answers } as unknown as SystemOneResult<Q>;
   }
 }
 
 test('a long partial program keeps every decision request under the cap and generation continues', async () => {
   const literal = 'lorem ipsum '.repeat(45).trim();
   const blocks = 3, per = 13, lines = blocks * (per + 1);
-  const chunk = (b: number): Array<string | { value: string }> => ['if', 'boolean', b % 2 ? 'false' : 'true', ...Array.from({ length: per }, (_, i) => ['expr', 'call', { value: 'print' }, ...(i % 2 ? ['2', 'string', { value: JSON.stringify(literal) }] : ['1']), 'string', { value: JSON.stringify(literal) }]).flat(), 'finish', 'no'];
+  // A two-argument print batches its sibling productions into one wave: the two 'string'
+  // productions are answered by one request before the per-argument terminals.
+  const chunk = (b: number): Array<string | { value: string }> => ['if', 'boolean', b % 2 ? 'false' : 'true', ...Array.from({ length: per }, (_, i) => ['expr', 'call', { value: 'print' }, ...(i % 2 ? ['2', 'string', 'string', { value: JSON.stringify(literal) }, { value: JSON.stringify(literal) }] : ['1', 'string', { value: JSON.stringify(literal) }])]).flat(), 'finish', 'no'];
   const script = ['0' as string | { value: string }].concat(Array.from({ length: blocks }, (_, b) => chunk(b)).flat(), 'finish');
   const expected = script.length;
+  const waves = blocks * Array.from({ length: per }, (_, i) => i % 2).filter(Boolean).length;
   const provider = new LongProvider(script);
   const decisions = new Decisions(provider, 1000, new AbortController().signal);
   const result = await generatePythonAst(decisions, { task: { prompt: `Python print "${literal}" ${blocks * per} times.` } }, 'content', { maxSteps: 1000, maxBytes: 256_000, allowEmpty: false, fragments: [] });
   assert.equal(result.split('\n').filter(Boolean).length, lines);
-  assert.equal(provider.requests.length, expected);
+  assert.equal(provider.requests.length, expected - waves, 'each two-argument print collapses its sibling productions into one wave');
   assert.ok(provider.requests.every(size => size <= MAX_GRID_REQUEST_BYTES), `largest request ${Math.max(...provider.requests)}`);
 });
 

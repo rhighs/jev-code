@@ -179,6 +179,41 @@ test('a JS/TS syntax hint drops productions matching the diagnostic in the retry
   assert.ok(unmatched['printed']!.includes('call'), 'unmatched diagnostics stay message-only');
 });
 
+test('choice-shaped tool fields batch into one request and decode per field', async () => {
+  const provider = new ScriptedProvider([{ action: 'probe', args: { flag: 'true', mode: 'fast' } }]);
+  const decisions = new Decisions(provider, 100, new AbortController().signal);
+  const args = await generateArguments(decisions, { task: { turn: 1, prompt: 'Probe the gadget.' }, action: 'probe' }, {
+    flag: { type: 'boolean', description: 'Flag.' },
+    mode: { type: 'enum', description: 'Mode.', choices: { fast: 'Fast.', slow: 'Slow.' } },
+  }, { fragments: [], maxSteps: 8 });
+  assert.deepEqual(args, { flag: true, mode: 'fast' });
+  assert.deepEqual(provider.requests, [['flag', 'mode']], 'both choice-shaped fields share one wave request');
+  assert.equal(decisions.requests, 1);
+});
+
+test('a single choice-shaped field keeps the single-question path', async () => {
+  const provider = new ScriptedProvider([{ action: 'probe', args: { flag: 'false' } }]);
+  const decisions = new Decisions(provider, 100, new AbortController().signal);
+  const args = await generateArguments(decisions, { task: { turn: 1, prompt: 'Probe the gadget.' }, action: 'probe' },
+    { flag: { type: 'boolean', description: 'Flag.' } }, { fragments: [], maxSteps: 8 });
+  assert.deepEqual(args, { flag: false });
+  assert.deepEqual(provider.requests, [['selection']], 'a lone choice field is not a wave');
+});
+
+test('the field wave excludes number fields, which keep their own decision', async () => {
+  const provider = new ScriptedProvider([{ action: 'probe', args: { flag: 'true', mode: 'slow', size: '10' } }]);
+  const decisions = new Decisions(provider, 100, new AbortController().signal);
+  const args = await generateArguments(decisions, { task: { turn: 1, prompt: 'Probe the gadget.' }, action: 'probe' }, {
+    flag: { type: 'boolean', description: 'Flag.' },
+    mode: { type: 'enum', description: 'Mode.', choices: { fast: 'Fast.', slow: 'Slow.' } },
+    size: { type: 'number', description: 'Size.', default: 5, min: 1, max: 100 },
+  }, { fragments: [], maxSteps: 8 });
+  assert.deepEqual(args, { flag: true, mode: 'slow', size: 10 });
+  const requests = provider.requests.map(keys => [...keys].sort());
+  assert.deepEqual(requests.sort(), [['flag', 'mode'], ['selection']], 'the wave carries only the choice-shaped fields');
+  assert.equal(decisions.requests, 2);
+});
+
 test('an over-budget enum field decision fails without sending a request', async () => {
   const provider = new ScriptedProvider([{ action: 'gadget' }]);
   const decisions = new Decisions(provider, 100, new AbortController().signal);

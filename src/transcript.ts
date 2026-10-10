@@ -22,6 +22,8 @@ export interface ToolItem {
 export interface Decision {
   turn: number; choice: string; confidence?: number; options: DecisionOption[]; lowConfidence: boolean;
   field?: string; slot?: string; unit?: string; candidate?: number;
+  /** Monotonic decision id and the wave (batched request) id, when the event carried them. */
+  decisionId?: number; wave?: number;
 }
 export type Item =
   | { kind: 'prompt'; text: string }
@@ -39,17 +41,22 @@ export interface Live {
 export interface TranscriptState {
   schema?: number; items: Item[]; live?: Live; decisions: Decision[]; requests: number; files: string[]; turn: number; elapsedMs: number;
   limits?: { turns: number; requests: number }; records: ToolRecord[];
+  /** Wave ids already counted, so every question of one wave increments `requests` exactly once. */
+  waves: Set<number>;
 }
 
 export const RING = 20;
 const SOURCE_LINES = 8, OUTPUT_LINES = 6, PATH_LINES = 8, COMMAND_LINES = 40;
 export { OUTPUT_LINES };
 
-export const initialState = (): TranscriptState => ({ items: [], decisions: [], requests: 0, files: [], turn: 0, elapsedMs: 0, records: [] });
+export const initialState = (): TranscriptState => ({ items: [], decisions: [], requests: 0, files: [], turn: 0, elapsedMs: 0, records: [], waves: new Set() });
 
 const lines = (text: string): string[] => text === '' ? [] : text.replace(/\n$/, '').split('\n');
 const clip = <T>(all: T[], max: number): { head: T[]; remaining: number } => ({ head: all.slice(0, max), remaining: Math.max(0, all.length - max) });
 const key = (d: { field?: string; unit?: string; candidate?: number }): string => `${d.field ?? ''}|${d.unit ?? ''}|${d.candidate ?? ''}`;
+/** Pairing key: a decision id when the event carried one (wave questions), the legacy identity otherwise. */
+const pairKey = (d: { decisionId?: number; field?: string; unit?: string; candidate?: number }): string =>
+  d.decisionId === undefined ? key(d) : `#${d.decisionId}`;
 const str = (val: unknown): string => typeof val === 'string' ? val : '';
 const pendingBody = (b: Body): Body => b.kind === 'source' ? { ...b, hint: 'written after approval' } : b;
 const gridSource = (cells: Array<string | null>, columns: number): string => {
@@ -133,17 +140,23 @@ export function reduce(state: TranscriptState, event: HarnessEvent | SessionEven
     case 'input': return { ...state, items: [...state.items, { kind: 'update', text: event.data.instruction }] };
     case 'action': return { ...state, live: live(state, card(event.turn, event.data.tool, at)) };
     case 'decision': {
-      const requests = state.requests + 1;
+      // One request per wave: every question of a wave carries the same `wave` id and only the
+      // first increments the request counters.
+      const wave = event.data.wave;
+      const counted = wave === undefined || !state.waves.has(wave);
+      const requests = state.requests + (counted ? 1 : 0);
+      const waves = counted && wave !== undefined ? new Set(state.waves).add(wave) : state.waves;
       const cur = state.live;
-      if (event.data.choice === undefined) return { ...state, requests, ...(cur ? { live: { ...cur, card: { ...cur.card, requests: cur.card.requests + 1 } } } : {}) };
-      const { choice, confidence, options = [], field, slot, unit, candidate } = event.data;
+      if (event.data.choice === undefined) return { ...state, requests, waves, ...(cur ? { live: { ...cur, card: { ...cur.card, requests: cur.card.requests + (counted ? 1 : 0) } } } : {}) };
+      const { choice, confidence, options = [], field, slot, unit, candidate, decisionId } = event.data;
       const d: Decision = { turn: event.turn, choice, options, lowConfidence: lowConfidence(options, confidence),
         ...(confidence === undefined ? {} : { confidence }), ...(field === undefined ? {} : { field }),
-        ...(slot === undefined ? {} : { slot }), ...(unit === undefined ? {} : { unit }), ...(candidate === undefined ? {} : { candidate }) };
+        ...(slot === undefined ? {} : { slot }), ...(unit === undefined ? {} : { unit }), ...(candidate === undefined ? {} : { candidate }),
+        ...(decisionId === undefined ? {} : { decisionId }), ...(wave === undefined ? {} : { wave }) };
       const decisions = [...state.decisions, d].slice(-RING);
-      if (!cur) return { ...state, requests, decisions };
-      const mine = cur.decision === undefined || key(d) === key(cur);
-      return { ...state, requests, decisions, live: { ...cur, card: { ...cur.card, requests: cur.card.requests + 1 }, latest: { ...cur.latest, [key(d)]: d }, ...(mine ? { decision: d } : {}) } };
+      if (!cur) return { ...state, requests, waves, decisions };
+      const mine = cur.decision === undefined || pairKey(d) === pairKey(cur.decision);
+      return { ...state, requests, waves, decisions, live: { ...cur, card: { ...cur.card, requests: cur.card.requests + (counted ? 1 : 0) }, latest: { ...cur.latest, [pairKey(d)]: d }, ...(mine ? { decision: d } : {}) } };
     }
     case 'text': {
       const { field, change, decoder, ast } = event.data;
@@ -165,7 +178,9 @@ export function reduce(state: TranscriptState, event: HarnessEvent | SessionEven
         next.slot = ast.slot; next.production = ast.production;
         if (ast.unit === undefined) delete next.unit; else next.unit = ast.unit;
         if (ast.candidate === undefined) delete next.candidate; else next.candidate = ast.candidate;
-        const paired = cur.latest[key({ field, ...(ast.unit === undefined ? {} : { unit: ast.unit }), ...(ast.candidate === undefined ? {} : { candidate: ast.candidate }) })];
+        // Pair by decision id when the step carries one (wave questions); fall back to the identity key.
+        const fallback = key({ field, ...(ast.unit === undefined ? {} : { unit: ast.unit }), ...(ast.candidate === undefined ? {} : { candidate: ast.candidate }) });
+        const paired = (ast.decisionId === undefined ? undefined : cur.latest[`#${ast.decisionId}`]) ?? cur.latest[fallback];
         next.decision = paired?.slot === ast.slot ? paired
           : { turn: event.turn, choice: ast.production, options: [], lowConfidence: false, field, slot: ast.slot, ...(ast.unit === undefined ? {} : { unit: ast.unit }), ...(ast.candidate === undefined ? {} : { candidate: ast.candidate }) };
       }

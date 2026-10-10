@@ -72,10 +72,13 @@ export interface TestState {
 export class ScriptedProvider implements DecisionProvider {
   states: TestState[] = [];
   actions: Array<{ turn: number; offered: string[] }> = [];
+  /** Question keys per request, so wave batching is observable. */
+  requests: string[][] = [];
   constructor(private readonly steps: Step[], private readonly inspect?: (state: TestState) => void) {}
   async decide<Q extends Questions>(input: EntryType, questions: Q, _signal?: AbortSignal): Promise<SystemOneResult<Q>> {
     const state = input as unknown as TestState;
     this.states.push(structuredClone(state));
+    this.requests.push(Object.keys(questions));
     this.inspect?.(state);
     const step = this.steps[state.task.turn - 1];
     assert.ok(step, `No scripted step for turn ${state.task.turn}`);
@@ -89,11 +92,11 @@ export class ScriptedProvider implements DecisionProvider {
       assert.equal(question.type, 'choice');
       if (question.type !== 'choice') throw new Error('Only Choice and Noul are used.');
       let selected = step.action;
-      if (!state.generation && !state.completionCheck && !state.field) this.actions.push({ turn: state.task.turn, offered: Object.keys(question.criteria) });
+      if (!state.generation && !state.completionCheck && !state.field && key === 'selection') this.actions.push({ turn: state.task.turn, offered: Object.keys(question.criteria) });
       if (state.completionCheck) selected = (step.verdict ?? 1) >= 0.5 ? 'complete' : 'continue';
       if (state.generation?.phase.startsWith('plan')) selected = 'free';
-      if (!state.generation && state.field && !state.completionCheck && !Object.hasOwn(question.criteria, 'default') && !Object.hasOwn(question.criteria, 'custom')) {
-        const value = step.args?.[state.field];
+      if (!state.generation && !state.completionCheck && !Object.hasOwn(question.criteria, 'default') && !Object.hasOwn(question.criteria, 'custom')) {
+        const value = step.args?.[state.field ?? key];
         if (value !== undefined && Object.hasOwn(question.criteria, value)) selected = value;
       }
       if (state.generation?.phase === 'bash_ast') {
