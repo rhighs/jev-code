@@ -1,5 +1,6 @@
 import { choice, noul, score, type EntryType, type Questions, type ScoreCriteria, type SystemOneResult } from '@typesafe-ai/sdk';
 import { RunResources, resourceView, type ProgramResourceView, type RunResourceOptions } from './resources.js';
+import { defaultRunContext, type RunContext } from '../run-context.js';
 import {
   DecisionError,
   type ChoiceDecisionResult,
@@ -16,10 +17,15 @@ import {
 const ROUNDING_STEP = 0.01;
 const MAX_DISTRIBUTION_DRIFT = 0.1;
 const MAX_ALTERNATIVES = 4;
+/** Inclusive runner-up gap below which a choice counts as a near-tie. */
+export const NEAR_TIE_GAP = 0.1;
+const NEAR_TIE_EPSILON = 1e-9;
 
 export interface DecisionSessionOptions extends RunResourceOptions {
   onDecision?: (result: DecisionResult) => void | Promise<void>;
   eventTimeoutMs?: number;
+  /** Run-scoped generation state; defaults to the process-scoped default context. */
+  runContext?: RunContext;
 }
 
 interface SessionInternals {
@@ -27,6 +33,7 @@ interface SessionInternals {
   readonly resources: RunResources;
   readonly onDecision?: (result: DecisionResult) => void | Promise<void>;
   readonly eventTimeoutMs: number;
+  readonly runContext: RunContext;
 }
 
 const DEFAULT_EVENT_TIMEOUT_MS = 5_000;
@@ -75,6 +82,27 @@ const topAlternatives = (probabilities: Record<string, number>, labels: (key: st
     .slice(0, MAX_ALTERNATIVES)
     .map(([label, probability]) => ({ label: labels(label), probability }));
 
+/**
+ * The canonical near-tie rule, computed once from the ranked alternatives: the top two
+ * probabilities are within the inclusive gap (NEAR_TIE_GAP), or the chosen label is not the
+ * probability argmax. The transcript's `lowConfidence` keeps its own strict comparison.
+ */
+export const isNearTie = (alternatives: readonly DecisionAlternative[], chosen: string): boolean => {
+  let top = Number.NEGATIVE_INFINITY, second = Number.NEGATIVE_INFINITY, argmax: string | undefined;
+  for (const alternative of alternatives) {
+    if (alternative.probability > top) {
+      second = top;
+      top = alternative.probability;
+      argmax = alternative.label;
+    } else if (alternative.probability > second) {
+      second = alternative.probability;
+    }
+  }
+  if (argmax === undefined) return false;
+  if (chosen !== argmax) return true;
+  return second === Number.NEGATIVE_INFINITY || top - second <= NEAR_TIE_GAP + NEAR_TIE_EPSILON;
+};
+
 const assertJsonValue = (value: unknown, ancestors: Set<object>): void => {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
   if (typeof value === 'number') {
@@ -110,6 +138,8 @@ const cloneState = (state: JsonObject): EntryType => {
 export class DecisionSession {
   get resources(): ProgramResourceView { return resourceView(sessionInternals.get(this)!.resources); }
   get signal(): AbortSignal { return sessionInternals.get(this)!.resources.signal; }
+  /** The run-scoped generation context this session records into. */
+  get runContext(): RunContext { return sessionInternals.get(this)!.runContext; }
 
   constructor(
     provider: DecisionProvider,
@@ -122,23 +152,24 @@ export class DecisionSession {
       resources: new RunResources(options),
       ...(options.onDecision === undefined ? {} : { onDecision: options.onDecision }),
       eventTimeoutMs,
+      runContext: options.runContext ?? defaultRunContext(),
     });
   }
 
   fork(signal?: AbortSignal): DecisionSession {
     const internals = sessionInternals.get(this)!;
-    return createDecisionSession(internals.provider, internals.resources.fork(signal), internals.onDecision, internals.eventTimeoutMs);
+    return createDecisionSession(internals.provider, internals.resources.fork(signal), internals.onDecision, internals.eventTimeoutMs, internals.runContext);
   }
 
   observe(onDecision: (result: DecisionResult) => void | Promise<void>): DecisionSession {
     const internals = sessionInternals.get(this)!;
     if (internals.onDecision === undefined) {
-      return createDecisionSession(internals.provider, internals.resources, onDecision, internals.eventTimeoutMs);
+      return createDecisionSession(internals.provider, internals.resources, onDecision, internals.eventTimeoutMs, internals.runContext);
     }
     const previous = internals.onDecision;
     return createDecisionSession(internals.provider, internals.resources, async result => {
         await Promise.all([previous(result), onDecision(result)]);
-      }, internals.eventTimeoutMs);
+      }, internals.eventTimeoutMs, internals.runContext);
   }
 
   async choose<const Criteria extends Record<string, string>>(
@@ -308,9 +339,10 @@ export const createDecisionSession = (
   resources: RunResources,
   onDecision?: (result: DecisionResult) => void | Promise<void>,
   eventTimeoutMs = DEFAULT_EVENT_TIMEOUT_MS,
+  runContext?: RunContext,
 ): DecisionSession => {
   const session = Object.create(DecisionSession.prototype) as DecisionSession;
-  sessionInternals.set(session, { provider, resources, ...(onDecision === undefined ? {} : { onDecision }), eventTimeoutMs });
+  sessionInternals.set(session, { provider, resources, ...(onDecision === undefined ? {} : { onDecision }), eventTimeoutMs, runContext: runContext ?? defaultRunContext() });
   return session;
 };
 
@@ -318,5 +350,5 @@ export const decisionSessionResources = (session: DecisionSession): RunResources
 
 export const rebindDecisionSession = (session: DecisionSession, resources: RunResources): DecisionSession => {
   const internals = sessionInternals.get(session)!;
-  return createDecisionSession(internals.provider, resources, internals.onDecision, internals.eventTimeoutMs);
+  return createDecisionSession(internals.provider, resources, internals.onDecision, internals.eventTimeoutMs, internals.runContext);
 };

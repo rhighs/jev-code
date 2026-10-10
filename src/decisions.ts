@@ -1,6 +1,7 @@
-import { DecisionSession, createDecisionSession } from './sdk/decisions.js';
+import { DecisionSession, createDecisionSession, isNearTie } from './sdk/decisions.js';
 import { RunResources } from './sdk/resources.js';
 import { DecisionError, LimitError, type DecisionProvider, type DecisionResult, type JsonObject } from './sdk/types.js';
+import { defaultRunContext, type PathChoice, type PathDecisionRequest, type RunContext } from './run-context.js';
 import type { DecisionEventData } from './types.js';
 
 export type State = Record<string, unknown>;
@@ -42,6 +43,8 @@ export class Decisions {
   get exhausted(): boolean { return this.requests >= this.maxRequests; }
   get usage(): { inputTokens: number; outputTokens: number } { return this.resources.snapshot().usage; }
   readonly signal: AbortSignal;
+  /** Run-scoped generation state shared by this facade and every fork. */
+  readonly runContext: RunContext;
 
   private readonly resources: RunResources;
   private readonly session: DecisionSession;
@@ -53,18 +56,20 @@ export class Decisions {
     private readonly onDecision: (data: DecisionEventData) => Promise<void> = async () => {},
     concurrency = 4,
     resources?: RunResources,
+    context?: RunContext,
   ) {
+    this.runContext = context ?? defaultRunContext();
     this.resources = resources ?? new RunResources({ limits: { decisions: maxRequests }, signal, concurrency });
-    this.session = createDecisionSession(provider, this.resources);
+    this.session = createDecisionSession(provider, this.resources, undefined, undefined, this.runContext);
     this.signal = this.resources.signal;
   }
 
   fork(signal: AbortSignal): Decisions {
-    return new Decisions(this.provider, this.maxRequests, signal, this.onDecision, 1, this.resources.fork(signal));
+    return new Decisions(this.provider, this.maxRequests, signal, this.onDecision, 1, this.resources.fork(signal), this.runContext);
   }
 
   observe(onDecision: (data: DecisionEventData) => Promise<void>): Decisions {
-    return new Decisions(this.provider, this.maxRequests, this.signal, onDecision, 1, this.resources);
+    return new Decisions(this.provider, this.maxRequests, this.signal, onDecision, 1, this.resources, this.runContext);
   }
 
   /** Public SDK session sharing this facade's budget, cancellation, usage, and event observer. */
@@ -103,6 +108,33 @@ export class Decisions {
   async choose(state: State, instructions: string, criteria: Record<string, string>): Promise<string> {
     const result = await this.observed(state).choose(jsonState(state), instructions, criteria);
     return result.value;
+  }
+
+  /**
+   * Alternatives-aware choice: records the pick, its retained alternatives, and the canonical
+   * near-tie flag in the run context, and attaches `decisionId`/`nearTie` to the decision event.
+   * Callers that do not need repair data keep using choose().
+   */
+  async chooseWithAlternatives(state: State, instructions: string, criteria: Record<string, string>, request: PathDecisionRequest): Promise<PathChoice> {
+    const context = request.context ?? this.runContext;
+    let captured: PathChoice | undefined;
+    const session = this.session.observe(async (result: DecisionResult) => {
+      if (result.type !== 'choice') throw new DecisionError('chooseWithAlternatives requires a choice result.');
+      const alternatives = [...result.metadata.alternatives];
+      const nearTie = isNearTie(alternatives, result.value);
+      const decisionId = context.allocateDecisionId();
+      captured = { choice: result.value, decisionId, alternatives, nearTie };
+      const currentIdentity = identity(state);
+      context.recordDecision(request.scope, {
+        decisionId, questionKey: request.questionKey, identity: currentIdentity,
+        chosen: result.value, alternatives, nearTie, kind: request.kind,
+      });
+      await this.onDecision({ choice: result.value, confidence: result.metadata.confidence, model: result.metadata.model,
+        options: alternatives, decisionId, nearTie, ...currentIdentity });
+    });
+    await session.choose(jsonState(state), instructions, criteria);
+    if (captured === undefined) throw new DecisionError('The choice decision did not report a result.');
+    return captured;
   }
 
   async probability(state: State, instructions: string): Promise<number> {

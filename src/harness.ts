@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, open, realpath, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Decisions, jsonState, type State } from './decisions.js';
+import { createRunContext } from './run-context.js';
 import { fragmentsFrom, generateArguments, generateText } from './generation.js';
 import { builtInTools, toolContext } from './tools.js';
 import { listWorkspace, resolveWorkspacePath } from './workspace.js';
@@ -154,6 +155,7 @@ export class Harness {
     const startedAt = new Date().toISOString();
     const started = performance.now();
     const id = randomUUID();
+    const runContext = createRunContext();
     const controller = new AbortController();
     const deadline = setTimeout(() => controller.abort(new LimitError('Run time budget exhausted.')), this.options.maxRunMs ?? DEFAULT_LIMITS.maxRunMs);
     const signal = externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal;
@@ -173,7 +175,7 @@ export class Harness {
       eventQueue = write.catch(() => {});
       return write;
     };
-    const decisions = new Decisions(this.options.provider, this.options.maxRequests ?? DEFAULT_LIMITS.maxRequests, signal, data => emit('decision', data), this.options.concurrency ?? 4);
+    const decisions = new Decisions(this.options.provider, this.options.maxRequests ?? DEFAULT_LIMITS.maxRequests, signal, data => emit('decision', data), this.options.concurrency ?? 4, undefined, runContext);
     let status: RunStatus = 'limited', summary = 'Turn budget exhausted; task was not reported complete.';
     let modelSummary: string | undefined;
     try {
@@ -243,7 +245,7 @@ export class Harness {
         ])]);
         const generationOptions = {
           maxSteps: this.options.maxGenerationSteps ?? DEFAULT_LIMITS.maxGenerationSteps, fragments,
-          astRegistry: this.astRegistry,
+          astRegistry: this.astRegistry, context: runContext,
           experimentalGrid: this.options.experimentalGrid ?? false,
           gridBatchSize: this.options.gridBatchSize ?? 8, concurrency: this.options.concurrency ?? 4, searchWidth: this.options.searchWidth ?? 1,
           // Patch events preserve the scored cells without duplicating the draft per batch.
@@ -340,7 +342,12 @@ export class Harness {
       return result;
     } finally {
       try { await journalHandle?.close(); }
-      finally { this.pendingInputs.length = 0; this.running = false; }
+      finally {
+        this.pendingInputs.length = 0;
+        this.running = false;
+        // The run owns the context; disposal shuts down its worker after the last event.
+        await runContext.dispose();
+      }
     }
   }
 }

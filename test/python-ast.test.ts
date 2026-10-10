@@ -6,8 +6,9 @@ import { join } from 'node:path';
 import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import { Decisions } from '../src/decisions.js';
 import { generatePythonAst, unparsePython } from '../src/python-ast.js';
+import { attemptScope, closeDefaultRunContext, createRunContext, defaultRunContext } from '../src/run-context.js';
 import { Harness } from '../src/harness.js';
-import type { DecisionProvider, HarnessEvent } from '../src/types.js';
+import type { DecisionEventData, DecisionProvider, HarnessEvent } from '../src/types.js';
 import { ScriptedProvider } from './helpers.js';
 
 interface AstState { generation: { phase: string; slot: string; partialSource: string; partialAst?: unknown; symbols: string[]; constraints: { inFunction: boolean; inLoop: boolean } } }
@@ -256,4 +257,38 @@ test('a call nested two levels inside call arguments is not offered a third call
   const inner = provider.criteria[slots.lastIndexOf('argument_0')]!;
   assert.ok(!Object.hasOwn(inner, 'call'));
   assert.ok(Object.hasOwn(provider.criteria[slots.indexOf('argument_0')]!, 'call'));
+});
+
+test('builder decisions record leaf and structural path entries with monotonic ids and event fields', async () => {
+  const context = createRunContext();
+  const events: DecisionEventData[] = [];
+  const provider = new AstProvider(['0', ...hello()]);
+  const d = new Decisions(provider, 100, new AbortController().signal, async data => { events.push(data); }, 4, undefined, context);
+  assert.equal(await generatePythonAst(d, state, 'content', options), "print('Hello, world!')\n");
+
+  const path = context.pathFor(attemptScope('content'));
+  assert.deepEqual(path.map(entry => [entry.questionKey, entry.kind]), [
+    ['unit_count', 'structural'], ['module_body', 'structural'], ['expression', 'structural'], ['callee', 'structural'],
+    ['argument_count', 'structural'], ['argument_0', 'structural'], ['string', 'leaf'], ['module_body', 'structural'],
+  ]);
+  assert.ok(path.every(entry => entry.alternatives.length >= 2 && entry.chosen.length > 0 && entry.identity.field === 'content'));
+  for (let index = 1; index < path.length; index++) assert.ok(path[index]!.decisionId > path[index - 1]!.decisionId);
+  assert.deepEqual(events.map(event => event.decisionId), path.map(entry => entry.decisionId));
+  assert.ok(events.every(event => event.nearTie === false && event.field === 'content' && event.phase === 'ast'));
+  assert.deepEqual(events.find(event => event.slot === 'string')!.options, path.at(-2)!.alternatives);
+  assert.equal(context.decisionEntry(path[0]!.decisionId), path[0]);
+  await context.dispose();
+});
+
+test('a direct generation without an explicit context uses the process default and closes it explicitly', async () => {
+  const provider = new AstProvider(['0', ...hello()]);
+  const d = decisions(provider);
+  assert.equal(d.runContext, defaultRunContext());
+  assert.equal(await generatePythonAst(d, state, 'content', options), "print('Hello, world!')\n");
+  const context = d.runContext;
+  assert.ok(context.pathFor(attemptScope('content')).length > 0);
+  assert.equal(context.isDisposed, false);
+  await closeDefaultRunContext();
+  assert.equal(context.isDisposed, true);
+  assert.throws(() => context.allocateDecisionId(), /disposed/);
 });

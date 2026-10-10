@@ -3,7 +3,9 @@ import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import type { AstAdapter } from '../src/ast-adapters.js';
 import { Harness } from '../src/harness.js';
+import { attemptScope, createRunContext, type RunContext } from '../src/run-context.js';
 import { builtInTools } from '../src/tools.js';
 import type { DecisionProvider, Tool } from '../src/types.js';
 import { ScriptedProvider, type Step } from './helpers.js';
@@ -417,4 +419,78 @@ test('an identical call that failed twice removes its tool until another action 
   const result = await new Harness({ experimentalGrid: true, workspace: root, provider, journalDirectory: false }).run('What is in missing.py?');
   assert.equal(result.status, 'completed');
   assert.match(feedback[0] ?? '', /read_file .*failed 2 times/);
+});
+
+test('sequential runs create isolated run contexts that are disposed at run end', async t => {
+  const root = await workspace(t);
+  const contexts: RunContext[] = [];
+  const beforePaths: number[] = [];
+  const beforeUnits: number[] = [];
+  const scope = attemptScope('content');
+  const scripted = new ScriptedProvider([
+    { action: 'write_file', args: { path: 'probe.txt', content: 'probe' } },
+    { action: 'finish', verdict: 1 },
+  ]);
+  const provider: DecisionProvider = {
+    decide: async (input, questions, signal) => {
+      if ((input as { probe?: unknown }).probe === true) {
+        return { model: 'probe', usage: { input_tokens: 1, output_tokens: 0 }, answers: {
+          selection: { type: 'choice', choice: 'a', confidence: 1, probabilities: { a: 1, b: 0 } },
+        } } as never;
+      }
+      return scripted.decide(input, questions, signal);
+    },
+  };
+  const adapter: AstAdapter = {
+    id: 'probe', extensions: ['.txt'], languages: ['text'],
+    async generate(decisions) {
+      const context = decisions.runContext;
+      assert.equal(context.isDisposed, false, 'the run context is live while generating');
+      contexts.push(context);
+      beforePaths.push(context.pathFor(scope).length);
+      beforeUnits.push(context.units.size);
+      context.units.set('probe', contexts.length);
+      await decisions.chooseWithAlternatives({ probe: true }, 'Pick a probe.',
+        { a: 'A', b: 'B' }, { scope, questionKey: 'probe', kind: 'leaf' });
+      assert.equal(context.pathFor(scope).length, 1);
+      return 'probe\n';
+    },
+    async validate() {},
+  };
+  const harness = new Harness({ workspace: root, provider, astAdapters: [adapter], journalDirectory: false });
+  const first = await harness.run('Create a probe.txt file containing probe text.');
+  assert.equal(first.status, 'completed', first.summary);
+  assert.equal(contexts.length, 1);
+  assert.equal(contexts[0]!.isDisposed, true, 'the first run disposes its context before resolving');
+  assert.equal(await readFile(join(root, 'probe.txt'), 'utf8'), 'probe\n');
+
+  const second = await harness.run('Create a probe.txt file containing probe text.');
+  assert.equal(second.status, 'completed', second.summary);
+  assert.equal(contexts.length, 2);
+  assert.notEqual(contexts[0], contexts[1]);
+  assert.equal(contexts[1]!.isDisposed, true);
+  assert.deepEqual(beforePaths, [0, 0], 'a new run starts with an empty decision-path store');
+  assert.deepEqual(beforeUnits, [0, 0], 'a new run starts with an empty unit cache');
+});
+
+test('disposing a run context shuts its worker down and rejects later use', async () => {
+  const context = createRunContext();
+  let stopped = 0;
+  context.setWorker({ dispose: () => { stopped++; } });
+  const decisionId = context.allocateDecisionId();
+  context.recordDecision('scope', { decisionId, questionKey: 'slot', identity: {}, chosen: 'a', alternatives: [], nearTie: false, kind: 'leaf' });
+  context.recordLine('main.py', 3, { slot: 'module_body', decisionId });
+  assert.equal(context.pathFor('scope').length, 1);
+  assert.deepEqual(context.slotAtLine('main.py', 3), { slot: 'module_body', decisionId });
+  assert.equal(context.decisionEntry(decisionId)?.questionKey, 'slot');
+  await context.dispose();
+  assert.equal(stopped, 1);
+  assert.equal(context.isDisposed, true);
+  await context.dispose();
+  assert.equal(stopped, 1, 'disposal is idempotent');
+  assert.throws(() => context.allocateDecisionId(), /disposed/);
+  assert.throws(() => context.recordDecision('scope', { decisionId, questionKey: 'slot', identity: {}, chosen: 'a', alternatives: [], nearTie: false, kind: 'leaf' }), /disposed/);
+  assert.throws(() => context.pathFor('scope'), /disposed/);
+  assert.throws(() => context.slotAtLine('main.py', 3), /disposed/);
+  assert.throws(() => context.setWorker({ dispose() {} }), /disposed/);
 });

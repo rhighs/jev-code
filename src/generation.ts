@@ -1,6 +1,7 @@
 import type { Decisions, State } from './decisions.js';
 import type { Field } from './types.js';
 import type { TextProgress, TextChange } from './grid.js';
+import type { RunContext } from './run-context.js';
 import { compactContext, generateScoredGrid } from './scored-grid.js';
 import ts from 'typescript';
 import { AstRegistry } from './ast-adapters.js';
@@ -28,6 +29,8 @@ export interface GenerateOptions {
   gridBatchSize?: number;
   concurrency?: number;
   searchWidth?: number;
+  /** Run-scoped generation state; defaults to the decisions facade's shared context. */
+  context?: RunContext;
   onText?: (field: string, value: string, done: boolean, change?: TextChange, progress?: TextProgress) => Promise<void>;
 }
 

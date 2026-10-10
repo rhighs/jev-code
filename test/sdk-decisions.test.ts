@@ -5,8 +5,15 @@ import {
   CancelledError,
   DecisionError,
   DecisionSession,
+  NEAR_TIE_GAP,
   ResourceExhaustedError,
+  attemptScope,
+  closeDefaultRunContext,
+  createRunContext,
+  defaultRunContext,
+  isNearTie,
   type DecisionProvider,
+  type DecisionPathEntry,
 } from '../src/sdk/index.js';
 import { createDecisionSession } from '../src/sdk/decisions.js';
 import { RunResources } from '../src/sdk/resources.js';
@@ -275,4 +282,56 @@ test('decision observers reject, time out, and yield promptly to cancellation or
       .probability({}, 'ready?'),
     (error: unknown) => error instanceof ResourceExhaustedError && error.evidence.kind === 'deadline-exceeded',
   );
+});
+
+test('near-tie uses the inclusive runner-up gap and the argmax deviation rule', () => {
+  const ranked = (first: number, second: number) => [
+    { label: 'a', probability: first },
+    { label: 'b', probability: second },
+  ];
+  assert.equal(NEAR_TIE_GAP, 0.1);
+  assert.equal(isNearTie(ranked(0.55, 0.45), 'a'), true, 'a gap of exactly 0.1 is a near-tie');
+  assert.equal(isNearTie(ranked(0.56, 0.45), 'a'), false, 'a gap of 0.11 is not a near-tie');
+  assert.equal(isNearTie(ranked(0.8, 0.2), 'b'), true, 'a chosen label that is not the argmax is a near-tie');
+  assert.equal(isNearTie(ranked(0.9, 0.1), 'a'), false);
+  assert.equal(isNearTie(ranked(0.5, 0.5), 'a'), true, 'a tied top is a near-tie');
+  assert.equal(isNearTie([], 'a'), false);
+});
+
+test('direct sessions share the process default run context until it is explicitly closed', async () => {
+  const first = new DecisionSession(responseProvider({ type: 'noul', noul: 1 }));
+  const second = new DecisionSession(responseProvider({ type: 'noul', noul: 1 }));
+  assert.equal(first.runContext, second.runContext);
+  assert.equal(first.runContext, defaultRunContext());
+  assert.equal(first.runContext.isDisposed, false);
+  await closeDefaultRunContext();
+  assert.equal(first.runContext.isDisposed, true);
+  assert.throws(() => first.runContext.allocateDecisionId(), /disposed/);
+  const fresh = new DecisionSession(responseProvider({ type: 'noul', noul: 1 }));
+  assert.notEqual(fresh.runContext, first.runContext);
+  assert.equal(fresh.runContext.isDisposed, false);
+  assert.equal((await fresh.probability({}, 'ready?')).value, 1);
+  await closeDefaultRunContext();
+});
+
+test('explicit run contexts isolate concurrent direct callers and survive session forks', async () => {
+  const left = createRunContext();
+  const right = createRunContext();
+  const leftSession = new DecisionSession(responseProvider({ type: 'noul', noul: 1 }), { runContext: left });
+  const rightSession = new DecisionSession(responseProvider({ type: 'noul', noul: 1 }), { runContext: right });
+  await Promise.all([leftSession.probability({}, 'left?'), rightSession.probability({}, 'right?')]);
+  assert.equal(leftSession.fork().runContext, left);
+  assert.equal(leftSession.observe(() => {}).runContext, left);
+  const scope = attemptScope('content', 'unit');
+  const entry: DecisionPathEntry = {
+    decisionId: left.allocateDecisionId(), questionKey: 'slot', identity: {}, chosen: 'a', alternatives: [], nearTie: false, kind: 'leaf',
+  };
+  left.recordDecision(scope, entry);
+  assert.deepEqual(left.pathFor(scope), [entry]);
+  assert.deepEqual(right.pathFor(scope), []);
+  await left.dispose();
+  assert.equal(left.isDisposed, true);
+  assert.equal(right.isDisposed, false);
+  assert.equal((await rightSession.probability({}, 'still?')).value, 1);
+  await right.dispose();
 });

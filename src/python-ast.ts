@@ -9,6 +9,7 @@ import { RUBRIC, wantsReturn } from './python-search.js';
 import { gridCursor } from './grid.js';
 import { compactContext, MAX_GRID_REQUEST_BYTES } from './scored-grid.js';
 import { astDecisionState, PENDING } from './decision-context.js';
+import { attemptScope, type DecisionKind } from './run-context.js';
 import { sanitizedEnv } from './env.js';
 import { LimitError } from './types.js';
 import { identifierCandidates, numberCandidates, objectiveWords, phraseLiterals, quotedLiterals, stringCandidates } from './vocab.js';
@@ -233,8 +234,12 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
   const { decisions, render, report, unit, peers, candidate } = input;
   const { field, options, objective, context, budget, vocab, maxDepth } = shared;
   const { words, identifiers, strings, numbers } = vocab;
+  const runContext = options.context ?? decisions.runContext;
+  const pathScope = attemptScope(field, unit, candidate);
+  // A regenerated attempt starts a fresh decision path; its previous entries are invalidated.
+  runContext.beginAttempt(pathScope);
 
-  async function pick(slot: string, scope: Scope, criteria: Record<string, string>, depth = 0): Promise<string> {
+  async function pick(slot: string, scope: Scope, criteria: Record<string, string>, depth = 0, kind: DecisionKind = 'structural'): Promise<string> {
     decisions.signal.throwIfAborted();
     if (++budget.step > options.maxSteps) throw new LimitError(`Python AST production budget exhausted (${options.maxSteps}).`);
     const keys = Object.keys(criteria);
@@ -246,7 +251,8 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
     const core = { field, phase: 'ast', slot, ...(unit === undefined ? {} : { unit }), ...(candidate === undefined ? {} : { candidate }), ...(peers === undefined || !peers.length ? {} : { peers: peers.map(peer => ({ ...peer })) }), symbols, symbolTable: symbolTable(scope),
       constraints: { depth, maxDepth, inFunction: scope.function, inLoop: scope.loop, remainingSteps: options.maxSteps - budget.step } };
     const state = astDecisionState({ objective, context, preview, core, questions, cap: MAX_GRID_REQUEST_BYTES });
-    const selected = keys.length === 1 ? keys[0]! : await decisions.choose(state, instruction, criteria);
+    const selected = keys.length === 1 ? keys[0]!
+      : (await decisions.chooseWithAlternatives(state, instruction, criteria, { scope: pathScope, questionKey: slot, kind, context: runContext })).choice;
     await report(preview, { slot, production: selected, symbols });
     return selected;
   }
@@ -254,14 +260,14 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
   async function terminal(slot: string, scope: Scope, values: Array<string | number>): Promise<string | number> {
     const criteria: Record<string, string> = Object.fromEntries(values.map((value, index) => [`value_${index}`, JSON.stringify(value)]));
     if (slot === 'string') criteria.custom = 'Compose a different terminal value from valid token choices, staying in AST generation.';
-    const selected = await pick(slot, scope, criteria);
+    const selected = await pick(slot, scope, criteria, 0, 'leaf');
     if (selected !== 'custom') return values[Number(selected.slice(6))]!;
     const pieces = [...new Set([...words, ...identifiers, ...'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'.split(''), ' ', ', ', ': ', '!', '?', '.', '\n'])].slice(0, 240);
     let result = '', last = '', repeats = 0;
     for (let count = 0; count < 32; count++) {
       const candidates: Record<string, string> = Object.fromEntries(pieces.map((piece, index) => [`piece_${index}`, JSON.stringify(piece)]));
       if (result || slot === 'string') candidates.end = 'This terminal value is complete.';
-      const selected = await pick(`${slot}_token:${JSON.stringify(result)}`, scope, candidates);
+      const selected = await pick(`${slot}_token:${JSON.stringify(result)}`, scope, candidates, 0, 'leaf');
       if (selected === 'end') return result;
       const piece = pieces[Number(selected.slice(6))]!;
       repeats = piece === last ? repeats + 1 : 1;
@@ -295,11 +301,11 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
       if ((numberConstraint === 'positive' && value <= 0) || (numberConstraint === 'nonzero' && value === 0)) throw new Error('Range bound violates its numeric constraint.');
       Object.assign(target, node('Constant', { value, kind: null }));
     } else if (production === 'boolean') {
-      const value = await pick('singleton', scope, { true: 'True', false: 'False', none: 'None' });
+      const value = await pick('singleton', scope, { true: 'True', false: 'False', none: 'None' }, 0, 'leaf');
       Object.assign(target, node('Constant', { value: value === 'none' ? null : value === 'true', kind: null }));
     } else if (production === 'name') {
       const names = namesForValue;
-      const selected = await pick('reference', scope, Object.fromEntries(names.map((value, index) => [`name_${index}`, value])));
+      const selected = await pick('reference', scope, Object.fromEntries(names.map((value, index) => [`name_${index}`, value])), 0, 'leaf');
       Object.assign(target, name(names[Number(selected.slice(5))]!));
     } else if (production === 'call') {
       const func = node('Hole');
@@ -312,7 +318,7 @@ export function createBuilder(shared: Shared, input: BuilderInput): Builder {
       const selected = await pick('callee', scope, callees);
       let arity: number | undefined, counts = [0, 1, 2, 3];
       if (selected === 'member') {
-        const receiver = await pick('receiver', scope, Object.fromEntries(names.map((value, index) => [`name_${index}`, value])));
+        const receiver = await pick('receiver', scope, Object.fromEntries(names.map((value, index) => [`name_${index}`, value])), 0, 'leaf');
         Object.assign(func, node('Attribute', { value: name(names[Number(receiver.slice(5))]!), attr: await identifier('method_name', scope), ctx: node('Load') }));
       } else {
         const id = names[Number(selected.slice(5))]!;
@@ -423,6 +429,7 @@ async function generate(decisions: Decisions, state: State, field: string, optio
   });
   const rootScope: Scope = { names: new Map(), function: false, loop: false };
   const peers: Peer[] = [];
+  const runContext = options.context ?? decisions.runContext;
   const root = createBuilder(shared, { decisions, peers, render: () => previewOf(tree), report: (preview, info) => emit(preview, info) });
   const layout = project ? await decomposeLayout(root, rootScope) : undefined;
   const units = await decompose(root, rootScope, shared.vocab, peers, layout);
@@ -450,7 +457,7 @@ async function generate(decisions: Decisions, state: State, field: string, optio
         decoder: 'search', step: shared.budget.step, cursor: gridCursor(c.source), bytes: Buffer.byteLength(c.source),
         ast: { slot: 'candidate', production: c.kept ? 'kept' : 'dropped', symbols: [], unit: unit.name, candidate: c.index, kept: c.kept, ...(c.reason === undefined ? {} : { reason: c.reason }) },
       }),
-    } : undefined);
+    } : undefined, unit => runContext.invalidateUnitAttempts(field, unit.name));
   }
   await root.block(tree.body as PythonNode[], rootScope, 0, 'module_body');
   if (layout) {

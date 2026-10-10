@@ -74,6 +74,10 @@ export interface DecisionEventData {
   slot?: string;
   unit?: string;
   candidate?: number;
+  /** Monotonic decision id within the run; present on alternatives-aware decisions. */
+  decisionId?: number;
+  /** Canonical near-tie flag: top-two gap <= 0.1 or the chosen label is not the probability argmax. */
+  nearTie?: boolean;
 }
 export interface TextEventData extends TextProgress {
   field: string;

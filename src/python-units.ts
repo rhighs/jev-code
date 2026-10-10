@@ -55,11 +55,14 @@ export type UnitSearch = Omit<SearchHooks, 'generate' | 'render' | 'check' | 'sc
   report(unit: Unit, candidate: Parameters<SearchHooks['report']>[0]): Promise<void>;
 };
 
-export async function fillUnits(units: Unit[], decisions: Decisions, makeBuilder: (unit: Unit, fork: Decisions, candidate?: number, body?: PythonNode[]) => Builder, parentFor: (unit: Unit) => Scope, search?: UnitSearch): Promise<void> {
+export type UnitStartHook = (unit: Unit) => void;
+
+export async function fillUnits(units: Unit[], decisions: Decisions, makeBuilder: (unit: Unit, fork: Decisions, candidate?: number, body?: PythonNode[]) => Builder, parentFor: (unit: Unit) => Scope, search?: UnitSearch, onUnitStart?: UnitStartHook): Promise<void> {
   const controller = new AbortController();
   const scopeFor = (unit: Unit): Scope => ({ names: new Map(unit.params.map(p => [p, { kind: 'parameter' as const }])), parent: parentFor(unit), function: true, loop: false });
   const outcomes = await Promise.allSettled(units.map(async unit => {
     try {
+      onUnitStart?.(unit);
       const fork = decisions.fork(controller.signal);
       if (search && search.width > 1) {
         await searchUnit(unit, fork, {

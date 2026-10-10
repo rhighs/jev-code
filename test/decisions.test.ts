@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import { Decisions } from '../src/decisions.js';
+import { attemptScope, createRunContext } from '../src/run-context.js';
 import { DecisionError, type DecisionEventData, type DecisionProvider } from '../src/types.js';
 
 const levels = ['bad', 'partial', 'noisy', 'good'];
@@ -78,4 +79,90 @@ test('choose, probability and score all attach the generation identity and the w
   assert.deepEqual(seen[0]!.options, [{ label: 'a', probability: 0.9 }, { label: 'b', probability: 0.1 }]);
   assert.equal(seen[1]!.probability, 0.7);
   assert.deepEqual(seen[2]!.options, [{ label: 'noisy', probability: 1 }, { label: 'bad', probability: 0 }, { label: 'partial', probability: 0 }, { label: 'good', probability: 0 }]);
+});
+
+const choiceProvider = (choice: string, probabilities: Record<string, number>): DecisionProvider => ({
+  decide: async <Q extends Questions>(_state: EntryType, questions: Q) =>
+    ({ model: 'fake', usage: { input_tokens: 1, output_tokens: 0 },
+      answers: Object.fromEntries(Object.keys(questions).map(k => [k, { type: 'choice', choice, confidence: probabilities[choice] ?? 0, probabilities }])) }) as unknown as SystemOneResult<Q>,
+});
+
+test('alternatives-aware choices record a decision path with ids, alternatives, kinds, and event fields', async () => {
+  const context = createRunContext();
+  const events: DecisionEventData[] = [];
+  const scope = attemptScope('content', 'greet');
+  const d = new Decisions(choiceProvider('a', { a: 0.9, b: 0.1 }), 10, new AbortController().signal, async data => { events.push(data); }, 4, undefined, context);
+  const first = await d.chooseWithAlternatives({ generation: { field: 'content', phase: 'ast', slot: 'module_body', unit: 'greet' } },
+    'pick', { a: 'A', b: 'B' }, { scope, questionKey: 'module_body', kind: 'structural' });
+  const second = await d.chooseWithAlternatives({ generation: { field: 'content', phase: 'ast', slot: 'string' } },
+    'pick', { a: 'A', b: 'B' }, { scope, questionKey: 'string', kind: 'leaf' });
+
+  assert.equal(first.choice, 'a');
+  assert.equal(first.nearTie, false);
+  assert.equal(first.decisionId, 1);
+  assert.equal(second.decisionId, 2);
+  assert.deepEqual(first.alternatives, [{ label: 'a', probability: 0.9 }, { label: 'b', probability: 0.1 }]);
+  const path = context.pathFor(scope);
+  assert.deepEqual(path.map(entry => [entry.decisionId, entry.questionKey, entry.kind]), [[1, 'module_body', 'structural'], [2, 'string', 'leaf']]);
+  assert.deepEqual(path[0]!.identity, { field: 'content', phase: 'ast', slot: 'module_body', unit: 'greet' });
+  assert.deepEqual(path[0]!.chosen, 'a');
+  assert.deepEqual(path[0]!.alternatives, first.alternatives);
+  assert.equal(context.decisionEntry(2), path[1]);
+  assert.deepEqual(events.map(event => [event.choice, event.decisionId, event.nearTie]), [['a', 1, false], ['a', 2, false]]);
+  assert.deepEqual(events[0]!.options, first.alternatives);
+  await context.dispose();
+});
+
+test('near-tie flags follow the inclusive boundary and the argmax deviation rule', async () => {
+  const context = createRunContext();
+  const scope = attemptScope('content', 'u');
+  const record = async (choice: string, probabilities: Record<string, number>) =>
+    new Decisions(choiceProvider(choice, probabilities), 10, new AbortController().signal, undefined, 4, undefined, context)
+      .chooseWithAlternatives({}, 'pick', Object.fromEntries(Object.keys(probabilities).map(key => [key, key])), { scope, questionKey: 'slot', kind: 'leaf' });
+  const exact = await record('a', { a: 0.55, b: 0.45 });
+  assert.equal(exact.nearTie, true, 'a gap of exactly 0.1 is a near-tie');
+  const above = await record('a', { a: 0.56, b: 0.45 });
+  assert.equal(above.nearTie, false, 'a gap of 0.11 is not a near-tie');
+  const deviated = await record('b', { a: 0.8, b: 0.2 });
+  assert.equal(deviated.nearTie, true, 'a chosen label that is not the argmax is a near-tie');
+  assert.deepEqual(context.pathFor(scope).map(entry => entry.nearTie), [true, false, true]);
+  await context.dispose();
+});
+
+test('a provider failure leaves the recorded path unchanged for that attempt', async () => {
+  const context = createRunContext();
+  const scope = attemptScope('content', 'greet');
+  let calls = 0;
+  const flaky: DecisionProvider = {
+    decide: async <Q extends Questions>(_state: EntryType, questions: Q) => {
+      calls++;
+      if (calls === 2) throw new Error('provider offline');
+      return { model: 'flaky', usage: { input_tokens: 1, output_tokens: 0 },
+        answers: Object.fromEntries(Object.keys(questions).map(key => [key, { type: 'choice', choice: 'a', confidence: 1, probabilities: { a: 1, b: 0 } }])) } as unknown as SystemOneResult<Q>;
+    },
+  };
+  const d = new Decisions(flaky, 10, new AbortController().signal, undefined, 4, undefined, context);
+  await d.chooseWithAlternatives({}, 'pick', { a: 'A', b: 'B' }, { scope, questionKey: 'first', kind: 'structural' });
+  await assert.rejects(d.chooseWithAlternatives({}, 'pick', { a: 'A', b: 'B' }, { scope, questionKey: 'second', kind: 'leaf' }), /provider offline/);
+  assert.deepEqual(context.pathFor(scope).map(entry => entry.questionKey), ['first']);
+  assert.equal(context.pathFor(scope)[0]!.decisionId, 1);
+  await context.dispose();
+});
+
+test('forked facades share the run context and plain choose keeps its event shape', async () => {
+  const context = createRunContext();
+  const events: DecisionEventData[] = [];
+  const root = new Decisions(choiceProvider('a', { a: 1, b: 0 }), 10, new AbortController().signal, async data => { events.push(data); }, 4, undefined, context);
+  const fork = root.fork(new AbortController().signal);
+  assert.equal(fork.runContext, context);
+  await fork.chooseWithAlternatives({ generation: { field: 'content', phase: 'ast', slot: 'callee', unit: 'greet' } },
+    'pick', { a: 'A', b: 'B' }, { scope: attemptScope('content', 'greet'), questionKey: 'callee', kind: 'structural' });
+  assert.equal(context.pathFor(attemptScope('content', 'greet')).length, 1);
+  await root.choose({ generation: { field: 'content', phase: 'ast', slot: 'callee' } }, 'pick', { a: 'A', b: 'B' });
+  assert.equal(events.length, 2);
+  assert.equal(events[0]!.decisionId, 1);
+  assert.equal(events[1]!.decisionId, undefined);
+  assert.equal(events[1]!.nearTie, undefined);
+  assert.deepEqual(context.pathFor(attemptScope('content', 'greet')).map(entry => entry.decisionId), [1]);
+  await context.dispose();
 });

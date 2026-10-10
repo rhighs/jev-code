@@ -3,6 +3,7 @@ import test from 'node:test';
 import type { EntryType, Questions, SystemOneResult } from '@typesafe-ai/sdk';
 import { Decisions } from '../src/decisions.js';
 import { generatePythonAst } from '../src/python-ast.js';
+import { attemptScope, createRunContext } from '../src/run-context.js';
 import { LimitError, type DecisionProvider } from '../src/types.js';
 import { SlotProvider, type SlotEntry } from './helpers.js';
 
@@ -140,4 +141,45 @@ test('a prompt without ASCII words skips decomposition instead of failing on an 
   const source = await generatePythonAst(decisions(provider), { task: { prompt: '打印 1 到 10 的数字' } }, 'content', options);
   assert.equal(source, 'print(1)\n');
   assert.ok(!provider.seen.some(s => s.generation.slot === 'unit_count'));
+});
+
+test('unit forks record their decision paths in the shared run context', async () => {
+  const context = createRunContext();
+  const provider = new GateProvider([...decomposition, ...bodies, ...main]);
+  await generatePythonAst(new Decisions(provider, 200, new AbortController().signal, undefined, 4, undefined, context), state, 'content', options);
+
+  const greet = context.pathFor(attemptScope('content', 'greet'));
+  assert.deepEqual(greet.map(entry => [entry.questionKey, entry.kind]), [['function_body', 'structural'], ['expression', 'structural'], ['string', 'leaf']]);
+  assert.ok(greet.every(entry => entry.identity.unit === 'greet' && entry.identity.field === 'content' && entry.identity.phase === 'ast'));
+  assert.ok(greet.every(entry => entry.identity.candidate === undefined && entry.chosen.length > 0 && entry.alternatives.length >= 2));
+
+  const shout = context.pathFor(attemptScope('content', 'shout'));
+  // shout's single-candidate reference pick is host-derived, so it records no path entry.
+  assert.deepEqual(shout.map(entry => [entry.questionKey, entry.kind]), [['function_body', 'structural'], ['expression', 'structural']]);
+
+  const root = context.pathFor(attemptScope('content'));
+  assert.ok(root.length >= 10);
+  assert.ok(root.every(entry => entry.identity.unit === undefined));
+
+  const ids = [...root, ...greet, ...shout].map(entry => entry.decisionId);
+  assert.equal(new Set(ids).size, ids.length, 'decision ids are unique across concurrent unit forks');
+  assert.equal(Math.min(...ids), 1);
+  await context.dispose();
+});
+
+test('regenerating a unit invalidates its previous decision path entries', async () => {
+  const context = createRunContext();
+  const scope = attemptScope('content', 'greet');
+  const run = (): Promise<string> => generatePythonAst(
+    new Decisions(new GateProvider([...decomposition, ...bodies, ...main]), 200, new AbortController().signal, undefined, 4, undefined, context),
+    state, 'content', options);
+  await run();
+  const first = context.pathFor(scope).map(entry => entry.decisionId);
+  assert.equal(first.length, 3);
+  await run();
+  const second = context.pathFor(scope);
+  assert.equal(second.length, 3);
+  assert.ok(second.every(entry => !first.includes(entry.decisionId)));
+  for (const id of first) assert.equal(context.decisionEntry(id), undefined, 'invalidated entries are no longer resolvable');
+  await context.dispose();
 });

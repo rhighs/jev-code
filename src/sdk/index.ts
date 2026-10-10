@@ -1,4 +1,19 @@
-export { DecisionSession, type DecisionSessionOptions } from './decisions.js';
+export { DecisionSession, NEAR_TIE_GAP, isNearTie, type DecisionSessionOptions } from './decisions.js';
+export {
+  RunContext,
+  RunContextDisposedError,
+  attemptScope,
+  closeDefaultRunContext,
+  createRunContext,
+  defaultRunContext,
+  type DecisionIdentity,
+  type DecisionKind,
+  type DecisionPathEntry,
+  type LineSlot,
+  type PathChoice,
+  type PathDecisionRequest,
+  type RunContextWorker,
+} from '../run-context.js';
 export { type ProgramResourceView, type RunLimits, type RunResourceOptions, type RunResourceSnapshot } from './resources.js';
 export {
   Program as DecisionProgram,
