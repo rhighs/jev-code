@@ -113,6 +113,29 @@ test('a failure in the first of two written files repairs from that file\'s own 
   assert.ok(repairs.some(repair => repair.kind === 'unit-replay' && repair.target === 'a.py'), `journaled repairs: ${JSON.stringify(repairs)}`);
 });
 
+test('a repaired shell retry asks for authorization again and honors allow-once', async t => {
+  const root = await workspace(t);
+  const prompt = "Write a Python program in main.py with a helper compute that prints int('5'); do not print int('x').";
+  const script: SlotEntry[] = [
+    ...intFile('x', '5'),
+    { phase: 'plan', answer: 'plan_0', once: true }, { phase: 'plan', answer: 'plan_0', once: true },
+    ...Array.from({ length: 6 }, () => ({ phase: 'plan', answer: 'plan_0', once: true } as SlotEntry)),
+  ];
+  const provider = new MixedProvider(new SlotProvider(script), ['write_file', 'bash', 'finish'], ['main.py']);
+  let bashApprovals = 0;
+  const result = await new Harness({ workspace: root, provider, experimentalGrid: true,
+    authorize: tool => { if (tool.name !== 'bash') return true; bashApprovals++; return bashApprovals === 1; } }).run(prompt);
+
+  assert.equal(bashApprovals, 2, 'the repaired retry asks a second time instead of reusing allow-once');
+  const bash = result.records.filter(record => record.tool === 'bash');
+  assert.equal(bash.length, 1, 'a declined retry must not execute the command again');
+  assert.equal(bash[0]!.result.ok, false);
+  assert.match(await readFile(join(root, 'main.py'), 'utf8'), /return int\('5'\)/, 'the repaired file is still written');
+  const journal = (await readFile(join(root, '.jev', 'runs', `${result.id}.jsonl`), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { type: string; data: Record<string, unknown> });
+  const notes = journal.filter(event => event.type === 'input').map(event => String(event.data.instruction));
+  assert.ok(notes.some(note => /repaired shell retry for main\.py was declined/.test(note)), JSON.stringify(notes));
+});
+
 test('a declined repair write is retried on the next failure instead of blocking repair', async t => {
   const root = await workspace(t);
   const prompt = "Write a Python program in main.py with a helper compute that prints int('5'); do not print int('x').";

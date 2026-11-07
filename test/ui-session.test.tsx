@@ -235,17 +235,16 @@ test('interactivity needs a TTY on both stdin and the output stream', () => {
 });
 
 test('the built CLI prints help without loading ink', async t => {
-  await exec('node', [join(root, 'node_modules/typescript/bin/tsc'), '-p', join(root, 'tsconfig.json')], { cwd: root });
+  await exec(process.execPath, [join(root, 'node_modules/typescript/bin/tsc'), '-p', join(root, 'tsconfig.json')], { cwd: root });
   await readFile(join(root, 'dist/ui/app.js'));
   const dir = await mkdtemp(join(tmpdir(), 'jev-hook-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const log = join(dir, 'loaded.log');
-  await writeFile(join(dir, 'hook.mjs'), `import { appendFileSync } from 'node:fs';\nexport async function resolve(spec, ctx, next) { const r = await next(spec, ctx); appendFileSync(${JSON.stringify(log)}, r.url + '\\n'); return r; }\n`);
-  await writeFile(join(dir, 'register.mjs'), `import { register } from 'node:module';\nregister('./hook.mjs', import.meta.url);\n`);
-  const { stdout } = await exec('node', ['--import', join(dir, 'register.mjs'), join(root, 'dist/cli.js'), '--help'], { cwd: root });
+  await writeFile(join(dir, 'plugin.mjs'), `import { appendFileSync } from 'node:fs';\nBun.plugin({ name: 'jev-load-log', setup(build) { build.onResolve({ filter: /.*/ }, args => { appendFileSync(${JSON.stringify(log)}, args.path + '\\n'); return undefined; }); } });\n`);
+  const { stdout } = await exec(process.execPath, ['--preload', join(dir, 'plugin.mjs'), join(root, 'dist/cli.js'), '--help'], { cwd: root });
   assert.match(stdout, /jev-code \[options\]/);
   const loaded = await readFile(log, 'utf8');
   assert.match(loaded, /dist\/cli\.js/);
-  assert.equal(loaded.includes('/node_modules/ink/'), false);
-  assert.equal(loaded.includes('/dist/ui/'), false);
+  assert.equal(loaded.split('\n').includes('ink'), false);
+  assert.equal(loaded.includes('./ui/'), false);
 });

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AstRegistry, installAstModule, loadInstalledAsts, removeAstAdapter } from '../src/ast-adapters.js';
+import { AstRegistry, UntrustedAstConfigError, installAstModule, listInstalledAstConfig, loadInstalledAsts, removeAstAdapter } from '../src/ast-adapters.js';
 import { Decisions } from '../src/decisions.js';
 import { generateText } from '../src/generation.js';
 import type { DecisionProvider } from '../src/types.js';
@@ -25,6 +25,34 @@ test('installed AST adapters persist, reload, route by extension and language, t
   assert.equal((JSON.parse(await readFile(join(root, '.jev/asts.json'), 'utf8'))).adapters.length, 1);
   await removeAstAdapter(root, 'test-json');
   assert.equal((await loadInstalledAsts(root)).length, 0);
+});
+
+test('a project AST config is not imported until the workspace trusts it', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'jev-untrusted-ast-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const marker = join(root, 'imported');
+  await writeFile(join(root, 'evil.mjs'), `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'ran');\nexport const astAdapters = [{ id: 'evil', extensions: ['.evil'], languages: ['evil'], async generate() { return ''; }, async validate() {} }];\n`);
+  await mkdir(join(root, '.jev'), { recursive: true });
+  await writeFile(join(root, '.jev/asts.json'), JSON.stringify({ version: 1, adapters: [{ id: 'evil', module: './evil.mjs' }] }, null, 2) + '\n');
+
+  await assert.rejects(loadInstalledAsts(root), UntrustedAstConfigError);
+  await assert.rejects(readFile(marker), 'module-level code must not run before trust');
+  assert.deepEqual(await listInstalledAstConfig(root), [{ id: 'evil', module: './evil.mjs' }]);
+
+  const adapters = await loadInstalledAsts(root, { trusted: true });
+  assert.equal(adapters.length, 1);
+  assert.equal(await readFile(marker, 'utf8'), 'ran');
+});
+
+test('editing an installed AST config revokes the recorded trust', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'jev-tampered-ast-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, 'json.mjs'), 'export const astAdapters = [{ id: "test-json", extensions: [".json"], languages: ["json"], async generate() { return "{}\\n"; }, async validate(source) { JSON.parse(source); } }];');
+  await installAstModule(root, './json.mjs');
+  const config = JSON.parse(await readFile(join(root, '.jev/asts.json'), 'utf8'));
+  config.adapters.push({ id: 'injected', module: './injected.mjs' });
+  await writeFile(join(root, '.jev/asts.json'), JSON.stringify(config, null, 2) + '\n');
+  await assert.rejects(loadInstalledAsts(root), UntrustedAstConfigError);
 });
 
 test('registration rejects conflicting extensions and adapters without validators', () => {

@@ -272,6 +272,14 @@ export class Harness {
         await note(`The repair write for ${attribution.target} was declined or failed; the file was left unchanged and the failure stands.`);
         return record;
       }
+      // A retry runs the same shell command again, so it crosses the same authorization boundary
+      // as the original call. An allow-once grant must not silently cover a repaired second run.
+      const retryAuthorized = await this.options.authorize?.(tool, record.args, signal) ?? true;
+      if (!retryAuthorized) {
+        await note(`The repaired shell retry for ${attribution.target} was declined; the failure stands.`);
+        return record;
+      }
+      signal.throwIfAborted();
       await emit('tool_start', { tool: record.tool, args: record.args });
       const retry = await tool.execute(record.args, context);
       const retryRecord: ToolRecord = { turn, tool: record.tool, args: record.args, result: retry,

@@ -1,13 +1,13 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 /**
  * Fallback recorder for docs/media/session.cast (non-shipped; scripts/ is outside the package
  * `files` list and the test glob). It drives the real `Harness`/`printRun` pipeline against a
  * local scripted provider, so the recording can be regenerated without an API key when a live
  * run is unavailable. The README caption must state that this provider produced the recording.
  *
- *   pnpm run build   # not required for this script; tsx reads src/ directly
+ *   bun run build   # not required for this script; Bun reads src/ directly
  *   asciinema rec docs/media/session.cast --overwrite -i 1 --cols 100 --rows 30 \
- *     -c "node_modules/.bin/tsx scripts/record-cast.ts"
+ *     -c "bun scripts/record-cast.ts"
  *   agg --theme github-dark --idle-time-limit 1 --speed 1.5 --fps-cap 20 \
  *     docs/media/session.cast docs/media/session.gif
  *

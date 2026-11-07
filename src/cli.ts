@@ -1,16 +1,16 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { loadEnvFile } from 'node:process';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { DEFAULT_LIMITS } from './harness.js';
 import { JevProvider } from './provider.js';
+import { loadProjectEnv } from './env.js';
 import { builtInTools } from './tools.js';
 import { createPrinter, printRun } from './print.js';
 import { isInteractiveTTY } from './terminal-style.js';
 import { formatDuration } from './timing.js';
-import { AstRegistry, loadInstalledAsts, loadAstModule, installAstModule, removeAstAdapter } from './ast-adapters.js';
+import { AstRegistry, UntrustedAstConfigError, listInstalledAstConfig, loadInstalledAsts, loadAstModule, installAstModule, removeAstAdapter } from './ast-adapters.js';
 import { bundledAstAdapters } from './lang/index.js';
 import { compareRecords, formatComparison, runEval, type EvalRecord } from './eval.js';
 import { runDecide } from './decide.js';
@@ -40,6 +40,7 @@ Starts an interactive coding session in a terminal. Use -p for one-shot tasks.
   --timeout-ms <n>         Total run time (default: ${DEFAULT_LIMITS.maxRunMs})
   --tools <module>        Load additional tools exported as a tools array
   --asts <module>         Load AST adapters for this session (repeatable)
+  --trust-asts            Allow importing adapters named by this workspace's .jev/asts.json
   --experimental-grid    Opt into character-grid fallback (slow/unreliable)
   ast install <module>    Install local/npm AST adapters in this workspace
   ast list               List available AST adapters
@@ -119,6 +120,12 @@ async function readStdin(limit: number): Promise<string> {
 
 const KEY_PROMPT = 'Paste your typesafe.ai API key (saved to ~/.config/jev-code/config.json): ';
 
+// Captured before a project .env is read. A checkout must not be able to redirect a saved key,
+// so the client always receives the destination chosen by the shell or the default.
+const trustedBaseUrl = process.env.TYPESAFE_BASE_URL?.trim() || undefined;
+const providerOptions = trustedBaseUrl === undefined ? undefined : { baseURL: trustedBaseUrl };
+const createProvider = (): JevProvider => new JevProvider(providerOptions);
+
 async function ensureApiKey(interactive: boolean): Promise<void> {
   const key = await resolveApiKey(interactive ? () => promptSecret(KEY_PROMPT) : async () => undefined);
   if (!key) throw new Error(NO_KEY);
@@ -140,8 +147,7 @@ async function logout(): Promise<void> {
 async function main(): Promise<void> {
   ignoreEpipe(process.stdout);
   ignoreEpipe(process.stderr);
-  try { loadEnvFile(); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  await loadProjectEnv();
   if (process.argv[2] === 'login') return login();
   if (process.argv[2] === 'logout') return logout();
   if (process.argv[2] === 'provider') throw new Error('Unknown command: provider.');
@@ -149,7 +155,7 @@ async function main(): Promise<void> {
     try { await ensureApiKey(false); }
     catch (error) { process.stderr.write(`decide: ${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 125; return; }
     const input = await readStdin(MAX_GRID_REQUEST_BYTES * 4);
-    const res = await runDecide(process.argv.slice(3), input, new JevProvider());
+    const res = await runDecide(process.argv.slice(3), input, createProvider());
     process.stdout.write(res.stdout);
     process.stderr.write(res.stderr);
     process.exitCode = res.code;
@@ -162,7 +168,7 @@ async function main(): Promise<void> {
     yes: { type: 'boolean' }, 'confirm-writes': { type: 'boolean' }, 'allow-outside': { type: 'boolean' },
     'max-turns': { type: 'string' }, 'max-requests': { type: 'string' }, 'max-steps': { type: 'string' },
     'timeout-ms': { type: 'string' }, 'grid-batch-size': { type: 'string' }, concurrency: { type: 'string' }, 'search-width': { type: 'string' }, tools: { type: 'string' }, json: { type: 'boolean' },
-    'experimental-grid': { type: 'boolean' }, asts: { type: 'string', multiple: true }, 'no-journal': { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
+    'experimental-grid': { type: 'boolean' }, asts: { type: 'string', multiple: true }, 'trust-asts': { type: 'boolean' }, 'no-journal': { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
     'eval-out': { type: 'string' }, resume: { type: 'string' },
   } });
   if (values.help) { process.stdout.write(HELP); return; }
@@ -178,7 +184,20 @@ async function main(): Promise<void> {
     if (extra.length || !['install', 'list', 'remove'].includes(command ?? '') || (command === 'list' ? target !== undefined : !target)) throw new Error('Use ast install <module>, ast list, or ast remove <id>.');
     if (command === 'install') process.stdout.write(`Installed AST adapters: ${(await installAstModule(workspace, target!)).join(', ')}\n`);
     else if (command === 'remove') { await removeAstAdapter(workspace, target!); process.stdout.write(`Removed AST adapter: ${target}\n`); }
-    else { const bundled = new Set(['python', ...bundledAstAdapters().map(a => a.id)]); for (const adapter of new AstRegistry(await loadInstalledAsts(workspace)).list()) process.stdout.write(`${adapter.id}\t${adapter.extensions.join(', ')}\t${bundled.has(adapter.id) ? 'built-in' : 'installed'}\n`); }
+    else {
+      const trusted = values['trust-asts'] ?? false;
+      let installed: Awaited<ReturnType<typeof loadInstalledAsts>> = [];
+      let untrusted = false;
+      try { installed = await loadInstalledAsts(workspace, { trusted }); }
+      catch (error) {
+        if (!(error instanceof UntrustedAstConfigError)) throw error;
+        untrusted = true;
+        process.stderr.write(`${error.message}\n`);
+      }
+      const bundled = new Set(['python', ...bundledAstAdapters().map(a => a.id)]);
+      for (const adapter of new AstRegistry(installed).list()) process.stdout.write(`${adapter.id}\t${adapter.extensions.join(', ')}\t${bundled.has(adapter.id) ? 'built-in' : 'installed'}\n`);
+      if (untrusted) for (const entry of await listInstalledAstConfig(workspace)) process.stdout.write(`${entry.id}\t-\tinstalled (untrusted)\n`);
+    }
     return;
   }
   if (positionals[0] === 'eval' && positionals[1] === 'compare') {
@@ -195,7 +214,7 @@ async function main(): Promise<void> {
     process.stderr.write('eval runs unattended: agent Bash executes on this host without confirmation.\n');
     const width = values['search-width'];
     if (width !== undefined && !/^[1-8]$/.test(width)) throw new Error('--search-width must be 1–8.');
-    const records = await runEval({ provider: new JevProvider(), out: resolve(values['eval-out'] ?? '.'), ...(only === undefined ? {} : { only }), searchWidth: width === undefined ? 1 : Number(width),
+    const records = await runEval({ provider: createProvider(), out: resolve(values['eval-out'] ?? '.'), ...(only === undefined ? {} : { only }), searchWidth: width === undefined ? 1 : Number(width),
       onRecord: r => process.stdout.write(`${r.task}\t${r.check.ok ? 'pass' : 'fail'}\t${r.status}\t${r.turns} turns\t${r.requests} requests\t${formatDuration(r.durationMs)}\t${r.check.reason}\n`) });
     process.exitCode = records.every(r => r.check.ok) ? 0 : 1;
     return;
@@ -235,8 +254,8 @@ async function main(): Promise<void> {
     return value;
   };
   await ensureApiKey(tty);
-  const asts = [...await loadInstalledAsts(workspace), ...(await Promise.all((values.asts ?? []).map(module => loadAstModule(workspace, module)))).flat()];
-  const provider = new JevProvider();
+  const asts = [...await loadInstalledAsts(workspace, { trusted: values['trust-asts'] ?? false }), ...(await Promise.all((values.asts ?? []).map(module => loadAstModule(workspace, module)))).flat()];
+  const provider = createProvider();
   const harnessOptions: Omit<HarnessOptions, 'onEvent' | 'authorize'> = {
     workspace, provider, tools: [...builtInTools(), ...extraTools],
     experimentalGrid: values['experimental-grid'] ?? false,

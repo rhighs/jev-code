@@ -13,13 +13,13 @@ The coding harness and `jev-code` CLI remain available from the same package. Th
 
 ## Install
 
-The package requires Node.js 22 or newer and is ESM-only. npm publication is not part of the current release process; from a source checkout, build with pnpm. The final two npm commands deliberately exercise npm tarball interoperability:
+The package requires Bun 1.4 or newer and is ESM-only. npm publication is not part of the current release process; from a source checkout, build with Bun. The final two commands pack and install the tarball with Bun to exercise the published package contract:
 
 ```bash
-pnpm install --frozen-lockfile
-pnpm run build
-npm pack
-npm install /path/to/jev-code-0.2.0.tgz
+bun install --frozen-lockfile
+bun run build
+bun pm pack
+bun add /path/to/jev-code-0.3.0.tgz
 ```
 
 Import only from the package root. Internal paths such as `jev-code/sdk/router.js` are intentionally not exported.

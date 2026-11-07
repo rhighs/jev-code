@@ -38,7 +38,7 @@ jev-code login
 jev-code
 ```
 
-macOS and Linux. Uses Node.js 22+ with Corepack if available, otherwise installs a private Node.js 24. Run the installer again to update.
+macOS and Linux. Installs a self-contained Bun binary, so no Node.js or package manager is needed. Run the installer again to update.
 
 A [typesafe.ai](https://typesafe.ai) API key is required to run model decisions. Your API key is saved in `~/.config/jev-code/config.json` with mode 600. `TYPESAFE_API_KEY` overrides it.
 

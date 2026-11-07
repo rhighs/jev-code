@@ -1,0 +1,29 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - name: Check the tag matches package.json
+        run: bun -e "const { version } = await Bun.file('package.json').json(); if (version !== process.env.GITHUB_REF_NAME.replace(/^v/, '')) { console.error('tag ' + process.env.GITHUB_REF_NAME + ' does not match package.json ' + version); process.exit(1); }"
+      - name: Compile standalone binaries
+        run: |
+          mkdir -p dist/release
+          for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
+            bun build src/cli.ts --compile --target="bun-$target" --outfile "dist/release/jev-code-$target"
+          done
+      - name: Checksums
+        run: cd dist/release && sha256sum jev-code-* > SHA256SUMS
+      - name: Publish
+        run: gh release create "$GITHUB_REF_NAME" dist/release/* --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -228,12 +228,28 @@ const checkResult = (operation: PythonOperation, result: unknown, maxBytes: numb
 
 const validationError = (detail: string): Error => new Error(`Python AST validation failed: ${detail}`);
 
+/**
+ * Node puts the errno code in a spawned child's error message; Bun reports "Executable not found in
+ * $PATH" and keeps the code only on the error object. Include the code so a missing python3 fails
+ * with the same recognizable text on either runtime.
+ */
+const spawnFailure = (error: unknown): Error => {
+  const failure = error instanceof Error ? error : new Error(String(error));
+  const code = (failure as NodeJS.ErrnoException).code;
+  if (typeof code === 'string' && !failure.message.includes(code)) {
+    return new Error(`${failure.message} (${code})`, { cause: failure });
+  }
+  return failure;
+};
+
 const setRef = (child: ChildProcess, ref: boolean): void => {
   if (ref) child.ref(); else child.unref();
   for (const stream of [child.stdin, child.stdout, child.stderr]) {
-    // Child stdio pipes are net.Socket instances; a single downcast keeps ref/unref typed.
+    // Node exposes child stdio as net.Socket; Bun exposes a different duplex. Both are optional
+    // handles, so call ref/unref only when the runtime provides them.
     const handle = stream as Socket | null;
-    if (ref) handle?.ref(); else handle?.unref();
+    if (handle === null || typeof handle.ref !== 'function' || typeof handle.unref !== 'function') continue;
+    if (ref) handle.ref(); else handle.unref();
   }
 };
 
@@ -519,7 +535,7 @@ export function runOneShot(spawner: PythonWorkerSpawn, operation: PythonOperatio
     timer = setTimeout(() => fail(validationError(`worker timed out after ${timeoutMs}ms`)), timeoutMs);
     timer.unref();
     call.signal.addEventListener('abort', onAbort, { once: true });
-    child.on('error', error => fail(error));
+    child.on('error', error => fail(spawnFailure(error)));
     child.stdin?.on('error', error => fail(error));
     child.stdout?.on('data', (chunk: Buffer) => {
       output += decoder.write(chunk);

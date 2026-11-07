@@ -6,35 +6,27 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: ${{ matrix.node-version }}
-          cache: pnpm
+          bun-version: 1.4.4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pnpm install --frozen-lockfile
+      - run: bun install --frozen-lockfile
       - run: bash -n install.sh
-      - run: pnpm run typecheck
-      - run: pnpm test
-      - run: pnpm run build
+      - run: bun run typecheck
+      - run: bun run test
+      - run: bun run build
+      - run: bun run build:binary
+      - run: ./dist/jev-code --help
   package-contract:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: ${{ matrix.node-version }}
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm run test:package
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - run: bun run test:package

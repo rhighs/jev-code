@@ -179,7 +179,7 @@ test('cli decide without TYPESAFE_API_KEY exits 125 with a message', async t => 
   env.JEV_CODE_CONFIG_DIR = await mkdtemp(join(tmpdir(), 'jev-cfg-'));
   const cwd = await mkdtemp(join(tmpdir(), 'jev-decide-'));
   t.after(async () => { await rm(cwd, { recursive: true, force: true }); await rm(env.JEV_CODE_CONFIG_DIR!, { recursive: true, force: true }); });
-  await assert.rejects(run(resolve('node_modules/.bin/tsx'), [resolve('src/cli.ts'), 'decide', 'Is this an error?', '--choices', 'yes,no'], { cwd, env, timeout: 60_000 }),
+  await assert.rejects(run(process.execPath, [resolve('src/cli.ts'), 'decide', 'Is this an error?', '--choices', 'yes,no'], { cwd, env, timeout: 60_000 }),
     (err: Error & { code?: unknown; stderr?: string }) => err.code === 125 && /jev-code login.*TYPESAFE_API_KEY/.test(err.stderr ?? ''));
 });
 

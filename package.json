@@ -1,14 +1,14 @@
 {
   "name": "jev-code",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "packageManager": "pnpm@10.30.3",
+  "packageManager": "bun@1.4.4",
   "description": "Typed Jev decisions, routing, programs, and validated formal trees.",
   "type": "module",
   "types": "./dist/index.d.ts",
   "main": "./dist/index.js",
   "engines": {
-    "node": ">=22"
+    "bun": ">=1.4.0"
   },
   "bin": {
     "jev-code": "dist/cli.js"
@@ -27,14 +27,16 @@
     "README.md"
   ],
   "scripts": {
-    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
-    "build": "pnpm run clean && tsc",
+    "clean": "bun -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "bun run clean && bun run build:types",
+    "build:types": "tsc",
+    "build:binary": "bun run clean && bun build src/cli.ts --compile --outfile dist/jev-code",
+    "dev": "bun src/cli.ts",
+    "start": "bun dist/cli.js",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
-    "dev": "tsx src/cli.ts",
-    "start": "node dist/cli.js",
-    "test": "tsx --test test/*.test.ts test/*.test.tsx",
-    "test:package": "tsx --test test/package-contract.contract.ts",
-    "prepack": "pnpm run build"
+    "test": "bun test --timeout 60000",
+    "test:package": "bun test ./test/package-contract.contract.ts",
+    "prepack": "bun run build"
   },
   "dependencies": {
     "@typesafe-ai/sdk": "^0.6.0",
@@ -44,9 +46,9 @@
     "typescript": "^5.9.0"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
+    "@types/bun": "^1.4.4",
     "@types/react": "^19.3.0",
     "ink-testing-library": "^4.0.0",
-    "tsx": "^4.20.0"
+    "react-devtools-core": "^7.0.1"
   }
 }

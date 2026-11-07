@@ -44,7 +44,7 @@ const random = (seed: number): DecisionProvider => {
 const has = async (bin: string): Promise<boolean> => exec('which', [bin]).then(() => true, () => false);
 
 const DIALECTS: Array<{ dialect: Dialect; bin: string }> = [
-  { dialect: javascriptDialect, bin: 'node' }, { dialect: typescriptDialect, bin: 'node' }, { dialect: cDialect, bin: 'gcc' },
+  { dialect: javascriptDialect, bin: process.execPath }, { dialect: typescriptDialect, bin: process.execPath }, { dialect: cDialect, bin: 'gcc' },
   { dialect: rustDialect, bin: 'rustc' }, { dialect: goDialect, bin: 'go' }, { dialect: luaDialect, bin: 'luac' }, { dialect: rubyDialect, bin: 'ruby' },
 ];
 

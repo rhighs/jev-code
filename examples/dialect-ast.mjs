@@ -1,4 +1,4 @@
-// Build the harness first: npm run build
+// Build the harness first: bun run build
 // A dialect supplies keywords, builtins, features, a renderer and a validator; the core builds the program.
 import { adapterFor } from '../dist/index.js';
 

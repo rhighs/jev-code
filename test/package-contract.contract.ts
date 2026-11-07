@@ -10,18 +10,12 @@ import { promisify } from 'node:util';
 const exec = promisify(execFile);
 const root = fileURLToPath(new URL('../', import.meta.url));
 const fixtures = join(root, 'test/fixtures/package-consumer');
-const npmEnvironment = {
-  ...process.env,
-  npm_config_audit: 'false',
-  npm_config_fund: 'false',
-  npm_config_update_notifier: 'false',
-};
-
-// npm is intentional here: this is an npm consumer interoperability test, not a repository workflow.
+// Bun is the only supported toolchain: pack and install the tarball with Bun, then run the
+// consumer checks with the Bun runtime that is executing this test.
 
 const run = async (file: string, args: readonly string[], cwd: string) => exec(file, [...args], {
   cwd,
-  env: npmEnvironment,
+  env: process.env,
   maxBuffer: 10 * 1024 * 1024,
 });
 
@@ -42,9 +36,9 @@ test('packed ESM package satisfies the public consumer contract', { timeout: 180
   await mkdir(join(root, 'dist/providers'), { recursive: true });
   await writeFile(join(root, 'dist/providers/stale.js'), 'export const stale = true;\n');
   await writeFile(join(root, 'dist/propose.js'), 'export const stale = true;\n');
-  await run('npm', ['pack', '--silent', '--pack-destination', packed], root);
+  await run(process.execPath, ['pm', 'pack', '--destination', packed], root);
   const archives = (await readdir(packed)).filter(file => file.endsWith('.tgz'));
-  assert.equal(archives.length, 1, 'npm pack should produce one archive');
+  assert.equal(archives.length, 1, 'bun pm pack should produce one archive');
   const archive = join(packed, archives[0]!);
 
   const { stdout: tarOutput } = await run('tar', ['-tzf', archive], root);
@@ -81,16 +75,16 @@ test('packed ESM package satisfies the public consumer contract', { timeout: 180
   ]) {
     await copyFile(join(fixtures, file), join(consumer, file));
   }
-  await run('npm', ['install', '--ignore-scripts', '--package-lock=false', archive], consumer);
+  await run(process.execPath, ['add', '--ignore-scripts', archive], consumer);
 
   for (const dependency of ['ink', 'ink-text-input', 'react']) {
     await rm(join(consumer, 'node_modules', dependency), { recursive: true, force: true });
   }
   await run(process.execPath, ['runtime.mjs'], consumer);
 
-  const tsc = join(root, 'node_modules/.bin/tsc');
-  await run(tsc, ['-p', 'tsconfig.nodenext.json'], consumer);
-  await run(tsc, ['-p', 'tsconfig.bundler.json'], consumer);
+  const tsc = join(root, 'node_modules/typescript/bin/tsc');
+  await run(process.execPath, [tsc, '-p', 'tsconfig.nodenext.json'], consumer);
+  await run(process.execPath, [tsc, '-p', 'tsconfig.bundler.json'], consumer);
 
   const declarations = await import('node:fs/promises').then(fs => fs.readFile(join(consumer, 'node_modules/jev-code/dist/index.d.ts'), 'utf8'));
   const sdkDeclarations = await import('node:fs/promises').then(fs => fs.readFile(join(consumer, 'node_modules/jev-code/dist/sdk/index.d.ts'), 'utf8'));
@@ -111,10 +105,11 @@ test('packed ESM package satisfies the public consumer contract', { timeout: 180
 
   await assert.rejects(
     run(process.execPath, ['deep-import.mjs'], consumer),
-    error => /ERR_PACKAGE_PATH_NOT_EXPORTED|Package subpath/.test(failureText(error)),
+    error => /ERR_PACKAGE_PATH_NOT_EXPORTED|Package subpath|Cannot find module/.test(failureText(error)),
   );
   await assert.rejects(
-    run(tsc, [
+    run(process.execPath, [
+      tsc,
       '--noEmit',
       '--strict',
       '--target', 'ES2023',
@@ -125,13 +120,12 @@ test('packed ESM package satisfies the public consumer contract', { timeout: 180
     error => /TS2307|Cannot find module/.test(failureText(error)),
   );
 
-  const cli = join(consumer, 'node_modules/.bin/jev-code');
-  const { stdout: help } = await run(cli, ['--help'], consumer);
+  const cli = join(consumer, 'node_modules/jev-code/dist/cli.js');
+  const { stdout: help } = await run(process.execPath, [cli, '--help'], consumer);
   assert.match(help, /jev-code \[options\]/);
 
-  const tsx = join(root, 'node_modules/.bin/tsx');
-  const router = await run(tsx, ['examples/router.ts'], root);
+  const router = await run(process.execPath, ['examples/router.ts'], root);
   assert.equal(router.stdout.trim(), 'account: priority 1');
-  const tree = await run(tsx, ['examples/dependency-tree.ts'], root);
+  const tree = await run(process.execPath, ['examples/dependency-tree.ts'], root);
   assert.equal(tree.stdout.trim(), '{"name":"Oak","children":[{"name":"Birch","children":[{"name":"Elm","children":[]},{"name":"Ash","children":[]}]},{"name":"Cedar","children":[{"name":"Pine","children":[]},{"name":"Oak","children":[]}]}]}');
 });

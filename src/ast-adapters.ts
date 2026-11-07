@@ -1,4 +1,5 @@
-import { readFile, mkdir, open, unlink } from 'node:fs/promises';
+import { readFile, mkdir, open, unlink, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { isAbsolute, resolve, join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -60,15 +61,45 @@ export class AstRegistry {
     return best && this.snapshot(best);
   }
 }
+/** Installed adapters named by a project must be re-approved until the workspace trusts them. */
+export class UntrustedAstConfigError extends Error {
+  constructor(readonly path: string) {
+    super(`Installed AST adapters in ${path} are not trusted. Review them, then run \`jev-code ast install <module>\` or pass --trust-asts.`);
+    this.name = 'UntrustedAstConfigError';
+  }
+}
+
 interface Installed { id: string; module: string }
-async function readConfig(workspace: string): Promise<Installed[]> {
+interface ConfigState { path: string; raw: string; entries: Installed[] }
+
+const trustPath = (configPath: string): string => join(dirname(configPath), 'asts.trusted');
+const digest = (raw: string): string => createHash('sha256').update(raw).digest('hex');
+
+async function readConfigState(workspace: string): Promise<ConfigState | undefined> {
   const path = await resolveWorkspacePath(workspace, '.jev/asts.json', false);
-  let raw: unknown;
-  try { raw = JSON.parse(await readFile(path, 'utf8')); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
-  const config = raw as { version?: unknown; adapters?: unknown } | null;
+  let raw: string;
+  try { raw = await readFile(path, 'utf8'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); }
+  catch { throw new Error('Invalid .jev/asts.json configuration.'); }
+  const config = parsed as { version?: unknown; adapters?: unknown } | null;
   if (!config || config.version !== 1 || !Array.isArray(config.adapters) || config.adapters.length > 64 || config.adapters.some(item => !item || typeof item.id !== 'string' || typeof item.module !== 'string')) throw new Error('Invalid .jev/asts.json configuration.');
-  return config.adapters as Installed[];
+  return { path, raw, entries: config.adapters as Installed[] };
+}
+
+async function configTrusted(state: ConfigState): Promise<boolean> {
+  try { return (await readFile(trustPath(state.path), 'utf8')).trim() === digest(state.raw); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
+}
+
+async function markTrusted(configPath: string, raw: string): Promise<void> {
+  await writeFile(trustPath(configPath), `${digest(raw)}\n`, { mode: 0o600 });
+}
+
+/** List the adapters named by `.jev/asts.json` without importing any module. */
+export async function listInstalledAstConfig(workspace: string): Promise<Array<{ id: string; module: string }>> {
+  return [...(await readConfigState(workspace))?.entries ?? []];
 }
 export async function loadAstModule(workspace: string, specifier: string): Promise<AstAdapter[]> {
   if (specifier.startsWith('builtin:')) {
@@ -83,39 +114,59 @@ export async function loadAstModule(workspace: string, specifier: string): Promi
   if (!Array.isArray(module.astAdapters) || !module.astAdapters.length) throw new Error('AST module must export a nonempty astAdapters array.');
   return module.astAdapters;
 }
-export async function loadInstalledAsts(workspace: string): Promise<AstAdapter[]> {
-  const config = await readConfig(workspace);
+export interface LoadInstalledAstsOptions {
+  /** Explicit approval to import the modules named by the project configuration. */
+  trusted?: boolean;
+}
+
+export async function loadInstalledAsts(workspace: string, options: LoadInstalledAstsOptions = {}): Promise<AstAdapter[]> {
+  const state = await readConfigState(workspace);
+  if (state === undefined || state.entries.length === 0) return [];
+  // Importing an adapter runs its module-level code, so a project-controlled file is not enough on
+  // its own. `ast install` records trust for the exact configuration it wrote; anything else needs
+  // the explicit flag.
+  if (options.trusted !== true && !(await configTrusted(state))) throw new UntrustedAstConfigError(state.path);
   const modules = new Map<string, AstAdapter[]>();
-  for (const entry of config) if (!modules.has(entry.module)) modules.set(entry.module, await loadAstModule(workspace, entry.module));
-  return config.map(entry => {
+  for (const entry of state.entries) if (!modules.has(entry.module)) modules.set(entry.module, await loadAstModule(workspace, entry.module));
+  return state.entries.map(entry => {
     const adapter = modules.get(entry.module)!.find(adapter => adapter.id === entry.id);
     if (!adapter) throw new Error(`Installed AST adapter ${entry.id} is missing from ${entry.module}.`);
     return adapter;
   });
 }
-async function updateConfig(workspace: string, update: (entries: Installed[]) => Promise<Installed[]>): Promise<void> {
+
+async function updateConfig(workspace: string, update: (entries: Installed[]) => Promise<Installed[]>, trust: boolean): Promise<void> {
   const path = await resolveWorkspacePath(workspace, '.jev/asts.json', false);
   await mkdir(dirname(path), { recursive: true });
   const lock = await open(join(dirname(path), 'asts.lock'), 'wx', 0o600).catch(error => { throw new Error('AST configuration is busy or inaccessible; retry after the other install finishes.', { cause: error }); });
-  try { await atomicWrite(path, JSON.stringify({ version: 1, adapters: await update(await readConfig(workspace)) }, null, 2) + '\n', new AbortController().signal); }
-  finally { await lock.close(); await unlink(join(dirname(path), 'asts.lock')); }
+  try {
+    const current = await readConfigState(workspace);
+    const raw = JSON.stringify({ version: 1, adapters: await update(current?.entries ?? []) }, null, 2) + '\n';
+    await atomicWrite(path, raw, new AbortController().signal);
+    if (trust) await markTrusted(path, raw);
+  } finally { await lock.close(); await unlink(join(dirname(path), 'asts.lock')); }
 }
+
 export async function installAstModule(workspace: string, specifier: string): Promise<string[]> {
   if (specifier.startsWith('builtin:')) return (await loadAstModule(workspace, specifier)).map(adapter => adapter.id);
   const module = isAbsolute(specifier) || specifier.startsWith('.') ? resolve(workspace, specifier) : specifier;
   const adapters = await loadAstModule(workspace, module);
+  // Installing is explicit approval of this module and the configuration it produces.
   await updateConfig(workspace, async entries => {
-    const registry = new AstRegistry(await loadInstalledAsts(workspace));
+    const registry = new AstRegistry(await loadInstalledAsts(workspace, { trusted: true }));
     for (const adapter of adapters) registry.register(adapter);
     const result = [...entries, ...adapters.map(adapter => ({ id: adapter.id, module }))];
     if (result.length > 64) throw new Error('At most 64 AST adapters may be installed.');
     return result;
-  });
+  }, true);
   return adapters.map(adapter => adapter.id);
 }
+
 export async function removeAstAdapter(workspace: string, id: string): Promise<void> {
+  const current = await readConfigState(workspace);
+  const wasTrusted = current === undefined ? false : await configTrusted(current);
   await updateConfig(workspace, async entries => {
     if (!entries.some(entry => entry.id === id)) throw new Error(`No installed AST adapter: ${id}`);
     return entries.filter(entry => entry.id !== id);
-  });
+  }, wasTrusted);
 }

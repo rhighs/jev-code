@@ -4,7 +4,7 @@ export { builtInTools, runBash, atomicWrite } from './tools.js';
 export { resolveWorkspacePath } from './workspace.js';
 export { characterAlphabet, gridCursor } from './grid.js';
 export { generatePythonAst, unparsePython, type PythonNode } from './python-ast.js';
-export { AstRegistry, pythonAstAdapter, loadAstModule, loadInstalledAsts, installAstModule, removeAstAdapter, type AstAdapter } from './ast-adapters.js';
+export { AstRegistry, UntrustedAstConfigError, pythonAstAdapter, listInstalledAstConfig, loadAstModule, loadInstalledAsts, installAstModule, removeAstAdapter, type AstAdapter, type LoadInstalledAstsOptions } from './ast-adapters.js';
 export { formatDuration } from './timing.js';
 export { runEval, loadTasks, compareRecords, formatComparison, type EvalRecord, type EvalTask, type CheckResult } from './eval.js';
 export { runDecide, type DecideResult, type SpecEntry } from './decide.js';

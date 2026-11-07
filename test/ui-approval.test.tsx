@@ -96,9 +96,8 @@ test('the source CLI loads no ink for --help or --print', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'jev-hook-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const log = join(dir, 'loaded.log');
-  await writeFile(join(dir, 'hook.mjs'), `import { appendFileSync } from 'node:fs';\nexport async function resolve(spec, ctx, next) { const r = await next(spec, ctx); appendFileSync(${JSON.stringify(log)}, r.url + '\\n'); return r; }\n`);
-  await writeFile(join(dir, 'register.mjs'), `import { register } from 'node:module';\nregister('./hook.mjs', import.meta.url);\n`);
-  const run = (args: string[]) => exec('node', ['--import', join(dir, 'register.mjs'), '--import', 'tsx', join(root, 'src/cli.ts'), ...args],
+  await writeFile(join(dir, 'plugin.mjs'), `import { appendFileSync } from 'node:fs';\nBun.plugin({ name: 'jev-load-log', setup(build) { build.onResolve({ filter: /.*/ }, args => { appendFileSync(${JSON.stringify(log)}, args.path + '\\n'); return undefined; }); } });\n`);
+  const run = (args: string[]) => exec(process.execPath, ['--preload', join(dir, 'plugin.mjs'), join(root, 'src/cli.ts'), ...args],
     { cwd: root, env: { ...process.env, TYPESAFE_API_KEY: 'test', TYPESAFE_BASE_URL: 'http://127.0.0.1:9' } }).catch((err: { stdout: string; stderr: string }) => err);
   const help = await run(['--help']);
   assert.match(help.stdout, /jev-code \[options\]/);
@@ -106,10 +105,10 @@ test('the source CLI loads no ink for --help or --print', async t => {
   assert.match(print.stdout, /\[error\]/);
   const loaded = await readFile(log, 'utf8');
   assert.match(loaded, /src\/cli\.ts/);
-  assert.match(loaded, /src\/print\.ts/);
-  assert.equal(loaded.includes('/node_modules/ink/'), false);
-  assert.equal(loaded.includes('/node_modules/react/'), false);
-  assert.equal(loaded.includes('/src/ui/'), false);
+  assert.match(loaded, /\.\/print\.js/);
+  assert.equal(loaded.split('\n').includes('ink'), false);
+  assert.equal(loaded.split('\n').includes('react'), false);
+  assert.equal(loaded.includes('./ui/'), false);
 });
 
 test('a multi-line command is listed in full on the awaiting card, and the header names only its first line', async t => {

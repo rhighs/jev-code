@@ -146,16 +146,16 @@ test('cli replay --plain renders a journal in a temp workspace, and rejects unkn
   await writeFile(join(cwd, '.jev', 'runs', 'good.jsonl'), jsonl(all));
   await writeFile(join(cwd, '.jev', 'runs', 'future.jsonl'), jsonl(withSchema(all, 2)));
   const cli = resolve('src/cli.ts');
-  const ok = await exec(process.execPath, ['--import', import.meta.resolve('tsx'), cli, 'replay', 'good', '--plain'], { cwd, env, timeout: 60_000 });
+  const ok = await exec(process.execPath, [cli, 'replay', 'good', '--plain'], { cwd, env, timeout: 60_000 });
   assert.match(ok.stderr, /✓ write_file hello.txt/);
   assert.match(ok.stdout, /\[completed\]/);
-  await assert.rejects(exec(process.execPath, ['--import', import.meta.resolve('tsx'), cli, 'replay', 'nope', '--plain'], { cwd, env, timeout: 60_000 }), (err: Error & { code: number; stderr: string }) => {
+  await assert.rejects(exec(process.execPath, [cli, 'replay', 'nope', '--plain'], { cwd, env, timeout: 60_000 }), (err: Error & { code: number; stderr: string }) => {
     assert.equal(err.code, 1);
     assert.equal(err.stderr.trim().split('\n').length, 1, err.stderr);
     assert.match(err.stderr, /nope/);
     return true;
   });
-  await assert.rejects(exec(process.execPath, ['--import', import.meta.resolve('tsx'), cli, 'replay', 'future', '--plain'], { cwd, env, timeout: 60_000 }), (err: Error & { code: number; stderr: string }) => {
+  await assert.rejects(exec(process.execPath, [cli, 'replay', 'future', '--plain'], { cwd, env, timeout: 60_000 }), (err: Error & { code: number; stderr: string }) => {
     assert.equal(err.code, 1);
     assert.match(err.stderr, /2/);
     assert.match(err.stderr, /1/);
@@ -336,7 +336,7 @@ test('cli --resume refuses missing, completed, mismatched, and eval journals bef
   // no saved key and no prompt in a non-TTY.
   const env = { ...process.env, NO_COLOR: '1', TYPESAFE_API_KEY: '', JEV_CODE_CONFIG_DIR: join(cwd, 'no-config') };
   const refusal = async (args: string[], pattern: RegExp): Promise<void> => {
-    await assert.rejects(exec(process.execPath, ['--import', import.meta.resolve('tsx'), cli, ...args], { cwd, env, timeout: 60_000 }),
+    await assert.rejects(exec(process.execPath, [cli, ...args], { cwd, env, timeout: 60_000 }),
       (err: Error & { code: number; stderr: string }) => {
         assert.equal(err.code, 1);
         assert.match(err.stderr, pattern);
@@ -364,7 +364,7 @@ test('cli --resume last resolves the newest journal and refuses an older complet
 
   const cli = resolve('src/cli.ts');
   const env = { ...process.env, NO_COLOR: '1', TYPESAFE_API_KEY: '', JEV_CODE_CONFIG_DIR: join(cwd, 'no-config') };
-  await assert.rejects(exec(process.execPath, ['--import', import.meta.resolve('tsx'), cli, '--resume', 'last'], { cwd, env, timeout: 60_000 }),
+  await assert.rejects(exec(process.execPath, [cli, '--resume', 'last'], { cwd, env, timeout: 60_000 }),
     (err: Error & { code: number; stderr: string }) => {
       assert.equal(err.code, 1);
       assert.match(err.stderr, /No API key/, 'last resolved the resumable journal rather than the completed one');
